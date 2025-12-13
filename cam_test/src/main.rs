@@ -143,11 +143,18 @@ fn main() -> Result<(), CameraError> {
         .create_topic(&topic_name, message_type.clone(), &QosPolicies::default())
         .map_err(|e| CameraError::Ros2(format!("Failed to create topic: {:?}", e)))?;
     
+    // Create publisher with matching QoS to ensure compatibility
     let mut publisher = node
-        .create_publisher(&image_topic, None)
+        .create_publisher(&image_topic, Some(QosPolicies::default()))
         .map_err(|e| CameraError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
     
     println!("Publisher created successfully");
+    
+    // Wait a bit for the publisher to establish connections with subscribers
+    // This is important for cross-device communication where discovery takes time
+    println!("Waiting for publisher to establish connections...");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    println!("Publisher ready, starting to publish frames...");
 
     // Find and open V4L2 device
     let device_path = find_v4l_device()?;
@@ -217,9 +224,8 @@ fn main() -> Result<(), CameraError> {
         // Create ROS2 std_msgs/String message
         // std_msgs/String has a single "data" field of type string
         // Create a struct that matches this format and implements Serialize
-        #[derive(Serialize, Debug)]
+        #[derive(Serialize, Debug, Clone)]
         struct StringMessage {
-            #[serde(rename = "data")]
             data: String,
         }
         
@@ -228,8 +234,43 @@ fn main() -> Result<(), CameraError> {
         };
         
         // Publish using the publisher
-        publisher.publish(msg)
-            .map_err(|e| CameraError::Message(format!("Failed to publish message: {:?}", e)))?;
+        // Handle WouldBlock errors gracefully - they occur when the publisher buffer is full
+        // or connections aren't ready yet. Retry a few times before giving up.
+        let mut publish_attempts = 0;
+        const MAX_PUBLISH_ATTEMPTS: u32 = 5;
+        let mut msg_to_publish = msg.clone();
+        loop {
+            match publisher.publish(msg_to_publish) {
+                Ok(()) => {
+                    // Successfully published
+                    break;
+                }
+                Err(e) => {
+                    // Check if it's a WouldBlock error (transient, can retry)
+                    let error_str = format!("{:?}", e);
+                    if error_str.contains("WouldBlock") {
+                        publish_attempts += 1;
+                        if publish_attempts >= MAX_PUBLISH_ATTEMPTS {
+                            // After max attempts, skip this frame and continue
+                            if frame_count % 30 == 0 {
+                                eprintln!("Warning: Skipping frame #{} after {} publish attempts (WouldBlock)", 
+                                    frame_count, publish_attempts);
+                            }
+                            break;
+                        }
+                        // Brief sleep before retry
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        // Clone again for retry
+                        msg_to_publish = msg.clone();
+                        continue;
+                    } else {
+                        // Other errors are more serious
+                        eprintln!("ERROR: Failed to publish message: {:?}", e);
+                        return Err(CameraError::Message(format!("Failed to publish message: {:?}", e)));
+                    }
+                }
+            }
+        }
         
         // Log frame capture info periodically to avoid flooding console
         if frame_count % 30 == 0 {
