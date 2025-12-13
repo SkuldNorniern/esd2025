@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 // ROS2 std_msgs/String has a single field "data" of type string
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct StringMessage {
-    #[serde(rename = "data")]
     data: String,
 }
 

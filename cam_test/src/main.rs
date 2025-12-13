@@ -7,6 +7,13 @@ use v4l::io::traits::CaptureStream;
 use base64::{Engine as _, engine::general_purpose};
 use serde::Serialize;
 
+// Message struct matching std_msgs/String format
+// ROS2 std_msgs/String has a single field "data" of type string
+#[derive(Serialize, Debug, Clone)]
+struct StringMessage {
+    data: String,
+}
+
 // Error type for camera operations
 #[derive(Debug)]
 enum CameraError {
@@ -150,10 +157,30 @@ fn main() -> Result<(), CameraError> {
     
     println!("Publisher created successfully");
     
-    // Wait a bit for the publisher to establish connections with subscribers
-    // This is important for cross-device communication where discovery takes time
-    println!("Waiting for publisher to establish connections...");
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Wait longer for the publisher to establish connections with subscribers
+    // This is critical for cross-device communication where DDS discovery takes time
+    println!("Waiting for publisher to establish connections with subscribers...");
+    println!("  (DDS discovery can take 5-10 seconds for cross-device communication)");
+    for i in 1..=10 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        print!(".");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    println!();
+    
+    // Test publish a small message to verify publishing works
+    let test_msg = StringMessage {
+        data: "test".to_string(),
+    };
+    println!("Testing publisher with a small message...");
+    match publisher.publish(test_msg) {
+        Ok(()) => println!("  Test publish succeeded!"),
+        Err(e) => {
+            eprintln!("  WARNING: Test publish failed: {:?}", e);
+            eprintln!("  This may indicate a connection issue. Continuing anyway...");
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
     println!("Publisher ready, starting to publish frames...");
 
     // Find and open V4L2 device
@@ -223,12 +250,7 @@ fn main() -> Result<(), CameraError> {
         
         // Create ROS2 std_msgs/String message
         // std_msgs/String has a single "data" field of type string
-        // Create a struct that matches this format and implements Serialize
-        #[derive(Serialize, Debug, Clone)]
-        struct StringMessage {
-            data: String,
-        }
-        
+        // Use the same struct definition as the test message
         let msg = StringMessage {
             data: json_msg,
         };
@@ -237,12 +259,14 @@ fn main() -> Result<(), CameraError> {
         // Handle WouldBlock errors gracefully - they occur when the publisher buffer is full
         // or connections aren't ready yet. Retry a few times before giving up.
         let mut publish_attempts = 0;
-        const MAX_PUBLISH_ATTEMPTS: u32 = 5;
+        const MAX_PUBLISH_ATTEMPTS: u32 = 10;
         let mut msg_to_publish = msg.clone();
+        let mut publish_succeeded = false;
         loop {
             match publisher.publish(msg_to_publish) {
                 Ok(()) => {
                     // Successfully published
+                    publish_succeeded = true;
                     break;
                 }
                 Err(e) => {
@@ -251,15 +275,15 @@ fn main() -> Result<(), CameraError> {
                     if error_str.contains("WouldBlock") {
                         publish_attempts += 1;
                         if publish_attempts >= MAX_PUBLISH_ATTEMPTS {
-                            // After max attempts, skip this frame and continue
-                            if frame_count % 30 == 0 {
-                                eprintln!("Warning: Skipping frame #{} after {} publish attempts (WouldBlock)", 
+                            // After max attempts, log error and continue
+                            if frame_count % 10 == 0 {
+                                eprintln!("ERROR: Failed to publish frame #{} after {} attempts (WouldBlock - publisher buffer may be full or no subscribers connected)", 
                                     frame_count, publish_attempts);
                             }
                             break;
                         }
-                        // Brief sleep before retry
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        // Brief sleep before retry - increase delay with each attempt
+                        std::thread::sleep(std::time::Duration::from_millis(20 * publish_attempts as u64));
                         // Clone again for retry
                         msg_to_publish = msg.clone();
                         continue;
@@ -272,14 +296,25 @@ fn main() -> Result<(), CameraError> {
             }
         }
         
-        // Log frame capture info periodically to avoid flooding console
+        // Log frame capture info periodically
         if frame_count % 30 == 0 {
-            println!("Published frame #{}: {}x{} RGB ({} bytes raw, {} bytes base64, sequence: {})", 
-                frame_count,
-                width, height, 
-                rgb_data.len(),
-                base64_data.len(),
-                meta.sequence);
+            if publish_succeeded {
+                println!("Published frame #{}: {}x{} RGB ({} bytes raw, {} bytes base64, sequence: {})", 
+                    frame_count,
+                    width, height, 
+                    rgb_data.len(),
+                    base64_data.len(),
+                    meta.sequence);
+            } else {
+                eprintln!("SKIPPED frame #{}: {}x{} RGB (publish failed after {} attempts)", 
+                    frame_count,
+                    width, height, 
+                    publish_attempts);
+            }
         }
+        
+        // Add a small delay to avoid overwhelming the publisher buffer
+        // This gives the DDS layer time to process messages
+        std::thread::sleep(std::time::Duration::from_millis(33)); // ~30 FPS max
     }
 }
