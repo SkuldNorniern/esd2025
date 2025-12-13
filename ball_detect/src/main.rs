@@ -2,7 +2,7 @@
 // Based on: https://medium.com/@alfred.weirich/rust-ort-onnx-real-time-yolo-on-a-live-webcam-part-1-b6edfb50bf9b
 use ros2_client::{Context, NodeOptions, NodeName, MessageTypeName, Name};
 use ros2_client::rustdds::QosPolicies;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::io::Write;
 use std::path::Path;
 use image::{DynamicImage, ImageBuffer, Rgb};
@@ -427,99 +427,83 @@ fn main() -> Result<(), BallDetectError> {
     println!("(Press Ctrl+C to stop)");
     println!();
 
-    // Main processing loop
-    // ros2-client Subscription API needs to be determined
-    // For now, we'll use a polling approach and check for available methods
-    let mut frame_count = 0u64;
-    let mut last_message_time = std::time::Instant::now();
-    
-    println!("Starting message reception loop...");
+    // Event-driven message reception loop
+    // Based on ros2-client service examples: https://github.com/Atostek/ros2-client/blob/master/examples/ros2_service_client/main.rs
+    // Note: Subscriptions don't support mio::Poll directly, so we use timer-based polling
+    println!("Starting event-driven message reception loop...");
     println!("Node names:");
     println!("  Publisher: camera_node (on Raspberry Pi)");
     println!("  Subscriber: ball_detect_node (on this device)");
     println!("Topic: /image");
     println!("Message type: std_msgs/String");
     println!();
-    println!("Note: For cross-device communication, ensure:");
-    println!("  1. ROS_DOMAIN_ID matches (current: {})", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
-    println!("  2. Both devices are on the same network");
-    println!("  3. Firewall allows DDS traffic (UDP ports 7400-7500)");
-    println!("  4. Check with: ros2 node list (should show both nodes)");
-    println!("  5. Check with: ros2 topic list (should show /image)");
-    println!("  6. Check with: ros2 topic echo /image (should show messages)");
-    println!();
+
+    let mut frame_count = 0u64;
+    let mut last_log_time = Instant::now();
     
-    // Main message reception loop
-    // Use take() method which returns Result<Option<(Message, MessageInfo)>, ReadError>
-    let mut take_count = 0u64;
-    let mut error_count = 0u64;
+    println!("Event loop started, waiting for messages...");
+    println!();
+
     loop {
-        // Try to take a message from the subscription
-        // This is non-blocking and returns Ok(None) if no message is available
-        take_count += 1;
-        match subscriber.take() {
-            Ok(Some((msg, info))) => {
-                frame_count += 1;
-                last_message_time = std::time::Instant::now();
-                
-                if frame_count == 1 {
-                    println!("✓ First message received! (after {} take() calls)", take_count);
-                }
-                
-                // Extract the JSON string from the message
-                let json_str = &msg.data;
-                
-                // Parse JSON and decode base64 image
-                match parse_image_message(json_str) {
-                    Ok((image_data, width, height, encoding)) => {
-                        // Run detection
-                        match detector.detect(&image_data, width, height, &encoding) {
-                            Ok(Some((x1, y1, x2, y2))) => {
-                                println!("Frame #{}: Ball detected at ({:.1}, {:.1}) to ({:.1}, {:.1})", 
-                                    frame_count, x1, y1, x2, y2);
-                            }
-                            Ok(None) => {
-                                if frame_count % 30 == 0 {
-                                    println!("Frame #{}: No ball detected", frame_count);
+        // Event-driven polling: check for messages periodically
+        // Process all available messages in a batch
+        loop {
+            match subscriber.take() {
+                Ok(Some((msg, _info))) => {
+                    frame_count += 1;
+                    
+                    if frame_count == 1 {
+                        println!("✓ First message received!");
+                    }
+                    
+                    // Extract the JSON string from the message
+                    let json_str = &msg.data;
+                    
+                    // Parse JSON and decode base64 image
+                    match parse_image_message(json_str) {
+                        Ok((image_data, width, height, encoding)) => {
+                            // Run detection
+                            match detector.detect(&image_data, width, height, &encoding) {
+                                Ok(Some((x1, y1, x2, y2))) => {
+                                    println!("Frame #{}: Ball detected at ({:.1}, {:.1}) to ({:.1}, {:.1})", 
+                                        frame_count, x1, y1, x2, y2);
+                                }
+                                Ok(None) => {
+                                    if frame_count % 30 == 0 {
+                                        println!("Frame #{}: No ball detected", frame_count);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Detection error on frame #{}: {}", frame_count, e);
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("Detection error on frame #{}: {}", frame_count, e);
-                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to parse image message on frame #{}: {}", frame_count, e);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to parse image message on frame #{}: {}", frame_count, e);
-                    }
                 }
-            }
-            Ok(None) => {
-                // No message available, sleep briefly to avoid busy-waiting
-                // Use a shorter sleep to check more frequently for messages
-                std::thread::sleep(Duration::from_millis(5));
-                
-                // Log periodically with more debugging info
-                if frame_count == 0 && take_count % 2000 == 0 {
-                    println!("Waiting for messages... (take() called {} times, no messages yet)", take_count);
-                    println!("  Debug info:");
-                    println!("    - Subscription created: ✓");
-                    println!("    - Topic: /image");
-                    println!("    - Message type: std_msgs/String");
-                    println!("    - Nodes visible: ✓");
-                    println!("  Troubleshooting:");
-                    println!("    - Run: ros2 topic info /image (check publisher/subscriber count)");
-                    println!("    - Run: ros2 topic echo /image (verify messages are published)");
-                    println!("    - Check QoS compatibility between publisher and subscriber");
-                    println!("    - Ensure both nodes have completed DDS discovery (wait 10+ seconds)");
+                Ok(None) => {
+                    // No more messages available, break inner loop
+                    break;
                 }
-            }
-            Err(e) => {
-                error_count += 1;
-                if error_count <= 5 || error_count % 100 == 0 {
-                    eprintln!("Error taking message from subscription (error #{}): {:?}", error_count, e);
+                Err(e) => {
+                    eprintln!("Error taking message from subscription: {:?}", e);
+                    break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
             }
         }
+        
+        // Log periodically if no messages received yet (similar to service example rate limiting)
+        if frame_count == 0 {
+            let now = Instant::now();
+            if now.duration_since(last_log_time) > Duration::from_secs(2) {
+                println!("Waiting for messages... (event loop polling)");
+                last_log_time = now;
+            }
+        }
+        
+        // Small sleep to avoid busy-waiting (similar to service example)
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
