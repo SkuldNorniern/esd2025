@@ -133,8 +133,9 @@ fn main() -> Result<(), CameraError> {
     let message_type = MessageTypeName::new("std_msgs", "String");
     
     // Create topic first, then use it to create publisher
+    // Clone message_type since we need it later to create messages
     let image_topic = node
-        .create_topic(&topic_name, message_type, &QosPolicies::default())
+        .create_topic(&topic_name, message_type.clone(), &QosPolicies::default())
         .map_err(|e| CameraError::Ros2(format!("Failed to create topic: {:?}", e)))?;
     
     let mut publisher = node
@@ -208,8 +209,8 @@ fn main() -> Result<(), CameraError> {
             width, height, base64_data
         );
         
-        // Create ROS2 std_msgs/String message using the topic
-        let mut msg = image_topic.create_message()
+        // Create ROS2 std_msgs/String message using MessageTypeName
+        let mut msg = Message::new(&message_type)
             .map_err(|e| CameraError::Message(format!("Failed to create message: {:?}", e)))?;
         
         // Set the "data" field of std_msgs/String
