@@ -1,0 +1,46 @@
+# YOLO Dataset Configuration Template
+# Copy this file and modify it for your custom dataset
+
+# Dataset path (absolute or relative to this YAML file)
+path: ./datasets/custom_dataset  # Path to dataset root directory
+
+# Train, validation, and test image directories (relative to 'path')
+train: images/train
+val: images/val
+test: images/test  # Optional
+
+# Number of classes
+nc: 1
+
+# Class names
+names:
+  0: ball  # Replace with your class names
+
+# Example directory structure:
+# datasets/custom_dataset/
+#   ├── images/
+#   │   ├── train/
+#   │   │   ├── image1.jpg
+#   │   │   ├── image2.jpg
+#   │   │   └── ...
+#   │   ├── val/
+#   │   │   ├── image1.jpg
+#   │   │   └── ...
+#   │   └── test/  # Optional
+#   │       └── ...
+#   └── labels/
+#       ├── train/
+#       │   ├── image1.txt
+#       │   ├── image2.txt
+#       │   └── ...
+#       ├── val/
+#       │   ├── image1.txt
+#       │   └── ...
+#       └── test/  # Optional
+#           └── ...
+#
+# Label format (YOLO format): one object per line
+# class_id center_x center_y width height
+# All coordinates are normalized (0.0 to 1.0)
+# Example: 0 0.5 0.5 0.2 0.2  (ball at center, 20% of image size)
+
