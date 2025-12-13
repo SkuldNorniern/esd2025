@@ -170,17 +170,26 @@ impl BallDetector {
         }
 
         // Find best ball detection (class 0)
+        // YOLO output format is [batch, outputs, anchors] = [1, 5, 8400]
+        // where outputs are [x_center, y_center, width, height, confidence]
+        // Coordinates are already in pixel space for the model input size (640x640)
         let mut best_detection: Option<(f32, f32, f32, f32)> = None;
         let mut best_confidence = 0.0;
 
-        // Access data as flat array and calculate indices manually
+        // Parse detections using [batch, outputs, anchors] layout
         for anchor_idx in 0..num_anchors {
-            let base_idx = anchor_idx * num_outputs;
-            let center_x = output_data[base_idx + 0];
-            let center_y = output_data[base_idx + 1];
-            let bbox_width = output_data[base_idx + 2];
-            let bbox_height = output_data[base_idx + 3];
-            let class_confidence = output_data[base_idx + 4];
+            // Index calculation: batch * (outputs * anchors) + output * anchors + anchor
+            let x_idx = 0 * (num_outputs * num_anchors) + 0 * num_anchors + anchor_idx;
+            let y_idx = 0 * (num_outputs * num_anchors) + 1 * num_anchors + anchor_idx;
+            let w_idx = 0 * (num_outputs * num_anchors) + 2 * num_anchors + anchor_idx;
+            let h_idx = 0 * (num_outputs * num_anchors) + 3 * num_anchors + anchor_idx;
+            let conf_idx = 0 * (num_outputs * num_anchors) + 4 * num_anchors + anchor_idx;
+            
+            let center_x = output_data[x_idx];
+            let center_y = output_data[y_idx];
+            let bbox_width = output_data[w_idx];
+            let bbox_height = output_data[h_idx];
+            let class_confidence = output_data[conf_idx];
 
             if class_confidence >= self.confidence_threshold && class_confidence > best_confidence {
                 // Coordinates are already in pixel space for the model input (640x640)
@@ -257,7 +266,8 @@ fn main() -> Result<(), BallDetectError> {
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create ROS2 context: {:?}", e)))?;
 
     // Create node using Context::new_node
-    let node_name = NodeName::new("", "ball_detect_node")
+    // NodeName requires a namespace - use "/" for root namespace
+    let node_name = NodeName::new("/", "ball_detect_node")
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create node name: {:?}", e)))?;
     let node = ctx
         .new_node(node_name, NodeOptions::new().enable_rosout(true))
