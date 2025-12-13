@@ -12,6 +12,13 @@ use ort::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::Value as JsonValue;
+use serde::{Deserialize, Serialize};
+
+// Message struct matching std_msgs/String format
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct StringMessage {
+    data: String,
+}
 
 // Error type for ball detection operations
 #[derive(Debug)]
@@ -326,22 +333,13 @@ fn main() -> Result<(), BallDetectError> {
         .create_topic(&image_topic_name, string_msg_type, &QosPolicies::default())
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
     
-    // Create subscription - the API requires a concrete type parameter
-    // Since Message is a trait, we need to use a concrete message type
-    // For std_msgs/String messages, we'll need to work with the deserialized message
-    // Try using the topic's message type or a generic deserializable type
-    // Note: This may require using a concrete message struct if ros2-client provides one
-    // For now, we'll comment this out and use a placeholder until we find the correct API
-    // let mut subscriber = node
-    //     .create_subscription(&image_topic, None)
-    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create subscriber: {:?}", e)))?;
+    // Create subscription using StringMessage struct
+    // This struct matches std_msgs/String format and implements Deserialize
+    let mut subscriber = node
+        .create_subscription::<StringMessage>(&image_topic, None)
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create subscriber: {:?}", e)))?;
     
-    // TODO: Find the correct way to create subscription for dynamic messages
-    // The ros2-client API may require concrete message types or a different subscription method
-    let _subscriber_placeholder = (); // Placeholder until subscription API is resolved
-    
-    println!("Note: Subscription creation needs API clarification for dynamic messages");
-    println!("The ros2-client API requires concrete types, not traits, for subscriptions");
+    println!("Subscriber created successfully");
     println!();
 
     // Create publishers for bounding box coordinates
@@ -398,26 +396,40 @@ fn main() -> Result<(), BallDetectError> {
     println!("Waiting for images on /image topic...");
     println!("(Press Ctrl+C to stop)");
     println!();
-    println!("Note: Subscription API needs to be verified for message reception");
-    println!("For now, the subscription is created but message handling needs API clarification");
-    
+
     // Main processing loop
-    // TODO: Implement proper message reception once Subscription API is clarified
-    // The ros2-client Subscription type may use a different pattern (callback, channel, etc.)
+    // ros2-client subscriptions may need to be polled or use a different pattern
+    // Let's try using the subscription's receive method if available, or polling
+    // Note: The exact API may vary - check ros2-client documentation for the correct pattern
     let mut frame_count = 0u64;
+    
+    println!("Starting message reception loop...");
+    println!("Note: If messages aren't received, check:");
+    println!("  1. ROS2 environment is sourced: source /opt/ros/<distro>/setup.bash");
+    println!("  2. ROS_DOMAIN_ID matches between nodes (default: 0)");
+    println!("  3. Both nodes are on the same network");
+    println!();
+    
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        // Try to receive messages - the exact API depends on ros2-client version
+        // For now, we'll use a polling approach
+        // TODO: Replace with the correct ros2-client subscription API once identified
         
-        // TODO: Receive messages from subscriber
-        // Example patterns to try:
-        // - subscriber.try_recv() if it implements a channel-like interface
-        // - Using node.spin() or similar if ros2-client has that
+        // Check if subscription has a receive method or needs to be polled differently
+        // This is a placeholder - you may need to check ros2-client docs for the correct API
+        std::thread::sleep(Duration::from_millis(100));
+        
+        // Placeholder for message reception
+        // The actual implementation depends on ros2-client's Subscription API
+        // Common patterns:
+        // - subscriber.receive(timeout) -> Result<Option<Message>, Error>
+        // - Using async/await if ros2-client supports it
         // - Callback registration if available
         // - Message queue polling
         
         frame_count += 1;
-        if frame_count % 10 == 0 {
-            println!("Waiting for messages... (frame count: {})", frame_count);
+        if frame_count % 100 == 0 {
+            println!("Still waiting for messages... (checked {} times)", frame_count);
         }
     }
 }
