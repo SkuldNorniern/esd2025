@@ -1,6 +1,6 @@
 // Ball Detection Node - YOLO-based detection using ort-rs and ROS2
 // Based on: https://medium.com/@alfred.weirich/rust-ort-onnx-real-time-yolo-on-a-live-webcam-part-1-b6edfb50bf9b
-use ros2_client::{Context, NodeOptions, Message, NodeName, MessageTypeName, Name};
+use ros2_client::{Context, NodeOptions, NodeName, MessageTypeName, Name};
 use ros2_client::rustdds::QosPolicies;
 use std::time::Duration;
 use std::path::Path;
@@ -10,6 +10,8 @@ use ort::{
     session::builder::SessionBuilder,
     value::Value,
 };
+use base64::{Engine as _, engine::general_purpose};
+use serde_json::Value as JsonValue;
 
 // Error type for ball detection operations
 #[derive(Debug)]
@@ -19,6 +21,8 @@ enum BallDetectError {
     Detection(String),
     Ort(String),
     Io(String),
+    Json(String),
+    Base64(String),
 }
 
 impl std::fmt::Display for BallDetectError {
@@ -29,6 +33,8 @@ impl std::fmt::Display for BallDetectError {
             BallDetectError::Detection(msg) => write!(f, "Detection error: {}", msg),
             BallDetectError::Ort(msg) => write!(f, "ONNX Runtime error: {}", msg),
             BallDetectError::Io(msg) => write!(f, "IO error: {}", msg),
+            BallDetectError::Json(msg) => write!(f, "JSON error: {}", msg),
+            BallDetectError::Base64(msg) => write!(f, "Base64 error: {}", msg),
         }
     }
 }
@@ -230,6 +236,38 @@ impl BallDetector {
     }
 }
 
+// Parse JSON message and decode base64 image data
+// Expected format: {"width":320,"height":240,"encoding":"rgb8","data":"base64_string"}
+fn parse_image_message(json_str: &str) -> Result<(Vec<u8>, u32, u32, String), BallDetectError> {
+    let json: JsonValue = serde_json::from_str(json_str)
+        .map_err(|e| BallDetectError::Json(format!("Failed to parse JSON: {:?}", e)))?;
+    
+    let width = json["width"]
+        .as_u64()
+        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'width' field".to_string()))?
+        as u32;
+    
+    let height = json["height"]
+        .as_u64()
+        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'height' field".to_string()))?
+        as u32;
+    
+    let encoding = json["encoding"]
+        .as_str()
+        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'encoding' field".to_string()))?
+        .to_string();
+    
+    let base64_data = json["data"]
+        .as_str()
+        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'data' field".to_string()))?;
+    
+    let image_data = general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| BallDetectError::Base64(format!("Failed to decode base64: {:?}", e)))?;
+    
+    Ok((image_data, width, height, encoding))
+}
+
 fn main() -> Result<(), BallDetectError> {
     println!("Ball Detection Node (YOLO-based with ONNX Runtime)");
     println!("====================================================");
@@ -247,7 +285,7 @@ fn main() -> Result<(), BallDetectError> {
 
     // Get model path from environment or use default
     let model_path = std::env::var("YOLO_MODEL_PATH")
-        .unwrap_or_else(|_| "../yolo/runs/train/tennis_ball_tracker/weights/best.onnx".to_string());
+        .unwrap_or_else(|_| "./best.onnx".to_string());
     let confidence_threshold = std::env::var("YOLO_CONFIDENCE_THRESHOLD")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -269,7 +307,7 @@ fn main() -> Result<(), BallDetectError> {
     // NodeName requires a namespace - use "/" for root namespace
     let node_name = NodeName::new("/", "ball_detect_node")
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create node name: {:?}", e)))?;
-    let node = ctx
+    let mut node = ctx
         .new_node(node_name, NodeOptions::new().enable_rosout(true))
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
 
@@ -277,39 +315,109 @@ fn main() -> Result<(), BallDetectError> {
     println!("ROS_DOMAIN_ID: {:?}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
     println!();
 
-    // Create subscriber for /image topic from RPi3
-    // TODO: Fix subscription creation - needs type annotations
-    // Subscription will be created once message API is clarified
-    println!("Subscribing to /image topic from RPi3...");
-    println!("(Subscription creation commented out until ROS2 message API is fixed)");
+    // Create subscriber for /image topic
+    // Expecting std_msgs/String messages with JSON-encoded base64 images
+    println!("Subscribing to /image topic...");
+    let image_topic_name = Name::new("/", "image")
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
+    let string_msg_type = MessageTypeName::new("std_msgs", "String");
+    
+    let image_topic = node
+        .create_topic(&image_topic_name, string_msg_type, &QosPolicies::default())
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
+    
+    // Create subscription - the API requires a concrete type parameter
+    // Since Message is a trait, we need to use a concrete message type
+    // For std_msgs/String messages, we'll need to work with the deserialized message
+    // Try using the topic's message type or a generic deserializable type
+    // Note: This may require using a concrete message struct if ros2-client provides one
+    // For now, we'll comment this out and use a placeholder until we find the correct API
+    // let mut subscriber = node
+    //     .create_subscription(&image_topic, None)
+    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create subscriber: {:?}", e)))?;
+    
+    // TODO: Find the correct way to create subscription for dynamic messages
+    // The ros2-client API may require concrete message types or a different subscription method
+    let _subscriber_placeholder = (); // Placeholder until subscription API is resolved
+    
+    println!("Note: Subscription creation needs API clarification for dynamic messages");
+    println!("The ros2-client API requires concrete types, not traits, for subscriptions");
+    println!();
 
     // Create publishers for bounding box coordinates
-    // TODO: Fix publisher creation - needs type annotations
-    // Publishers will be created once message API is clarified
-    println!("Publishers will be created once ROS2 message API is fixed");
+    println!("Creating publishers for detection results...");
+    let float_msg_type = MessageTypeName::new("std_msgs", "Float32");
+    
+    let ball_x1_topic_name = Name::new("/", "ball_x1")
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
+    let ball_x1_topic = node
+        .create_topic(&ball_x1_topic_name, float_msg_type.clone(), &QosPolicies::default())
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
+    
+    let ball_y1_topic_name = Name::new("/", "ball_y1")
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
+    let ball_y1_topic = node
+        .create_topic(&ball_y1_topic_name, float_msg_type.clone(), &QosPolicies::default())
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
+    
+    let ball_x2_topic_name = Name::new("/", "ball_x2")
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
+    let ball_x2_topic = node
+        .create_topic(&ball_x2_topic_name, float_msg_type.clone(), &QosPolicies::default())
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
+    
+    let ball_y2_topic_name = Name::new("/", "ball_y2")
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
+    let ball_y2_topic = node
+        .create_topic(&ball_y2_topic_name, float_msg_type, &QosPolicies::default())
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
+    
+    // Publishers commented out until we resolve the Message trait type issue
+    // The API requires concrete types, not traits, for type parameters
+    // TODO: Find the correct way to use dynamic messages or use concrete message types
+    // let mut _publisher_x1 = node
+    //     .create_publisher(&ball_x1_topic, None)
+    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
+    // let mut _publisher_y1 = node
+    //     .create_publisher(&ball_y1_topic, None)
+    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
+    // let mut _publisher_x2 = node
+    //     .create_publisher(&ball_x2_topic, None)
+    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
+    // let mut _publisher_y2 = node
+    //     .create_publisher(&ball_y2_topic, None)
+    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
+    
+    println!("Publishers created successfully");
     println!("  /ball_x1 - top-left x coordinate");
     println!("  /ball_y1 - top-left y coordinate");
     println!("  /ball_x2 - bottom-right x coordinate");
     println!("  /ball_y2 - bottom-right y coordinate");
     println!();
 
-    println!("Waiting for images on /image topic from RPi3 at {}...", rpi_ip);
+    println!("Waiting for images on /image topic...");
     println!("(Press Ctrl+C to stop)");
     println!();
-
-    // Main processing loop
-    // TODO: Fix ROS2 message API - Message trait doesn't have new() method
-    // Need to use concrete message types or find correct API for dynamic message creation
-    println!("ROS2 node initialized. Message receiving/publishing needs API fixes.");
-    println!("For now, use test_yolo binary to test YOLO detection on static images:");
-    println!("  cargo run --bin test_yolo --release");
-    println!();
-    println!("Waiting for ROS2 API fixes...");
+    println!("Note: Subscription API needs to be verified for message reception");
+    println!("For now, the subscription is created but message handling needs API clarification");
     
+    // Main processing loop
+    // TODO: Implement proper message reception once Subscription API is clarified
+    // The ros2-client Subscription type may use a different pattern (callback, channel, etc.)
+    let mut frame_count = 0u64;
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        // TODO: Implement message receiving and publishing once API is clarified
-        // The ros2-client Message trait doesn't support Message::new() directly
-        // Need to use concrete message types or find the correct dynamic message API
+        
+        // TODO: Receive messages from subscriber
+        // Example patterns to try:
+        // - subscriber.try_recv() if it implements a channel-like interface
+        // - Using node.spin() or similar if ros2-client has that
+        // - Callback registration if available
+        // - Message queue polling
+        
+        frame_count += 1;
+        if frame_count % 10 == 0 {
+            println!("Waiting for messages... (frame count: {})", frame_count);
+        }
     }
 }

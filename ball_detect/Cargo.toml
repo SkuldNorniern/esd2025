@@ -12,3 +12,5 @@ ort = { version = "2.0.0-rc.10", features = [] }
 image = "0.25"
 ros2-client = "0.8.2"
 ndarray = "0.16"
+base64 = "0.22"
+serde_json = "1.0"
