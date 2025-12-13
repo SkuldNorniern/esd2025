@@ -122,7 +122,7 @@ fn main() -> Result<(), CameraError> {
     // Create node using Context::new_node
     let node_name = NodeName::new("/", "camera_node")
         .map_err(|e| CameraError::Ros2(format!("Failed to create node name: {:?}", e)))?;
-    let node = ctx
+    let mut node = ctx
         .new_node(node_name, NodeOptions::new().enable_rosout(true))
         .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
 
@@ -130,11 +130,15 @@ fn main() -> Result<(), CameraError> {
     println!("Creating ROS2 publisher on /image topic...");
     let topic_name = Name::new("/", "image")
         .map_err(|e| CameraError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
-    let message_type = MessageTypeName::new("std_msgs", "String")
-        .map_err(|e| CameraError::Ros2(format!("Failed to create message type: {:?}", e)))?;
+    let message_type = MessageTypeName::new("std_msgs", "String");
     
-    let publisher = node
-        .create_publisher::<Message>(&message_type, &topic_name, &QosPolicies::default())
+    // Create topic first, then use it to create publisher
+    let image_topic = node
+        .create_topic(&topic_name, message_type, &QosPolicies::default())
+        .map_err(|e| CameraError::Ros2(format!("Failed to create topic: {:?}", e)))?;
+    
+    let mut publisher = node
+        .create_publisher(&image_topic, None)
         .map_err(|e| CameraError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
     
     println!("Publisher created successfully");
@@ -204,8 +208,8 @@ fn main() -> Result<(), CameraError> {
             width, height, base64_data
         );
         
-        // Create ROS2 std_msgs/String message
-        let mut msg = Message::new(&message_type)
+        // Create ROS2 std_msgs/String message using the topic
+        let mut msg = image_topic.create_message()
             .map_err(|e| CameraError::Message(format!("Failed to create message: {:?}", e)))?;
         
         // Set the "data" field of std_msgs/String
