@@ -3,6 +3,7 @@
 use ros2_client::{Context, NodeOptions, NodeName, MessageTypeName, Name};
 use ros2_client::rustdds::QosPolicies;
 use std::time::Duration;
+use std::io::Write;
 use std::path::Path;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use ndarray::Array4;
@@ -346,6 +347,19 @@ fn main() -> Result<(), BallDetectError> {
     println!("  Message type: std_msgs/String");
     println!("  Node: ball_detect_node");
     println!();
+    
+    // Wait for the subscriber to establish connections with publishers
+    // This is critical for cross-device communication where DDS discovery takes time
+    println!("Waiting for subscriber to establish connections with publishers...");
+    println!("  (DDS discovery can take 5-10 seconds for cross-device communication)");
+    for i in 1..=10 {
+        std::thread::sleep(Duration::from_secs(1));
+        print!(".");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    println!();
+    println!("Subscriber ready, waiting for messages...");
+    println!();
 
     // Create publishers for bounding box coordinates
     println!("Creating publishers for detection results...");
@@ -469,10 +483,11 @@ fn main() -> Result<(), BallDetectError> {
             }
             Ok(None) => {
                 // No message available, sleep briefly to avoid busy-waiting
-                std::thread::sleep(Duration::from_millis(10));
+                // Use a shorter sleep to check more frequently for messages
+                std::thread::sleep(Duration::from_millis(5));
                 
                 // Log periodically with more debugging info
-                if frame_count == 0 && last_message_time.elapsed() > Duration::from_secs(2) {
+                if frame_count == 0 && take_count % 2000 == 0 {
                     println!("Waiting for messages... (take() called {} times, no messages yet)", take_count);
                     println!("  Debug info:");
                     println!("    - Subscription created: ✓");
@@ -483,7 +498,7 @@ fn main() -> Result<(), BallDetectError> {
                     println!("    - Run: ros2 topic info /image (check publisher/subscriber count)");
                     println!("    - Run: ros2 topic echo /image (verify messages are published)");
                     println!("    - Check QoS compatibility between publisher and subscriber");
-                    last_message_time = std::time::Instant::now();
+                    println!("    - Ensure both nodes have completed DDS discovery (wait 10+ seconds)");
                 }
             }
             Err(e) => {

@@ -313,8 +313,9 @@ fn main() -> Result<(), CameraError> {
             }
         }
         
-        // Add a small delay to avoid overwhelming the publisher buffer
-        // This gives the DDS layer time to process messages
-        std::thread::sleep(std::time::Duration::from_millis(33)); // ~30 FPS max
+        // Add a delay to avoid overwhelming the subscriber and prevent message loss
+        // Reduced to ~10 FPS (100ms) to ensure reliable delivery of large base64-encoded messages
+        // This gives the subscriber time to process each message before the next one arrives
+        std::thread::sleep(std::time::Duration::from_millis(100)); // ~10 FPS max
     }
 }
