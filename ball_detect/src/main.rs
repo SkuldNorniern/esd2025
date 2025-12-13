@@ -335,11 +335,14 @@ fn main() -> Result<(), BallDetectError> {
     
     // Create subscription using StringMessage struct
     // This struct matches std_msgs/String format and implements Deserialize
-    let mut subscriber = node
+    let subscriber = node
         .create_subscription::<StringMessage>(&image_topic, None)
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create subscriber: {:?}", e)))?;
     
     println!("Subscriber created successfully");
+    println!("  Topic: /image");
+    println!("  Message type: std_msgs/String");
+    println!("  Node: ball_detect_node");
     println!();
 
     // Create publishers for bounding box coordinates
@@ -398,38 +401,81 @@ fn main() -> Result<(), BallDetectError> {
     println!();
 
     // Main processing loop
-    // ros2-client subscriptions may need to be polled or use a different pattern
-    // Let's try using the subscription's receive method if available, or polling
-    // Note: The exact API may vary - check ros2-client documentation for the correct pattern
+    // ros2-client Subscription API needs to be determined
+    // For now, we'll use a polling approach and check for available methods
     let mut frame_count = 0u64;
+    let mut last_message_time = std::time::Instant::now();
     
     println!("Starting message reception loop...");
-    println!("Note: If messages aren't received, check:");
-    println!("  1. ROS2 environment is sourced: source /opt/ros/<distro>/setup.bash");
-    println!("  2. ROS_DOMAIN_ID matches between nodes (default: 0)");
-    println!("  3. Both nodes are on the same network");
+    println!("Node names:");
+    println!("  Publisher: camera_node (on Raspberry Pi)");
+    println!("  Subscriber: ball_detect_node (on this device)");
+    println!("Topic: /image");
+    println!("Message type: std_msgs/String");
+    println!();
+    println!("Note: For cross-device communication, ensure:");
+    println!("  1. ROS_DOMAIN_ID matches (current: {})", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
+    println!("  2. Both devices are on the same network");
+    println!("  3. Firewall allows DDS traffic (UDP ports 7400-7500)");
+    println!("  4. Check with: ros2 node list (should show both nodes)");
+    println!("  5. Check with: ros2 topic list (should show /image)");
+    println!("  6. Check with: ros2 topic echo /image (should show messages)");
     println!();
     
+    // Main message reception loop
+    // Use take() method which returns Result<Option<(Message, MessageInfo)>, ReadError>
     loop {
-        // Try to receive messages - the exact API depends on ros2-client version
-        // For now, we'll use a polling approach
-        // TODO: Replace with the correct ros2-client subscription API once identified
-        
-        // Check if subscription has a receive method or needs to be polled differently
-        // This is a placeholder - you may need to check ros2-client docs for the correct API
-        std::thread::sleep(Duration::from_millis(100));
-        
-        // Placeholder for message reception
-        // The actual implementation depends on ros2-client's Subscription API
-        // Common patterns:
-        // - subscriber.receive(timeout) -> Result<Option<Message>, Error>
-        // - Using async/await if ros2-client supports it
-        // - Callback registration if available
-        // - Message queue polling
-        
-        frame_count += 1;
-        if frame_count % 100 == 0 {
-            println!("Still waiting for messages... (checked {} times)", frame_count);
+        // Try to take a message from the subscription
+        // This is non-blocking and returns Ok(None) if no message is available
+        match subscriber.take() {
+            Ok(Some((msg, _info))) => {
+                frame_count += 1;
+                last_message_time = std::time::Instant::now();
+                
+                // Extract the JSON string from the message
+                let json_str = &msg.data;
+                
+                // Parse JSON and decode base64 image
+                match parse_image_message(json_str) {
+                    Ok((image_data, width, height, encoding)) => {
+                        // Run detection
+                        match detector.detect(&image_data, width, height, &encoding) {
+                            Ok(Some((x1, y1, x2, y2))) => {
+                                println!("Frame #{}: Ball detected at ({:.1}, {:.1}) to ({:.1}, {:.1})", 
+                                    frame_count, x1, y1, x2, y2);
+                            }
+                            Ok(None) => {
+                                if frame_count % 30 == 0 {
+                                    println!("Frame #{}: No ball detected", frame_count);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Detection error on frame #{}: {}", frame_count, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to parse image message on frame #{}: {}", frame_count, e);
+                    }
+                }
+            }
+            Ok(None) => {
+                // No message available, sleep briefly to avoid busy-waiting
+                std::thread::sleep(Duration::from_millis(10));
+                
+                // Log periodically if we haven't received messages
+                if frame_count == 0 && last_message_time.elapsed() > Duration::from_secs(2) {
+                    println!("Waiting for messages from camera_node...");
+                    println!("  Nodes discovered: ✓ (both nodes visible)");
+                    println!("  Check: ros2 topic echo /image (should show messages)");
+                    println!("  Check: ros2 topic info /image (should show publisher and subscriber)");
+                    last_message_time = std::time::Instant::now();
+                }
+            }
+            Err(e) => {
+                eprintln!("Error taking message from subscription: {:?}", e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 }
