@@ -1,10 +1,11 @@
-use ros2_client::{Context, NodeName, NodeOptions, MessageTypeName, Name, Message};
+use ros2_client::{Context, NodeName, NodeOptions, MessageTypeName, Name};
 use ros2_client::rustdds::QosPolicies;
 use v4l::video::Capture;
 use v4l::Format;
 use v4l::io::mmap::Stream;
 use v4l::io::traits::CaptureStream;
 use base64::{Engine as _, engine::general_purpose};
+use serde::Serialize;
 
 // Error type for camera operations
 #[derive(Debug)]
@@ -209,15 +210,19 @@ fn main() -> Result<(), CameraError> {
             width, height, base64_data
         );
         
-        // Create ROS2 std_msgs/String message using MessageTypeName
-        let mut msg = Message::new(&message_type)
-            .map_err(|e| CameraError::Message(format!("Failed to create message: {:?}", e)))?;
+        // Create ROS2 std_msgs/String message
+        // std_msgs/String has a single "data" field of type string
+        // Create a struct that matches this format and implements Serialize
+        #[derive(Serialize)]
+        struct StringMessage {
+            data: String,
+        }
         
-        // Set the "data" field of std_msgs/String
-        msg.set("data", json_msg)
-            .map_err(|e| CameraError::Message(format!("Failed to set message data: {:?}", e)))?;
+        let msg = StringMessage {
+            data: json_msg,
+        };
         
-        // Publish the message
+        // Publish using the publisher
         publisher.publish(msg)
             .map_err(|e| CameraError::Message(format!("Failed to publish message: {:?}", e)))?;
         
