@@ -213,7 +213,7 @@ fn main() -> Result<(), CameraError> {
         // Create ROS2 std_msgs/String message
         // std_msgs/String has a single "data" field of type string
         // Create a struct that matches this format and implements Serialize
-        #[derive(Serialize)]
+        #[derive(Serialize, Debug)]
         struct StringMessage {
             data: String,
         }
