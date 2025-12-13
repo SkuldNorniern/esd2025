@@ -1,8 +1,7 @@
-use ros2_client::{Context, Node, NodeOptions};
-use v4l::prelude::*;
-use v4l::video::Capture;
+use ros2_client::{Context, NodeName, NodeOptions};
 use v4l::Format;
 use v4l::io::mmap::Stream;
+use v4l::io::traits::CaptureStream;
 
 // Error type for camera operations
 #[derive(Debug)]
@@ -43,7 +42,9 @@ fn find_v4l_device() -> Result<String, CameraError> {
             // Try to open it to verify it's a capture device
             if let Ok(dev) = v4l::Device::with_path(path) {
                 if let Ok(caps) = dev.query_caps() {
-                    if caps.device_caps().contains(v4l::device::CapabilityFlags::VIDEO_CAPTURE) {
+                    // Check if device supports video capture
+                    // CapabilityFlags::VIDEO_CAPTURE is a bitflag
+                    if caps.capabilities.contains(v4l::CapabilityFlags::VIDEO_CAPTURE) {
                         return Ok(path.to_string());
                     }
                 }
@@ -60,7 +61,12 @@ fn main() -> Result<(), CameraError> {
     // Initialize ROS2 context
     let ctx = Context::new()
         .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 context: {:?}", e)))?;
-    let node = Node::new(&ctx, "camera_node", &NodeOptions::new().enable_rosout(true))
+    
+    // Create node using Context::new_node
+    let node_name = NodeName::new("/", "camera_node")
+        .map_err(|e| CameraError::Ros2(format!("Failed to create node name: {:?}", e)))?;
+    let _node = ctx
+        .new_node(node_name, NodeOptions::new().enable_rosout(true))
         .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
 
     // Create publisher for /image topic
@@ -79,8 +85,8 @@ fn main() -> Result<(), CameraError> {
     // Query device capabilities
     let caps = dev.query_caps()
         .map_err(|e| CameraError::V4l(format!("Failed to query device capabilities: {:?}", e)))?;
-    println!("Device: {}", caps.card());
-    println!("Driver: {}", caps.driver());
+    println!("Device: {}", caps.card);
+    println!("Driver: {}", caps.driver);
 
     // Set format: 320x240 YUYV (common V4L2 format, similar to YUV420)
     // YUYV is a packed YUV format that's widely supported
@@ -95,9 +101,9 @@ fn main() -> Result<(), CameraError> {
     let actual_format = dev.format()
         .map_err(|e| CameraError::Format(format!("Failed to get format: {:?}", e)))?;
     println!("Camera format: {}x{} {:?}", 
-        actual_format.width(), 
-        actual_format.height(),
-        actual_format.fourcc());
+        actual_format.width, 
+        actual_format.height,
+        actual_format.fourcc);
 
     // Create capture stream with 4 buffers for double buffering
     let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 4)
@@ -117,8 +123,8 @@ fn main() -> Result<(), CameraError> {
         frame_count += 1;
 
         // Get frame dimensions from format
-        let width = actual_format.width();
-        let height = actual_format.height();
+        let width = actual_format.width;
+        let height = actual_format.height;
         let frame_size = buffer.len();
 
         // Convert frame data to ROS2 Image message format
