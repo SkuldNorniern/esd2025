@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 ros2-client = "0.8.2"
+rppal = "0.22.1"
