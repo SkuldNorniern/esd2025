@@ -1,4 +1,5 @@
 use ros2_client::{Context, NodeName, NodeOptions};
+use v4l::video::Capture;
 use v4l::Format;
 use v4l::io::mmap::Stream;
 use v4l::io::traits::CaptureStream;
@@ -43,8 +44,8 @@ fn find_v4l_device() -> Result<String, CameraError> {
             if let Ok(dev) = v4l::Device::with_path(path) {
                 if let Ok(caps) = dev.query_caps() {
                     // Check if device supports video capture
-                    // CapabilityFlags::VIDEO_CAPTURE is a bitflag
-                    if caps.capabilities.contains(v4l::CapabilityFlags::VIDEO_CAPTURE) {
+                    // Flags::VIDEO_CAPTURE is a bitflag from capability module
+                    if caps.capabilities.contains(v4l::capability::Flags::VIDEO_CAPTURE) {
                         return Ok(path.to_string());
                     }
                 }
