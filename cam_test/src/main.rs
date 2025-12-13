@@ -121,8 +121,12 @@ fn main() -> Result<(), CameraError> {
         .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 context: {:?}", e)))?;
     
     // Create node using Context::new_node
+    // Node name: camera_node (on Raspberry Pi)
     let node_name = NodeName::new("/", "camera_node")
         .map_err(|e| CameraError::Ros2(format!("Failed to create node name: {:?}", e)))?;
+    
+    println!("ROS2 node name: camera_node");
+    println!("ROS_DOMAIN_ID: {}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
     let mut node = ctx
         .new_node(node_name, NodeOptions::new().enable_rosout(true))
         .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
