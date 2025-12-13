@@ -337,7 +337,8 @@ fn main() -> Result<(), BallDetectError> {
     
     // Create subscription using StringMessage struct
     // This struct matches std_msgs/String format and implements Deserialize
-    // Use the same QoS as the publisher to ensure compatibility
+    // IMPORTANT: Use the exact same QoS as the publisher (Some(QosPolicies::default()))
+    // to ensure compatibility - this must match exactly!
     let subscriber = node
         .create_subscription::<StringMessage>(&image_topic, Some(QosPolicies::default()))
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create subscriber: {:?}", e)))?;
@@ -441,6 +442,7 @@ fn main() -> Result<(), BallDetectError> {
     // Main message reception loop
     // Use take() method which returns Result<Option<(Message, MessageInfo)>, ReadError>
     let mut take_count = 0u64;
+    let mut error_count = 0u64;
     loop {
         // Try to take a message from the subscription
         // This is non-blocking and returns Ok(None) if no message is available
@@ -502,7 +504,10 @@ fn main() -> Result<(), BallDetectError> {
                 }
             }
             Err(e) => {
-                eprintln!("Error taking message from subscription: {:?}", e);
+                error_count += 1;
+                if error_count <= 5 || error_count % 100 == 0 {
+                    eprintln!("Error taking message from subscription (error #{}): {:?}", error_count, e);
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
