@@ -1,0 +1,154 @@
+# ESD 2025 — Ball Tracking Laser Turret (ROS 2 + Rust)
+
+A Raspberry Pi 3B + camera + 2-axis servo gimbal project that detects a ball in the camera feed and points a laser at it by driving pan/tilt servos.
+
+This repo is organized as three Rust nodes:
+
+* `camera` — publishes camera frames to ROS 2
+* `ball_detect` — runs OpenCV ball detection and publishes the ball position
+* `tracker` — converts the detected ball position into pan/tilt commands (control loop)
+
+## Demo concept
+
+```
+Camera -> Image topic -> Ball detection -> (x,y,r,conf) -> Tracker/PID -> Servo angles -> Pan/Tilt
+                                                                    \-> (optional) Laser enable
+```
+
+## Hardware
+
+* Raspberry Pi 3 Model B
+* Camera (Raspberry Pi camera module v2)
+* 2x servos (pan + tilt)
+* Laser module (Always on)
+* External 5V supply for servos with mosfet 
+
+### Wiring (current plan)
+
+* Servo pan (left/right): GPIO18 (physical pin 11)
+* Servo tilt (up/down): GPIO19 (physical pin 13)
+
+Important notes:
+
+* Power servos from an external 5V supply and **share ground** with the Pi.
+
+## Software stack
+
+* Ubuntu Server 24.04 on Raspberry Pi 3B
+* ROS 2 Kilted
+* Rust (main language)
+* OpenCV (ball detection) 
+
+## Repository structure
+
+```
+.
+├── ball_detect/   # OpenCV-based ball detection (ROS 2 node)
+├── camera/        # Camera publisher (ROS 2 node)
+└── tracker/       # Control loop that outputs pan/tilt commands (ROS 2 node)
+```
+
+## ROS 2 interfaces (topics)
+
+Suggested topic contract (simple and debuggable):
+
+* `/image` (`sensor_msgs/Image`)
+
+  * Published by `camera`
+  * Subscribed by `ball_detect`
+
+* `/ball` (choose one)
+
+  * Option A (no custom messages): publish
+
+    * `/ball_center` (`geometry_msgs/PointStamped`) where x,y are pixels
+    * `/ball_radius` (`std_msgs/Float32`)
+    * `/ball_confidence` (`std_msgs/Float32`)
+  * Option B (cleaner): create a custom `Ball.msg` with `(x, y, radius, confidence)`
+
+* `/cmd_pan_tilt` (choose one)
+
+  * Angles in degrees/radians, or
+  * Servo pulse widths in microseconds (recommended if your hardware layer expects pulses)
+
+
+
+## Build and run
+
+### 1) Install dependencies
+
+Make sure ROS 2 Kilted is installed and sourced:
+
+```bash
+source /opt/ros/kilted/setup.bash
+```
+
+OpenCV installation depends on your setup (Ubuntu packages are usually fine for a class project):
+
+```bash
+sudo apt update
+sudo apt install -y libopencv-dev pkg-config
+```
+
+### 2) Build
+
+This repo is currently organized as separate Rust crates. You can build each crate directly:
+
+```bash
+cd camera && cargo build --release
+cd ../ball_detect && cargo build --release
+cd ../tracker && cargo build --release
+```
+
+If you later convert this repo into a full ROS 2 workspace (`colcon build`), you’ll run builds from the workspace root instead.
+
+### 3) Run (three terminals)
+
+Terminal A — camera:
+
+```bash
+cd camera
+cargo run --release
+```
+
+Terminal B — ball detection:
+
+```bash
+cd ball_detect
+cargo run --release
+```
+
+Terminal C — tracker:
+
+```bash
+cd tracker
+cargo run --release
+```
+
+## Calibration and tuning
+
+### Vision tuning
+
+* Start at a low resolution (e.g., 320×240) to reduce latency.
+* Tune HSV (or other) thresholds for your ball color and lighting.
+* Add a confidence score and ignore detections below a threshold.
+
+### Control tuning
+
+* Start with P-only control:
+
+  * `pan += Kp_pan * (x - cx)`
+  * `tilt += Kp_tilt * (y - cy)`
+* Add rate limiting and clamps (servo limits) so it doesn’t slam into stops.
+* Optional: add a little D term for damping.
+
+### Alignment
+
+If the camera and laser aren’t perfectly aligned, you’ll need an offset so that “ball centered in image” corresponds to “laser hits ball.”
+
+## Safety
+
+* Use a low-power laser and avoid reflective surfaces.
+* Add a physical kill switch if possible.
+* Default state should be safe: **laser disabled on boot**, and disable on loss of detection or node crash.
+* Keep a beam stop behind the tracking area.
