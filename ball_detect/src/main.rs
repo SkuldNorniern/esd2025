@@ -15,8 +15,10 @@ use serde_json::Value as JsonValue;
 use serde::{Deserialize, Serialize};
 
 // Message struct matching std_msgs/String format
+// ROS2 std_msgs/String has a single field "data" of type string
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct StringMessage {
+    #[serde(rename = "data")]
     data: String,
 }
 
@@ -335,8 +337,9 @@ fn main() -> Result<(), BallDetectError> {
     
     // Create subscription using StringMessage struct
     // This struct matches std_msgs/String format and implements Deserialize
+    // Use the same QoS as the publisher to ensure compatibility
     let subscriber = node
-        .create_subscription::<StringMessage>(&image_topic, None)
+        .create_subscription::<StringMessage>(&image_topic, Some(QosPolicies::default()))
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create subscriber: {:?}", e)))?;
     
     println!("Subscriber created successfully");
@@ -424,13 +427,19 @@ fn main() -> Result<(), BallDetectError> {
     
     // Main message reception loop
     // Use take() method which returns Result<Option<(Message, MessageInfo)>, ReadError>
+    let mut take_count = 0u64;
     loop {
         // Try to take a message from the subscription
         // This is non-blocking and returns Ok(None) if no message is available
+        take_count += 1;
         match subscriber.take() {
-            Ok(Some((msg, _info))) => {
+            Ok(Some((msg, info))) => {
                 frame_count += 1;
                 last_message_time = std::time::Instant::now();
+                
+                if frame_count == 1 {
+                    println!("✓ First message received! (after {} take() calls)", take_count);
+                }
                 
                 // Extract the JSON string from the message
                 let json_str = &msg.data;
@@ -463,12 +472,18 @@ fn main() -> Result<(), BallDetectError> {
                 // No message available, sleep briefly to avoid busy-waiting
                 std::thread::sleep(Duration::from_millis(10));
                 
-                // Log periodically if we haven't received messages
+                // Log periodically with more debugging info
                 if frame_count == 0 && last_message_time.elapsed() > Duration::from_secs(2) {
-                    println!("Waiting for messages from camera_node...");
-                    println!("  Nodes discovered: ✓ (both nodes visible)");
-                    println!("  Check: ros2 topic echo /image (should show messages)");
-                    println!("  Check: ros2 topic info /image (should show publisher and subscriber)");
+                    println!("Waiting for messages... (take() called {} times, no messages yet)", take_count);
+                    println!("  Debug info:");
+                    println!("    - Subscription created: ✓");
+                    println!("    - Topic: /image");
+                    println!("    - Message type: std_msgs/String");
+                    println!("    - Nodes visible: ✓");
+                    println!("  Troubleshooting:");
+                    println!("    - Run: ros2 topic info /image (check publisher/subscriber count)");
+                    println!("    - Run: ros2 topic echo /image (verify messages are published)");
+                    println!("    - Check QoS compatibility between publisher and subscriber");
                     last_message_time = std::time::Instant::now();
                 }
             }

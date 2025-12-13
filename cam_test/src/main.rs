@@ -219,6 +219,7 @@ fn main() -> Result<(), CameraError> {
         // Create a struct that matches this format and implements Serialize
         #[derive(Serialize, Debug)]
         struct StringMessage {
+            #[serde(rename = "data")]
             data: String,
         }
         
