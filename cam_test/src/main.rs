@@ -138,6 +138,15 @@ fn main() -> Result<(), CameraError> {
         .new_node(node_name, NodeOptions::new().enable_rosout(true))
         .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
 
+    // CRITICAL: Start the node spinner in a background thread to process DDS events
+    // This is required for the publisher to send messages properly!
+    // Based on ros2-client examples: https://github.com/Atostek/ros2-client/blob/master/examples/minimal_action_client/main.rs
+    let spinner = node.spinner()
+        .map_err(|e| CameraError::Ros2(format!("Failed to create node spinner: {:?}", e)))?;
+    std::thread::spawn(move || {
+        spinner.spin();
+    });
+
     // Create publisher for /image topic using std_msgs/String for base64-encoded images
     println!("Creating ROS2 publisher on /image topic...");
     let topic_name = Name::new("/", "image")

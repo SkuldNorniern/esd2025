@@ -320,8 +320,18 @@ fn main() -> Result<(), BallDetectError> {
         .new_node(node_name, NodeOptions::new().enable_rosout(true))
         .map_err(|e| BallDetectError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
 
+    // CRITICAL: Start the node spinner in a background thread to process DDS events
+    // This is required for the subscription to receive messages!
+    // Based on ros2-client examples: https://github.com/Atostek/ros2-client/blob/master/examples/minimal_action_client/main.rs
+    let spinner = node.spinner()
+        .map_err(|e| BallDetectError::Ros2(format!("Failed to create node spinner: {:?}", e)))?;
+    std::thread::spawn(move || {
+        spinner.spin();
+    });
+
     println!("ROS2 node created: ball_detect_node");
     println!("ROS_DOMAIN_ID: {:?}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
+    println!("Node spinner started in background thread");
     println!();
 
     // Create subscriber for /image topic
