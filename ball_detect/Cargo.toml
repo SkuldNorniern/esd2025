@@ -3,6 +3,12 @@ name = "ball_detect"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "test_yolo"
+path = "src/test_yolo.rs"
+
 [dependencies]
-opencv = "0.97.2"
+ort = { version = "2.0.0-rc.10", features = [] }
+image = "0.25"
 ros2-client = "0.8.2"
+ndarray = "0.16"
