@@ -1,4 +1,4 @@
-use ros2_client::{Context, Node, NodeOptions, QosProfile};
+use ros_wrapper::{create_topic_receiver, QosProfile, std_msgs::msg::String as StringMsg};
 use rppal::gpio::{Gpio, Level, OutputPin};
 use rppal::pwm::{Channel, Pwm};
 use std::time::{Duration, Instant};
@@ -244,7 +244,55 @@ impl Controller {
     }
 }
 
-fn main() -> Result<(), TrackerError> {
+// Ball detection coordinates (latest values)
+struct BallCoordinates {
+    coords: Arc<Mutex<Option<(f32, f32, f32, f32)>>>,
+    last_update: Arc<Mutex<Instant>>,
+}
+
+impl BallCoordinates {
+    fn new() -> Self {
+        Self {
+            coords: Arc::new(Mutex::new(None)),
+            last_update: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    fn get_coordinates(&self) -> Option<(f32, f32, f32, f32)> {
+        *self.coords.lock().unwrap()
+    }
+
+    fn set_coordinates(&self, coords: Option<(f32, f32, f32, f32)>) {
+        *self.coords.lock().unwrap() = coords;
+        *self.last_update.lock().unwrap() = Instant::now();
+    }
+
+    fn is_stale(&self, timeout: Duration) -> bool {
+        self.last_update.lock().unwrap().elapsed() > timeout
+    }
+}
+
+// Parse coordinates string: "x1,y1,x2,y2" or "none"
+fn parse_coordinates(s: &str) -> Option<(f32, f32, f32, f32)> {
+    if s == "none" {
+        return None;
+    }
+    
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    
+    let x1 = parts[0].parse().ok()?;
+    let y1 = parts[1].parse().ok()?;
+    let x2 = parts[2].parse().ok()?;
+    let y2 = parts[3].parse().ok()?;
+    
+    Some((x1, y1, x2, y2))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing tracker node...");
     println!("GPIO18: Pan servo (Left-Right)");
     println!("GPIO19: Tilt servo (Up-Down)");
@@ -261,74 +309,99 @@ fn main() -> Result<(), TrackerError> {
     servo.set_pan(90.0)?;
     servo.set_tilt(90.0)?;
     println!("Servos set to center position (90 degrees)");
+    println!();
 
-    // Initialize ROS2 context
-    let ctx = Context::new()
-        .map_err(|e| TrackerError::Ros2(format!("Failed to create ROS2 context: {:?}", e)))?;
-    let node = Node::new(&ctx, "tracker_node", &NodeOptions::new().enable_rosout(true))
-        .map_err(|e| TrackerError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
+    // Create subscriber for ball detection coordinates
+    println!("Subscribing to ball detection topic...");
+    let coords = BallCoordinates::new();
+    
+    // Subscribe to /ball_coords topic (single topic with string format: "x1,y1,x2,y2" or "none")
+    let (mut rx_coords, _node_coords) = create_topic_receiver::<StringMsg>(
+        "tracker_node",
+        "/ball_coords",
+        QosProfile::default(),
+    )?;
 
-    println!("ROS2 node created: tracker_node");
+    println!("Subscriber created successfully");
+    println!("  Topic: /ball_coords");
+    println!("  Message type: std_msgs/String");
+    println!("  Format: \"x1,y1,x2,y2\" or \"none\"");
+    println!("ROS_DOMAIN_ID: {}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
+    println!();
+
+    // Wait for subscribers to establish connections
+    println!("Waiting for subscribers to establish connections...");
+    println!("  (DDS discovery can take 5-10 seconds for cross-device communication)");
+    for _i in 1..=10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        print!(".");
+        std::io::Write::flush(&mut std::io::stdout())?;
+    }
+    println!();
+    println!("Subscribers ready, waiting for ball detection data...");
+    println!("(Press Ctrl+C to stop)");
+    println!();
 
     // Image dimensions (should match camera resolution: 320x240)
     let image_width = 320;
     let image_height = 240;
     let mut controller = Controller::new(image_width, image_height);
 
-    println!("Subscribing to ball detection topics...");
-    // TODO: Create subscribers for ball detection
-    // Assuming ball_detect publishes bounding box coordinates
-    // Options:
-    // 1. Single topic with custom message containing (x1, y1, x2, y2)
-    // 2. Separate topics: /ball_x1, /ball_y1, /ball_x2, /ball_y2 (std_msgs/Float32)
-    // 3. Use /ball_center and calculate bounding box from radius
-    //
-    // For now, we'll assume a custom message or separate topics
-    // let subscriber = node.create_subscriber::<BallDetection>(...)
+    // Spawn task to receive coordinates from single topic
+    let coords_clone = BallCoordinates {
+        coords: Arc::clone(&coords.coords),
+        last_update: Arc::clone(&coords.last_update),
+    };
 
-    println!("Waiting for ball detection data...");
-    println!("(Press Ctrl+C to stop)");
-    println!();
+    tokio::spawn(async move {
+        while let Some(msg) = rx_coords.recv().await {
+            let parsed = parse_coordinates(&msg.data);
+            coords_clone.set_coordinates(parsed);
+        }
+    });
 
     // Main control loop
     let mut last_detection_time = Instant::now();
     let timeout = Duration::from_secs(2); // Reset to center if no detection for 2 seconds
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
-        // TODO: Receive ball detection messages from ROS2
-        // Example structure:
-        // match subscriber.receive(Duration::from_millis(100)) {
-        //     Ok(Some(detection_msg)) => {
-        //         let x1 = detection_msg.x1;
-        //         let y1 = detection_msg.y1;
-        //         let x2 = detection_msg.x2;
-        //         let y2 = detection_msg.y2;
-        //
-        //         let (pan_angle, tilt_angle) = controller.update(x1, y1, x2, y2);
-        //         servo.set_pan(pan_angle)?;
-        //         servo.set_tilt(tilt_angle)?;
-        //
-        //         println!("Ball at ({:.1}, {:.1}) to ({:.1}, {:.1}) -> Pan: {:.1}°, Tilt: {:.1}°",
-        //             x1, y1, x2, y2, pan_angle, tilt_angle);
-        //
-        //         last_detection_time = Instant::now();
-        //     }
-        //     Ok(None) => {
-        //         // Timeout - check if we should reset
-        //         if last_detection_time.elapsed() > timeout {
-        //             controller.reset_to_center();
-        //             servo.set_pan(90.0)?;
-        //             servo.set_tilt(90.0)?;
-        //             last_detection_time = Instant::now();
-        //         }
-        //     }
-        //     Err(e) => {
-        //         eprintln!("Error receiving message: {:?}", e);
-        //     }
-        // }
+        interval.tick().await;
 
-        // Placeholder: simulate detection for testing
-        // Remove this when ROS2 integration is complete
-        std::thread::sleep(Duration::from_millis(100));
+        // Check for ball detection coordinates
+        if let Some((x1, y1, x2, y2)) = coords.get_coordinates() {
+            // Check if coordinates are stale
+            if !coords.is_stale(timeout) {
+                let (pan_angle, tilt_angle) = controller.update(x1, y1, x2, y2);
+                servo.set_pan(pan_angle)?;
+                servo.set_tilt(tilt_angle)?;
+
+                println!("Ball at ({:.1}, {:.1}) to ({:.1}, {:.1}) -> Pan: {:.1}°, Tilt: {:.1}°",
+                    x1, y1, x2, y2, pan_angle, tilt_angle);
+
+                last_detection_time = Instant::now();
+            } else {
+                // Coordinates are stale, reset to center
+                if last_detection_time.elapsed() > timeout {
+                    controller.reset_to_center();
+                    servo.set_pan(90.0)?;
+                    servo.set_tilt(90.0)?;
+                    println!("No detection for {}s, resetting to center", timeout.as_secs());
+                    last_detection_time = Instant::now();
+                }
+            }
+        } else {
+            // No coordinates available, check if we should reset
+            if last_detection_time.elapsed() > timeout {
+                controller.reset_to_center();
+                servo.set_pan(90.0)?;
+                servo.set_tilt(90.0)?;
+                if last_detection_time.elapsed() > timeout + Duration::from_secs(1) {
+                    // Only log once per timeout period
+                    println!("No detection for {}s, resetting to center", timeout.as_secs());
+                    last_detection_time = Instant::now();
+                }
+            }
+        }
     }
 }

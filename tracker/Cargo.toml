@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ros2-client = "0.8.2"
+ros_wrapper = { path = "../ros_wrapper" }
 rppal = "0.22.1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

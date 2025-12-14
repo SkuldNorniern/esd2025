@@ -1,6 +1,7 @@
 // Ball Detection Node - YOLO-based detection using ort-rs and ROS2
 // Uses ros_wrapper for ROS communication and receives PNG images via sensor_msgs/Image
-use ros_wrapper::{create_topic_receiver, QosProfile, sensor_msgs::msg::Image};
+// Publishes ball coordinates as a single string message: "x1,y1,x2,y2" or "none"
+use ros_wrapper::{create_topic_receiver, create_topic_sender, QosProfile, sensor_msgs::msg::Image, std_msgs::msg::String as StringMsg};
 use std::time::{Duration, Instant};
 use image::{DynamicImage, ImageBuffer, Rgb};
 use ndarray::Array4;
@@ -259,6 +260,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("(Press Ctrl+C to stop)");
     println!();
 
+    // Create topic sender for ball coordinates
+    println!("Creating publisher for ball coordinates...");
+    let (tx_coords, _node_pub) = create_topic_sender::<StringMsg>(
+        "ball_detect_node",
+        "/ball_coords",
+        QosProfile::default(),
+    )
+    .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic sender: {:?}", e)))?;
+    
+    println!("Publisher created successfully");
+    println!("  Topic: /ball_coords");
+    println!("  Message type: std_msgs/String");
+    println!("  Format: \"x1,y1,x2,y2\" or \"none\"");
+    println!();
+
     let mut frame_count = 0u64;
     let mut last_log_time = Instant::now();
     
@@ -277,19 +293,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         // Run detection on PNG data
-        match detector.detect(&msg.data) {
+        let coords_string = match detector.detect(&msg.data) {
             Ok(Some((x1, y1, x2, y2))) => {
                 println!("Frame #{}: Ball detected at ({:.1}, {:.1}) to ({:.1}, {:.1})", 
                     frame_count, x1, y1, x2, y2);
+                format!("{:.2},{:.2},{:.2},{:.2}", x1, y1, x2, y2)
             }
             Ok(None) => {
                 if frame_count % 30 == 0 {
                     println!("Frame #{}: No ball detected", frame_count);
                 }
+                "none".to_string()
             }
             Err(e) => {
                 eprintln!("Detection error on frame #{}: {}", frame_count, e);
+                "none".to_string()
             }
+        };
+        
+        // Publish coordinates as string
+        let coord_msg = StringMsg {
+            data: coords_string,
+        };
+        if let Err(e) = tx_coords.send(coord_msg).await {
+            eprintln!("Failed to send coordinates: {:?}", e);
         }
         
         // Log periodically if no messages received yet
