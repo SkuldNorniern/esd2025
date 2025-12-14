@@ -104,6 +104,9 @@ impl SoftwarePwmServo {
         let angle_clone = Arc::clone(&angle);
         let running_clone = Arc::clone(&running);
         
+        // Store pin_num for phase offset calculation
+        let pin_num_for_thread = pin_num;
+        
         // Spawn background thread for continuous PWM generation
         // Uses high-priority timing to minimize jitter
         let _thread = thread::spawn(move || {
@@ -121,6 +124,15 @@ impl SoftwarePwmServo {
             let mut cached_pulse_width_us = 1500u64; // Default to center (90°)
             let mut angle_update_counter = 0u32;
             
+            // Phase offset to reduce interference when multiple servos are running
+            // Each servo gets a small offset to avoid synchronized timing
+            // This helps when multiple PWM threads are running simultaneously
+            // GPIO18 (pan) gets 0us offset, GPIO19 (tilt) gets 100us offset
+            let phase_offset_us = (pin_num_for_thread as u64 % 2) * 100;
+            if phase_offset_us > 0 {
+                thread::sleep(Duration::from_micros(phase_offset_us));
+            }
+            
             // Pre-calculate period end duration to avoid repeated Duration::from_micros calls
             // This reduces allocations and improves cache locality
             
@@ -133,12 +145,13 @@ impl SoftwarePwmServo {
                     }
                 }
                 
-                // Read angle atomically - update less frequently to reduce cache line bouncing
-                // Update cached angle every 50 periods (1 second) instead of 10
-                // This is safe because servo movement is slow (0.1s/60°)
-                // Reduces atomic operations by 5x, significantly reducing micro stutter
+                // Read angle atomically - update more frequently for tilt servo responsiveness
+                // Update cached angle every 20 periods (400ms) for better responsiveness
+                // This is still safe because servo movement is slow (0.1s/60°)
+                // Balance between responsiveness and jitter reduction
+                // Tilt servo may need more frequent updates due to gravity/mechanical factors
                 angle_update_counter += 1;
-                if angle_update_counter >= 50 {
+                if angle_update_counter >= 20 {
                     let new_angle = angle_clone.load(Ordering::Relaxed);
                     if new_angle != cached_angle {
                         cached_angle = new_angle;

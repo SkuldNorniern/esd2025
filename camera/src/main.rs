@@ -77,7 +77,7 @@ fn main() -> Result<(), CameraError> {
         // Set resolution to 320x240 for low latency
         stream_config.size = Size::new(320, 240);
         // Use NV12 format (common for video, similar to YUV420)
-        // PixelFormat is created from predefined formats
+        // PixelFormat from predefined formats module
         stream_config.pixel_format = formats::NV12;
     }
 
