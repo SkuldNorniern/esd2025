@@ -199,7 +199,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main capture loop
     let mut frame_count = 0u64;
-    let mut interval = tokio::time::interval(Duration::from_millis(100)); // ~10 FPS
+    // For 30 FPS, we need ~33ms between frames
+    // But we'll capture as fast as possible and let the interval throttle
+    let mut interval = tokio::time::interval(Duration::from_millis(33)); // ~30 FPS (33ms = 1000/30)
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     
     loop {
         interval.tick().await;
