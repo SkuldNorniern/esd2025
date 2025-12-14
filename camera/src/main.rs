@@ -73,20 +73,24 @@ fn main() -> Result<(), CameraError> {
         .ok_or(CameraError::Configuration("Failed to generate configuration".to_string()))?;
 
     // Configure stream settings
-    if let Some(stream_config) = config.streams_mut().get_mut(0) {
+    // Use get_mut to get mutable reference to stream configuration
+    if let Some(mut stream_config) = config.get_mut(0) {
         // Set resolution to 320x240 for low latency
-        stream_config.size = Size::new(320, 240);
+        stream_config.set_size(320, 240);
         // Use NV12 format (common for video, similar to YUV420)
         // PixelFormat from predefined formats module
-        stream_config.pixel_format = formats::NV12;
+        stream_config.set_pixel_format(formats::NV12);
     }
 
     // Validate and apply configuration
     config.validate();
-    camera.configure(&config)
+    camera.configure(&mut config)
         .map_err(|e| CameraError::Configuration(format!("Failed to configure camera: {:?}", e)))?;
 
-    println!("Camera configured: {:?}", config.streams()[0].size);
+    // Get stream config for logging (use get for immutable access)
+    if let Some(stream_config) = config.get(0) {
+        println!("Camera configured: {:?}", stream_config.size());
+    }
 
     // Start the camera (takes Option<&ControlList>, use None for default controls)
     camera.start(None)
@@ -99,9 +103,9 @@ fn main() -> Result<(), CameraError> {
     let mut frame_count = 0u64;
     loop {
         // Create a capture request
-        // create_request takes Option<u64> for request ID, use None for auto
+        // create_request returns Option, not Result
         let request = camera.create_request(None)
-            .map_err(|e| CameraError::Request(format!("Failed to create request: {:?}", e)))?;
+            .ok_or(CameraError::Request("Failed to create request".to_string()))?;
 
         // Queue the request
         camera.queue_request(request)
@@ -116,17 +120,20 @@ fn main() -> Result<(), CameraError> {
         
         // Log frame info periodically
         if frame_count == 1 {
-            let stream_config = &config.streams()[0];
-            println!("First frame queued: {}x{}", 
-                stream_config.size.width, stream_config.size.height);
-            println!("  Format: {:?}", stream_config.pixel_format);
-            println!("  Note: Frame processing API may vary by libcamera-rs version");
+            if let Some(stream_config) = config.get(0) {
+                let size = stream_config.size();
+                println!("First frame queued: {}x{}", size.width, size.height);
+                println!("  Format: {:?}", stream_config.pixel_format());
+                println!("  Note: Frame processing API may vary by libcamera-rs version");
+            }
         }
         
         if frame_count % 30 == 0 {
-            let stream_config = &config.streams()[0];
-            println!("Queued frame #{}: {}x{}", 
-                frame_count, stream_config.size.width, stream_config.size.height);
+            if let Some(stream_config) = config.get(0) {
+                let size = stream_config.size();
+                println!("Queued frame #{}: {}x{}", 
+                    frame_count, size.width, size.height);
+            }
         }
     }
 }
