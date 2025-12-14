@@ -122,10 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Device: {}", caps.card);
     println!("Driver: {}", caps.driver);
 
-    // Set format: 320x240 MJPEG (Motion JPEG, compressed format)
+    // Set format: 640x640 MJPEG (Motion JPEG, compressed format)
     // MJPEG is more commonly supported by webcams and uses less bandwidth
-    let width = 320;
-    let height = 240;
+    let width = 640;
+    let height = 640;
     
     let format = Format::new(width, height, v4l::FourCC::new(b"MJPG"));
     dev.set_format(&format)
