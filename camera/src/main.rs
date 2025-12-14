@@ -2,6 +2,7 @@ use libcamera::camera_manager::CameraManager;
 use libcamera::stream::StreamRole;
 use libcamera::geometry::Size;
 use libcamera::formats;
+use libcamera::frame_buffer_allocator::FrameBufferAllocator;
 use std::time::Duration;
 
 // Error type for camera operations
@@ -93,6 +94,31 @@ fn main() -> Result<(), CameraError> {
         println!("Camera configured: {:?}", stream_config.get_size());
     }
 
+    // Allocate buffers for the stream
+    // Get the stream from configuration (stream() returns Immutable wrapper)
+    let stream_ref = if let Some(stream_config) = config.get(0) {
+        stream_config.stream()
+    } else {
+        return Err(CameraError::Configuration("No stream configuration available".to_string()));
+    };
+    
+    // Create frame buffer allocator
+    let mut allocator = FrameBufferAllocator::new(&camera)
+        .map_err(|e| CameraError::Configuration(format!("Failed to create buffer allocator: {:?}", e)))?;
+    
+    // Allocate buffers for the stream
+    // Note: stream_ref might be Immutable<Stream>, check if we need to unwrap or use as_ref
+    allocator.allocate(&stream_ref)
+        .map_err(|e| CameraError::Configuration(format!("Failed to allocate buffers: {:?}", e)))?;
+    
+    // Get allocated buffers
+    let buffers = allocator.buffers(&stream_ref);
+    println!("Allocated {} buffers for stream", buffers.len());
+    
+    if buffers.is_empty() {
+        return Err(CameraError::Configuration("No buffers allocated".to_string()));
+    }
+
     // Start the camera (takes Option<&ControlList>, use None for default controls)
     camera.start(None)
         .map_err(|e| CameraError::CameraStart(format!("Failed to start camera: {:?}", e)))?;
@@ -100,13 +126,24 @@ fn main() -> Result<(), CameraError> {
     println!("Camera started, capturing frames...");
     println!("(Press Ctrl+C to stop)");
 
+    // Pre-queue requests with buffers
+    let mut buffer_index = 0usize;
+    let num_buffers = buffers.len();
+    
     // Main capture loop
     let mut frame_count = 0u64;
     loop {
         // Create a capture request
         // create_request returns Option, not Result
-        let request = camera.create_request(None)
+        let mut request = camera.create_request(None)
             .ok_or(CameraError::Request("Failed to create request".to_string()))?;
+
+        // Add buffer to request (cycle through available buffers)
+        let buffer = &buffers[buffer_index % num_buffers];
+        request.add_buffer(&stream_ref, buffer)
+            .map_err(|e| CameraError::Request(format!("Failed to add buffer to request: {:?}", e)))?;
+        
+        buffer_index += 1;
 
         // Queue the request
         camera.queue_request(request)
