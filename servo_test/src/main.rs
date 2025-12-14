@@ -1,163 +1,210 @@
-use rppal::gpio::Gpio;
-use std::sync::{Arc, Mutex};
+use rppal::gpio::{Gpio, OutputPin};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU16, Ordering},
+    Arc,
+};
 use std::thread;
-use std::time::{Duration, Instant};
 
-// MG90S servo specifications (from datasheet):
-// - Operating frequency: 50Hz (20ms period)
-// - Pulse width range: 1ms (-90°) to 2ms (+90°)
-// - Neutral position: 1.5ms (0°)
-// - Dead band width: 5μs
-// - Operating speed: 0.1s/60° (4.8V), 0.08s/60° (6V)
-// - Operating voltage: 4.8V-6.0V
+const PERIOD_US: u64 = 20_000; // 50Hz
 
-// Software PWM servo with dedicated background thread
-// Uses precise timing to minimize jitter
-struct SoftwarePwmServo {
-    angle: Arc<Mutex<u8>>,
-    running: Arc<Mutex<bool>>,
-    _thread: thread::JoinHandle<()>,
+// MG90S typical: ~1000..2000us (sometimes needs 500..2500 depending on unit)
+// Keep conservative unless you know your endpoints.
+const MIN_US: u16 = 1000;
+const MAX_US: u16 = 2000;
+
+fn angle_to_pulse_us(angle: u16) -> u16 {
+    let a = angle.min(180);
+    MIN_US + ((a * (MAX_US - MIN_US)) / 180)
 }
 
-// Precise busy-wait function that doesn't yield to scheduler
-// Uses CPU cycles for accurate microsecond-level timing
-#[inline(never)]
-fn busy_wait_until(target: Instant) {
-    // Use a tight loop without yielding to maintain precise timing
-    // This is acceptable in a dedicated PWM thread
-    while Instant::now() < target {
-        // Empty loop - compiler won't optimize this away due to Instant::now()
+// --------- low-level monotonic time helpers (absolute scheduling) ---------
+
+fn now_mono_ns() -> u64 {
+    unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        (ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)
+    }
+}
+
+fn sleep_until_mono_ns(target_ns: u64) {
+    unsafe {
+        let ts = libc::timespec {
+            tv_sec: (target_ns / 1_000_000_000u64) as libc::time_t,
+            tv_nsec: (target_ns % 1_000_000_000u64) as libc::c_long,
+        };
+        // Absolute sleep on CLOCK_MONOTONIC
+        libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut());
+    }
+}
+
+fn spin_until_mono_ns(target_ns: u64) {
+    while now_mono_ns() < target_ns {
         std::hint::spin_loop();
     }
 }
 
-impl SoftwarePwmServo {
-    fn new(pin_num: u8) -> Result<Self, rppal::gpio::Error> {
+// Try to make the PWM thread “win” against Linux.
+// If this fails, it still runs; you just get more jitter.
+fn try_make_realtime_and_pin() {
+    unsafe {
+        // SCHED_FIFO priority: 1..99
+        let param = libc::sched_param { sched_priority: 80 };
+        libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+
+        // Pin to CPU 0 (helps avoid migration jitter)
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(0, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+pub struct DualServoPwm {
+    pulse1_us: Arc<AtomicU16>,
+    pulse2_us: Arc<AtomicU16>,
+    running: Arc<AtomicBool>,
+    _thread: thread::JoinHandle<()>,
+}
+
+impl DualServoPwm {
+    pub fn new(pin1: u8, pin2: u8) -> Result<Self, Box<dyn std::error::Error>> {
         let gpio = Gpio::new()?;
-        let pin = gpio.get(pin_num)?.into_output();
-        
-        let angle = Arc::new(Mutex::new(90)); // Start at center
-        let running = Arc::new(Mutex::new(true));
-        
-        let angle_clone = Arc::clone(&angle);
-        let running_clone = Arc::clone(&running);
-        
-        // Spawn background thread for continuous PWM generation
-        // Uses high-priority timing to minimize jitter
-        let _thread = thread::spawn(move || {
-            let mut pin = pin;
-            const PERIOD_US: u64 = 20_000; // 50Hz = 20ms period
-            const PERIOD_DURATION: Duration = Duration::from_micros(PERIOD_US);
-            
-            // Cache angle to reduce lock contention
-            let mut cached_angle = 90u8;
-            let mut angle_update_counter = 0u32;
-            
-            loop {
-                // Check if we should stop (non-blocking check)
-                if !*running_clone.lock().unwrap() {
-                    break;
-                }
-                
-                // Update cached angle every 10 periods to reduce lock contention
-                // This is safe because servo movement is slow (0.1s/60°)
-                angle_update_counter += 1;
-                if angle_update_counter >= 10 {
-                    cached_angle = *angle_clone.lock().unwrap();
-                    angle_update_counter = 0;
-                }
-                
-                let angle = cached_angle.min(180) as u64;
-                
-                // Convert angle to pulse width in microseconds
-                // 0° = 1000μs (1ms), 90° = 1500μs (1.5ms), 180° = 2000μs (2ms)
-                // Linear interpolation: pulse = 1000 + (angle * 1000) / 180
-                let pulse_width_us = 1000 + ((angle * 1000) / 180);
-                
-                // Generate one PWM period with precise timing
-                let period_start = Instant::now();
-                
-                // High pulse - set pin high
-                pin.set_high();
-                let high_end = period_start + Duration::from_micros(pulse_width_us);
-                
-                // Precise busy-wait for high pulse duration
-                // Don't use sleep or yield - they cause jitter
-                busy_wait_until(high_end);
-                
-                // Low pulse - set pin low
-                pin.set_low();
-                let period_end = period_start + PERIOD_DURATION;
-                
-                // Precise busy-wait for remaining period time
-                // This ensures exact 20ms period for stable 50Hz frequency
-                busy_wait_until(period_end);
-            }
-        });
-        
-        Ok(SoftwarePwmServo {
-            angle,
+        let p1 = gpio.get(pin1)?.into_output_low();
+        let p2 = gpio.get(pin2)?.into_output_low();
+
+        let pulse1_us = Arc::new(AtomicU16::new(angle_to_pulse_us(90)));
+        let pulse2_us = Arc::new(AtomicU16::new(angle_to_pulse_us(90)));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let pulse1_c = pulse1_us.clone();
+        let pulse2_c = pulse2_us.clone();
+        let running_c = running.clone();
+
+        let _thread = thread::spawn(move || pwm_loop(p1, p2, pulse1_c, pulse2_c, running_c));
+
+        Ok(Self {
+            pulse1_us,
+            pulse2_us,
             running,
             _thread,
         })
     }
 
-    fn set_angle(&self, angle: u8) -> Result<(), rppal::gpio::Error> {
-        *self.angle.lock().unwrap() = angle.min(180);
-        Ok(())
+    pub fn set_angle_1(&self, angle: u16) {
+        self.pulse1_us.store(angle_to_pulse_us(angle), Ordering::Relaxed);
+    }
+
+    pub fn set_angle_2(&self, angle: u16) {
+        self.pulse2_us.store(angle_to_pulse_us(angle), Ordering::Relaxed);
+    }
+
+    pub fn set_angles(&self, a1: u16, a2: u16) {
+        self.set_angle_1(a1);
+        self.set_angle_2(a2);
     }
 }
 
-impl Drop for SoftwarePwmServo {
+impl Drop for DualServoPwm {
     fn drop(&mut self) {
-        *self.running.lock().unwrap() = false;
+        self.running.store(false, Ordering::Relaxed);
+        // Optionally join, but don't block Drop if you don't want to.
+        // let _ = self._thread.join();
     }
+}
+
+fn pwm_loop(
+    mut s1: OutputPin,
+    mut s2: OutputPin,
+    pulse1_us: Arc<AtomicU16>,
+    pulse2_us: Arc<AtomicU16>,
+    running: Arc<AtomicBool>,
+) {
+    try_make_realtime_and_pin();
+
+    let period_ns = PERIOD_US * 1_000;
+    let mut next_start = now_mono_ns() + period_ns;
+
+    // For best edges: sleep most of the time, spin only near deadlines.
+    // Tune this (100..500us) if needed.
+    let spin_guard_ns: u64 = 200_000; // 200us
+
+    while running.load(Ordering::Relaxed) {
+        // Absolute wait for start of frame
+        let now = now_mono_ns();
+        if next_start > now + spin_guard_ns {
+            sleep_until_mono_ns(next_start - spin_guard_ns);
+        }
+        spin_until_mono_ns(next_start);
+
+        let start = next_start;
+
+        let p1 = pulse1_us.load(Ordering::Relaxed).clamp(MIN_US, MAX_US) as u64;
+        let p2 = pulse2_us.load(Ordering::Relaxed).clamp(MIN_US, MAX_US) as u64;
+
+        // Raise both at the same time
+        s1.set_high();
+        s2.set_high();
+
+        // Decide which falls first
+        let (first_is_1, t_first_ns, t_second_ns) = if p1 <= p2 {
+            (true, start + p1 * 1_000, start + p2 * 1_000)
+        } else {
+            (false, start + p2 * 1_000, start + p1 * 1_000)
+        };
+
+        // First falling edge
+        if t_first_ns > now_mono_ns() + spin_guard_ns {
+            sleep_until_mono_ns(t_first_ns - spin_guard_ns);
+        }
+        spin_until_mono_ns(t_first_ns);
+        if first_is_1 {
+            s1.set_low();
+        } else {
+            s2.set_low();
+        }
+
+        // Second falling edge
+        if t_second_ns > now_mono_ns() + spin_guard_ns {
+            sleep_until_mono_ns(t_second_ns - spin_guard_ns);
+        }
+        spin_until_mono_ns(t_second_ns);
+        if first_is_1 {
+            s2.set_low();
+        } else {
+            s1.set_low();
+        }
+
+        // End of period
+        next_start = start + period_ns;
+        // Ensure both are low (safety)
+        s1.set_low();
+        s2.set_low();
+    }
+
+    // Clean shutdown
+    s1.set_low();
+    s2.set_low();
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Initializing MG90S servo test on GPIO 18 and 19...");
-    println!("Both servos using software PWM with dedicated threads");
+    println!("Dual MG90S software PWM test (single RT thread).");
 
-    // Initialize both servos using software PWM
-    let servo1 = SoftwarePwmServo::new(18)
-        .map_err(|e| format!("Failed to initialize servo on GPIO 18: {:?}", e))?;
-    
-    let servo2 = SoftwarePwmServo::new(19)
-        .map_err(|e| format!("Failed to initialize servo on GPIO 19: {:?}", e))?;
+    // Use your actual pins here (you said 17 and 27 in your build)
+    let servos = DualServoPwm::new(17, 27)?;
 
-    println!("Servos initialized. Starting test sequence...");
-    
-    // Small delay to let PWM threads stabilize
-    thread::sleep(Duration::from_millis(100));
-
-    // Test sequence: move both servos through different positions
-    let positions = [(0, "0°"), (90, "90°"), (180, "180°"), (90, "90°")];
-
-    for (angle, label) in positions.iter() {
-        println!("Setting servos to {}...", label);
-        
-        // Set both servos to the same position
-        servo1.set_angle(*angle)
-            .map_err(|e| format!("Failed to set servo1 angle: {:?}", e))?;
-        servo2.set_angle(*angle)
-            .map_err(|e| format!("Failed to set servo2 angle: {:?}", e))?;
-        
-        // Wait for servo to reach position
-        thread::sleep(Duration::from_secs(2));
-    }
-
-    println!("Test sequence completed. Servos holding at center position (90°).");
-    
-    // Keep servos at center position
-    servo1.set_angle(90)
-        .map_err(|e| format!("Failed to set servo1 to center: {:?}", e))?;
-    servo2.set_angle(90)
-        .map_err(|e| format!("Failed to set servo2 to center: {:?}", e))?;
-    
-    println!("Press Ctrl+C to exit...");
-    
-    // Keep the program running
+    // Simple sweep test
     loop {
-        thread::sleep(Duration::from_secs(1));
+        servos.set_angles(0, 0);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        servos.set_angles(90, 90);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        servos.set_angles(180, 180);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        servos.set_angles(90, 90);
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
 }
