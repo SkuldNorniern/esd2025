@@ -391,12 +391,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         
-        // Publish coordinates as string
+        // Publish coordinates as string to /ball_coords topic
         let coord_msg = StringMsg {
-            data: coords_string,
+            data: coords_string.clone(),
         };
-        if let Err(e) = tx_coords.send(coord_msg).await {
-            eprintln!("Failed to send coordinates: {:?}", e);
+        
+        match tx_coords.send(coord_msg).await {
+            Ok(_) => {
+                // Log periodically to confirm coordinates are being sent
+                if frame_count % 30 == 0 {
+                    println!("Published coordinates to /ball_coords: {}", coords_string);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to send coordinates to /ball_coords: {:?}", e);
+                eprintln!("  This may indicate a connection issue with subscribers");
+            }
         }
         
         // Log periodically if no messages received yet
