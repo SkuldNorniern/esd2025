@@ -1,24 +1,25 @@
 use ros_wrapper::{create_topic_receiver, QosProfile, std_msgs::msg::String as StringMsg};
+use rppal::gpio::{Gpio, Level, OutputPin};
 use rppal::pwm::{Channel, Pwm};
-use software_pwm::SoftwarePwmServo;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 // Error type for tracker operations
 #[derive(Debug)]
 enum TrackerError {
     Ros2(String),
+    Gpio(String),
     Pwm(String),
     Control(String),
-    Servo(String),
 }
 
 impl std::fmt::Display for TrackerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TrackerError::Ros2(msg) => write!(f, "ROS2 error: {}", msg),
+            TrackerError::Gpio(msg) => write!(f, "GPIO error: {}", msg),
             TrackerError::Pwm(msg) => write!(f, "PWM error: {}", msg),
             TrackerError::Control(msg) => write!(f, "Control error: {}", msg),
-            TrackerError::Servo(msg) => write!(f, "Servo error: {}", msg),
         }
     }
 }
@@ -26,43 +27,93 @@ impl std::fmt::Display for TrackerError {
 impl std::error::Error for TrackerError {}
 
 // Servo control using PWM
-// GPIO18: Pan (Left-Right) - Hardware PWM
-// GPIO19: Tilt (Up-Down) - Software PWM
+// GPIO18: Pan (Left-Right)
+// GPIO19: Tilt (Up-Down)
 struct ServoController {
     // Hardware PWM for GPIO18 (PWM0)
     pan_pwm: Option<Pwm>,
-    // Software PWM for GPIO19 using software_pwm library
-    tilt_servo: SoftwarePwmServo,
+    // Software PWM for GPIO19 (or hardware if available)
+    tilt_pin: Option<OutputPin>,
+    tilt_pwm_thread: Option<std::thread::JoinHandle<()>>,
+    tilt_angle: Arc<Mutex<f64>>,
+    running: Arc<Mutex<bool>>,
 }
 
 impl ServoController {
     fn new() -> Result<Self, TrackerError> {
+        let gpio = Gpio::new()
+            .map_err(|e| TrackerError::Gpio(format!("Failed to initialize GPIO: {:?}", e)))?;
+
         // GPIO18 is PWM0 (hardware PWM)
         let pan_pwm = Pwm::with_frequency(Channel::Pwm0, 50.0, 0.075, false)
             .map_err(|e| TrackerError::Pwm(format!("Failed to create pan PWM: {:?}", e)))?;
         pan_pwm.enable()
             .map_err(|e| TrackerError::Pwm(format!("Failed to enable pan PWM: {:?}", e)))?;
 
-        // GPIO19 - use software PWM library (pinned to CPU core 3 for best performance)
-        let tilt_servo = SoftwarePwmServo::new(19, Some(3))
-            .map_err(|e| TrackerError::Servo(format!("Failed to create tilt servo: {:?}", e)))?;
+        // GPIO19 - use software PWM since it's not a hardware PWM pin
+        let tilt_pin = gpio.get(19)
+            .map_err(|e| TrackerError::Gpio(format!("Failed to get GPIO19: {:?}", e)))?
+            .into_output();
+
+        let tilt_angle = Arc::new(Mutex::new(90.0)); // Start at center
+        let running = Arc::new(Mutex::new(true));
+        
+        // Start software PWM thread for tilt servo
+        let tilt_angle_clone = Arc::clone(&tilt_angle);
+        let running_clone = Arc::clone(&running);
+        
+        let tilt_pwm_thread = std::thread::spawn(move || {
+            let period_ms = 20.0; // 50Hz = 20ms period
+            let gpio = Gpio::new().ok();
+            let mut tilt_pin = gpio.and_then(|g| g.get(19).ok()).map(|p| p.into_output());
+            
+            loop {
+                let should_run = *running_clone.lock().unwrap();
+                if !should_run {
+                    break;
+                }
+
+                let angle = *tilt_angle_clone.lock().unwrap();
+                let pulse_width_ms = Self::angle_to_pulse_width(angle);
+                let pulse_width_us = (pulse_width_ms * 1000.0) as u64;
+                let period_us = (period_ms * 1000.0) as u64;
+                let off_time_us = period_us - pulse_width_us;
+
+                // Generate PWM pulse
+                if let Some(ref mut pin) = tilt_pin {
+                    pin.set_high();
+                    std::thread::sleep(Duration::from_micros(pulse_width_us));
+                    pin.set_low();
+                    std::thread::sleep(Duration::from_micros(off_time_us));
+                } else {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
 
         Ok(Self {
             pan_pwm: Some(pan_pwm),
-            tilt_servo,
+            tilt_pin: None, // Pin is moved to thread
+            tilt_pwm_thread: Some(tilt_pwm_thread),
+            tilt_angle,
+            running,
         })
     }
 
     // Convert angle (0-180 degrees) to pulse width in milliseconds
     // Standard servos: 1.0ms (0°) to 2.0ms (180°)
+    // Some servos: 0.5ms (0°) to 2.5ms (180°)
     fn angle_to_pulse_width(angle: f64) -> f64 {
+        // Clamp angle to 0-180
         let angle = angle.max(0.0).min(180.0);
+        // Map 0-180 degrees to 1.0-2.0ms
         1.0 + (angle / 180.0) * 1.0
     }
 
     // Convert pulse width to duty cycle for hardware PWM (50Hz, 20ms period)
     fn pulse_width_to_duty_cycle(pulse_width_ms: f64) -> f64 {
-        (pulse_width_ms / 20.0) * 100.0
+        let period_ms = 20.0; // 50Hz
+        (pulse_width_ms / period_ms) * 100.0
     }
 
     // Set pan servo position (0-180 degrees)
@@ -80,10 +131,25 @@ impl ServoController {
 
     // Set tilt servo position (0-180 degrees)
     fn set_tilt(&self, angle: f64) -> Result<(), TrackerError> {
-        let angle_u8 = angle.max(0.0).min(180.0) as u8;
-        self.tilt_servo.set_angle(angle_u8)
-            .map_err(|e| TrackerError::Servo(format!("Failed to set tilt angle: {:?}", e)))?;
+        let angle = angle.max(0.0).min(180.0);
+        *self.tilt_angle.lock().unwrap() = angle;
         Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        *self.running.lock().unwrap() = false;
+        if let Some(thread) = self.tilt_pwm_thread.take() {
+            thread.join().ok();
+        }
+        // Set servos to center position
+        self.set_pan(90.0).ok();
+        self.set_tilt(90.0).ok();
+    }
+}
+
+impl Drop for ServoController {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

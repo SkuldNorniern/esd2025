@@ -9,5 +9,3 @@ path = "src/lib.rs"
 
 [dependencies]
 rppal = "0.22.1"
-thread-priority = "0.13"
-libc = "0.2"
