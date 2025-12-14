@@ -16,10 +16,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Note: For best performance (minimal jitter), run with sudo or set CAP_SYS_NICE capability");
 
     // Initialize both servos using software PWM
-    let servo1 = SoftwarePwmServo::new(18)
+    // Pin to CPU core 3 for best performance (adjust based on your system)
+    // Use None to not set CPU affinity (may have more jitter)
+    let servo1 = SoftwarePwmServo::new(18, Some(3))
         .map_err(|e| format!("Failed to initialize servo on GPIO 18: {:?}", e))?;
     
-    let servo2 = SoftwarePwmServo::new(19)
+    let servo2 = SoftwarePwmServo::new(19, Some(3))
         .map_err(|e| format!("Failed to initialize servo on GPIO 19: {:?}", e))?;
 
     println!("Servos initialized. Starting test sequence...");
