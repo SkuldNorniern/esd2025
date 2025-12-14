@@ -121,7 +121,8 @@ fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
 
 // Convert RGB to PNG bytes
 fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CameraError> {
-    use image::{ImageBuffer, ImageEncoder, Rgb, RgbImage};
+    use image::{ImageBuffer, Rgb, RgbImage};
+    use std::io::Cursor;
     
     // Verify RGB data size
     let expected_size = (width * height * 3) as usize;
@@ -150,17 +151,12 @@ fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Camer
         }
     }
     
-    // Encode to PNG using the newer API
+    // Encode to PNG using write_to method
     let mut png_bytes = Vec::new();
     {
-        let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-        encoder.write_image(
-            img.as_raw(),
-            width,
-            height,
-            image::ColorType::Rgb8.into(),
-        )
-        .map_err(|e| CameraError::Image(format!("Failed to encode PNG: {:?}", e)))?;
+        let mut cursor = Cursor::new(&mut png_bytes);
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| CameraError::Image(format!("Failed to encode PNG: {:?}", e)))?;
     }
     
     Ok(png_bytes)
@@ -222,15 +218,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         actual_format.height,
         actual_format.fourcc);
     
-    // Check if format has stride (bytes per line might be different from width * 2)
-    if let Some(stride) = actual_format.stride {
-        println!("Stride (bytes per line): {} (expected: {})", 
-            stride, 
-            actual_format.width * 2);
-        if stride != actual_format.width * 2 {
-            eprintln!("Warning: Stride mismatch! This may cause image corruption.");
-            eprintln!("  Using stride {} instead of expected {}", stride, actual_format.width * 2);
-        }
+    // Check stride (bytes per line might be different from width * 2)
+    let stride = actual_format.stride;
+    println!("Stride (bytes per line): {} (expected: {})", 
+        stride, 
+        actual_format.width * 2);
+    if stride != actual_format.width * 2 {
+        eprintln!("Warning: Stride mismatch! This may cause image corruption.");
+        eprintln!("  Using stride {} instead of expected {}", stride, actual_format.width * 2);
     }
 
     // Create capture stream with 4 buffers
@@ -260,8 +255,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let width = actual_format.width;
         let height = actual_format.height;
         
-        // Get stride (bytes per line) - use actual stride if available, otherwise calculate
-        let row_stride = actual_format.stride.unwrap_or(width * 2);
+        // Get stride (bytes per line) from format
+        let row_stride = actual_format.stride;
 
         // Verify buffer size matches expected YUYV size
         let expected_size = (row_stride * height) as usize;
