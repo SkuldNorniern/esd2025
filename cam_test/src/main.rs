@@ -59,11 +59,10 @@ fn find_v4l_device() -> Result<String, CameraError> {
 // Convert YUYV format to RGB8
 // YUYV format: 4 bytes per 2 pixels: Y0 U Y1 V
 // Each pair of pixels shares U and V components
-fn yuyv_to_rgb(yuyv_data: &[u8], width: u32, height: u32) -> Vec<u8> {
+// row_stride: bytes per row (may include padding)
+fn yuyv_to_rgb(yuyv_data: &[u8], width: u32, height: u32, row_stride: u32) -> Vec<u8> {
     let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
-    
-    // YUYV: each row is width * 2 bytes (2 pixels per 4 bytes)
-    let row_stride_bytes = (width * 2) as usize;
+    let row_stride_bytes = row_stride as usize;
     
     for y in 0..height {
         let row_offset = (y as usize) * row_stride_bytes;
@@ -224,12 +223,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         actual_format.fourcc);
     
     // Check if format has stride (bytes per line might be different from width * 2)
-    if let Some(bytesperline) = actual_format.bytesperline {
-        println!("Bytes per line: {} (expected: {})", 
-            bytesperline, 
+    if let Some(stride) = actual_format.stride {
+        println!("Stride (bytes per line): {} (expected: {})", 
+            stride, 
             actual_format.width * 2);
-        if bytesperline != actual_format.width * 2 {
+        if stride != actual_format.width * 2 {
             eprintln!("Warning: Stride mismatch! This may cause image corruption.");
+            eprintln!("  Using stride {} instead of expected {}", stride, actual_format.width * 2);
         }
     }
 
@@ -259,12 +259,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Get frame dimensions from format
         let width = actual_format.width;
         let height = actual_format.height;
+        
+        // Get stride (bytes per line) - use actual stride if available, otherwise calculate
+        let row_stride = actual_format.stride.unwrap_or(width * 2);
 
-        // Verify buffer size matches expected YUYV size (width * height * 2 bytes)
-        let expected_size = (width * height * 2) as usize;
+        // Verify buffer size matches expected YUYV size
+        let expected_size = (row_stride * height) as usize;
         if buffer.len() != expected_size {
-            eprintln!("Warning: Buffer size mismatch. Expected {} bytes, got {} bytes", 
-                expected_size, buffer.len());
+            eprintln!("Warning: Buffer size mismatch. Expected {} bytes (stride {} * height {}), got {} bytes", 
+                expected_size, row_stride, height, buffer.len());
             if buffer.len() < expected_size {
                 eprintln!("Buffer is too small, skipping frame");
                 continue;
@@ -275,6 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if frame_count == 1 {
             println!("First 16 bytes of raw frame: {:?}", 
                 &buffer[..buffer.len().min(16)]);
+            println!("Using stride: {} bytes per line", row_stride);
             if let Err(e) = std::fs::write("debug_raw_frame.bin", &buffer) {
                 eprintln!("Failed to save raw frame: {:?}", e);
             } else {
@@ -282,8 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Convert YUYV to RGB8
-        let rgb_data = yuyv_to_rgb(&buffer, width, height);
+        // Convert YUYV to RGB8 (using actual stride)
+        let rgb_data = yuyv_to_rgb(&buffer, width, height, row_stride);
         
         // Verify RGB data size
         let expected_rgb_size = (width * height * 3) as usize;
