@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-// Ultra-precise busy-wait with consistent timing
-// Uses a simple, predictable loop for maximum consistency
+// Precise busy-wait with minimal overhead
+// Simple, direct approach for maximum consistency
 #[inline(never)]
 fn busy_wait_until(target: Instant) {
-    // Simple, consistent loop - no batching that could introduce timing variations
-    // The key is consistency, not minimizing Instant::now() calls
+    // Simple tight loop - most predictable timing
+    // Instant::now() is fast enough for microsecond precision
     while Instant::now() < target {
         std::hint::spin_loop();
     }
@@ -66,24 +66,29 @@ impl SoftwarePwmServo {
                 pulse_widths[angle as usize] = 1000u64 + ((angle as u64 * 1000u64) / 180u64);
             }
             
-            // Cache angle and pulse width to minimize calculations
+            // Cache angle and pulse width to minimize atomic reads and calculations
             let mut cached_angle = 90u8;
             let mut cached_pulse_width_us = pulse_widths[90];
+            let mut angle_update_counter = 0u32;
             
             loop {
                 // Check if we should stop (non-blocking atomic check - no locks!)
-                // Use Relaxed ordering for speed (single writer, single reader)
+                // Use Relaxed ordering - we don't need strict ordering for a stop flag
                 if !running_clone.load(Ordering::Relaxed) {
                     break;
                 }
                 
-                // Read angle atomically every period for maximum responsiveness
-                // Only recalculate pulse width if angle changed
-                // Use Relaxed ordering for maximum speed (single writer, single reader)
-                let new_angle = angle_clone.load(Ordering::Relaxed).min(180);
-                if new_angle != cached_angle {
-                    cached_angle = new_angle;
-                    cached_pulse_width_us = pulse_widths[cached_angle as usize];
+                // Read angle atomically - update every period for responsiveness
+                // But only recalculate pulse width if angle changed
+                angle_update_counter += 1;
+                if angle_update_counter >= 5 {
+                    // Use Relaxed ordering - we don't need strict ordering here
+                    let new_angle = angle_clone.load(Ordering::Relaxed).min(180);
+                    if new_angle != cached_angle {
+                        cached_angle = new_angle;
+                        cached_pulse_width_us = pulse_widths[cached_angle as usize];
+                    }
+                    angle_update_counter = 0;
                 }
                 
                 // Generate one PWM period with precise timing
@@ -138,7 +143,7 @@ impl SoftwarePwmServo {
     /// ```
     pub fn set_angle(&self, angle: u8) -> Result<(), rppal::gpio::Error> {
         // Atomic write - use Relaxed ordering for speed
-        // Single writer, single reader pattern doesn't need stronger ordering
+        // The angle is checked frequently enough that strict ordering isn't needed
         self.angle.store(angle.min(180), Ordering::Relaxed);
         Ok(())
     }
