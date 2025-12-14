@@ -126,7 +126,7 @@ fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Camer
             img.as_raw(),
             width,
             height,
-            image::ColorType::Rgb8,
+            image::ColorType::Rgb8.into(),
         )
         .map_err(|e| CameraError::Image(format!("Failed to encode PNG: {:?}", e)))?;
     }
