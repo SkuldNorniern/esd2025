@@ -76,7 +76,8 @@ fn main() -> Result<(), CameraError> {
     // Use get_mut to get mutable reference to stream configuration
     if let Some(mut stream_config) = config.get_mut(0) {
         // Set resolution to 320x240 for low latency
-        stream_config.set_size(320, 240);
+        // set_size takes a Size object, not two integers
+        stream_config.set_size(Size::new(320, 240));
         // Use NV12 format (common for video, similar to YUV420)
         // PixelFormat from predefined formats module
         stream_config.set_pixel_format(formats::NV12);
@@ -89,7 +90,7 @@ fn main() -> Result<(), CameraError> {
 
     // Get stream config for logging (use get for immutable access)
     if let Some(stream_config) = config.get(0) {
-        println!("Camera configured: {:?}", stream_config.size());
+        println!("Camera configured: {:?}", stream_config.get_size());
     }
 
     // Start the camera (takes Option<&ControlList>, use None for default controls)
@@ -121,16 +122,16 @@ fn main() -> Result<(), CameraError> {
         // Log frame info periodically
         if frame_count == 1 {
             if let Some(stream_config) = config.get(0) {
-                let size = stream_config.size();
+                let size = stream_config.get_size();
                 println!("First frame queued: {}x{}", size.width, size.height);
-                println!("  Format: {:?}", stream_config.pixel_format());
+                println!("  Format: {:?}", stream_config.get_pixel_format());
                 println!("  Note: Frame processing API may vary by libcamera-rs version");
             }
         }
         
         if frame_count % 30 == 0 {
             if let Some(stream_config) = config.get(0) {
-                let size = stream_config.size();
+                let size = stream_config.get_size();
                 println!("Queued frame #{}: {}x{}", 
                     frame_count, size.width, size.height);
             }
