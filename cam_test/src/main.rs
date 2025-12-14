@@ -2,7 +2,7 @@ use ros_wrapper::{create_topic_sender, QosProfile, sensor_msgs::msg::Image};
 use v4l::video::Capture;
 use v4l::Format;
 use v4l::io::mmap::Stream;
-use v4l::io::traits::CaptureStream;
+use v4l::io::traits::{CaptureStream, Stream as StreamTrait};
 use std::time::Duration;
 
 // Error type for camera operations
@@ -320,8 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 png_size);
         }
         
-        // Re-queue the buffer so it can be filled with the next frame
-        stream.queue(meta.index)
-            .map_err(|e| CameraError::Frame(format!("Failed to re-queue buffer: {:?}", e)))?;
+        // Note: stream.next() automatically re-queues the buffer when called again,
+        // so no manual re-queuing is needed
     }
 }
