@@ -112,7 +112,7 @@ fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
 
 // Convert RGB to PNG bytes
 fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CameraError> {
-    use image::{ImageBuffer, Rgb, RgbImage};
+    use image::{ImageBuffer, ImageEncoder, Rgb, RgbImage};
     
     // Create RGB image from raw data
     let img: RgbImage = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, rgb_data.to_vec())
