@@ -2,6 +2,7 @@
 // Subscribes to std_msgs/String messages on /test_topic
 
 use rclrs::*;
+use rclrs::vendor::example_interfaces::msg::String as StringMsg;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,11 +68,11 @@ fn main() -> Result<(), RclrsError> {
     let first_message_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let first_message_received_clone = Arc::clone(&first_message_received);
 
-    // Using example_interfaces::msg::String as shown in rclrs docs
+    // Using rclrs::vendor::example_interfaces::msg::String
     // This is compatible with std_msgs/String in ROS 2
     let _subscription = node.create_subscription(
         "test_topic",
-        move |msg: example_interfaces::msg::String| {
+        move |msg: StringMsg| {
             let count = message_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
             
             if !first_message_received_clone.swap(true, Ordering::Relaxed) {
@@ -84,7 +85,7 @@ fn main() -> Result<(), RclrsError> {
 
     println!("Subscriber created successfully");
     println!("  Topic: /test_topic");
-    println!("  Message type: std_msgs/String (using example_interfaces::msg::String)");
+    println!("  Message type: std_msgs/String (using rclrs::vendor::example_interfaces::msg::String)");
     println!();
 
     // Wait for subscriber to establish connections

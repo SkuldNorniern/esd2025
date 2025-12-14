@@ -2,6 +2,7 @@
 // Publishes std_msgs/String messages on /test_topic
 
 use rclrs::*;
+use rclrs::vendor::example_interfaces::msg::String as StringMsg;
 use std::time::Duration;
 
 fn main() -> Result<(), RclrsError> {
@@ -57,10 +58,10 @@ fn main() -> Result<(), RclrsError> {
     println!();
 
     // Create publisher for /test_topic
-    // Using example_interfaces::msg::String as shown in rclrs docs
+    // Using rclrs::vendor::example_interfaces::msg::String
     // This is compatible with std_msgs/String in ROS 2
     println!("Creating ROS2 publisher on /test_topic...");
-    let publisher = node.create_publisher::<example_interfaces::msg::String>("test_topic")?;
+    let publisher = node.create_publisher::<StringMsg>("test_topic")?;
 
     println!("Publisher created successfully");
     println!();
@@ -86,7 +87,7 @@ fn main() -> Result<(), RclrsError> {
         message_count += 1;
 
         // Create message
-        let msg = example_interfaces::msg::String {
+        let msg = StringMsg {
             data: format!("Hello from ros_test_A! Message #{}", message_count),
         };
 
