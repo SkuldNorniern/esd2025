@@ -108,14 +108,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Process incoming messages
-    while let Some(msg) = subscriber.next().await {
-        let count = message_count.fetch_add(1, Ordering::Relaxed) + 1;
-        
-        if !first_message_received.swap(true, Ordering::Relaxed) {
-            println!("First message received!");
+    // We need to periodically spin the node to process incoming messages
+    let mut spin_interval = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            msg_result = subscriber.next() => {
+                if let Some(msg) = msg_result {
+                    let count = message_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    
+                    if !first_message_received.swap(true, Ordering::Relaxed) {
+                        println!("First message received!");
+                    }
+                    
+                    println!("Received message #{}: {}", count, msg.data);
+                }
+            }
+            _ = spin_interval.tick() => {
+                // Periodically spin the node to process DDS events and incoming messages
+                node.spin_once(Duration::from_millis(10));
+            }
         }
-        
-        println!("Received message #{}: {}", count, msg.data);
     }
 
     Ok(())
