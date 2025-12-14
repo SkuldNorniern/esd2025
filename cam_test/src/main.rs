@@ -139,15 +139,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         actual_format.height,
         actual_format.fourcc);
     
-    // Check stride (bytes per line might be different from width * 3 for RGB3)
+    // Check format - MJPEG is compressed, so stride is 0
     let stride = actual_format.stride;
-    println!("Stride (bytes per line): {} (expected: {})", 
-        stride, 
-        actual_format.width * 3);
-    if stride != actual_format.width * 3 {
-        eprintln!("Warning: Stride mismatch! This may cause image corruption.");
-        eprintln!("  Using stride {} instead of expected {}", stride, actual_format.width * 3);
+    let is_mjpeg = actual_format.fourcc.to_string() == "MJPG";
+    
+    if is_mjpeg {
+        println!("Format: MJPEG (compressed JPEG, stride is 0 for compressed formats)");
+    } else {
+        println!("Stride (bytes per line): {} (expected: {})", 
+            stride, 
+            actual_format.width * 3);
+        if stride != actual_format.width * 3 && stride != 0 {
+            eprintln!("Warning: Stride mismatch! This may cause image corruption.");
+            eprintln!("  Using stride {} instead of expected {}", stride, actual_format.width * 3);
+        }
     }
+    
+    // Store is_mjpeg for use in the capture loop
+    let format_is_mjpeg = is_mjpeg;
 
     // Create capture stream with 4 buffers
     let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 4)
@@ -168,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!();
-    if is_mjpeg {
+    if format_is_mjpeg {
         println!("Publishing MJPEG (compressed JPEG) images to /image topic (press Ctrl+C to stop)");
     } else {
         println!("Publishing RGB3/rgb24 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
@@ -199,8 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // For MJPEG, use the actual bytes used (compressed size)
         // For uncompressed formats, use stride * height
-        let is_mjpeg = actual_format.fourcc.to_string() == "MJPG";
-        let image_data = if is_mjpeg {
+        let image_data = if format_is_mjpeg {
             // MJPEG: use only the bytes actually used (compressed JPEG data)
             // meta.bytesused contains the actual compressed size
             let bytes_used = meta.bytesused as usize;
@@ -245,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         if !is_valid {
             if frame_count <= 10 {
-                if is_mjpeg {
+                if format_is_mjpeg {
                     println!("Frame #{}: Invalid JPEG (seq: {}, bytesused: {}), skipping (camera may still be initializing)", 
                         frame_count, meta.sequence, meta.bytesused);
                 } else {
@@ -268,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Sequence: {}, Bytes used: {}, Buffer size: {}", 
                 meta.sequence, meta.bytesused, buffer.len());
             if frame_count == 1 && is_valid {
-                if is_mjpeg {
+                if format_is_mjpeg {
                     println!("Format: MJPEG (compressed JPEG)");
                     if let Err(e) = std::fs::write("debug_mjpeg_frame.jpg", image_data) {
                         eprintln!("Failed to save MJPEG frame: {:?}", e);
@@ -294,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         
         let data_size = image_data.len();
-        let (encoding, step) = if is_mjpeg {
+        let (encoding, step) = if format_is_mjpeg {
             ("jpeg".to_string(), 0u32) // MJPEG: compressed, no step
         } else {
             ("rgb8".to_string(), (width * 3) as u32) // RGB3: 3 bytes per pixel
@@ -324,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Log frame capture info periodically
         if frame_count % 30 == 0 {
-            if is_mjpeg {
+            if format_is_mjpeg {
                 println!("Published frame #{}: {}x{} MJPEG ({} bytes compressed)", 
                     frame_count,
                     width, height, 
