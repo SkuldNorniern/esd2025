@@ -297,7 +297,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Size: {}x{}", msg.width, msg.height);
         }
         
-        // Convert RGB3/rgb24 (received as "rgb8" encoding) to PNG if needed, or use PNG data directly
+        // Convert image data to PNG format for YOLO processing
+        // Supports: rgb8 (RGB3/rgb24 raw), jpeg/mjpeg (compressed JPEG), png (already PNG)
         let png_data = if msg.encoding == "rgb8" {
             // Convert RGB3/rgb24 (24-bit RGB 8-8-8) raw data to PNG
             // ROS uses "rgb8" encoding name for RGB3 (V4L2) / rgb24 (ffmpeg) format
@@ -308,11 +309,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             }
+        } else if msg.encoding == "jpeg" || msg.encoding == "mjpeg" {
+            // Decode JPEG/MJPEG to image, then convert to PNG
+            // The image crate can decode JPEG directly
+            let img = match image::load_from_memory(&msg.data) {
+                Ok(img) => img,
+                Err(e) => {
+                    eprintln!("Frame #{}: Failed to decode JPEG: {}", frame_count, e);
+                    continue;
+                }
+            };
+            
+            // Convert to PNG bytes
+            let mut png_bytes = Vec::new();
+            {
+                use std::io::Write;
+                let mut cursor = std::io::Cursor::new(&mut png_bytes);
+                if let Err(e) = img.write_to(&mut cursor, image::ImageFormat::Png) {
+                    eprintln!("Frame #{}: Failed to encode PNG from JPEG: {}", frame_count, e);
+                    continue;
+                }
+            }
+            png_bytes
         } else if msg.encoding == "png" {
             // Already PNG, use directly
             msg.data.clone()
         } else {
-            eprintln!("Frame #{}: Unsupported encoding '{}', expected 'rgb8' (RGB3/rgb24) or 'png'", frame_count, msg.encoding);
+            eprintln!("Frame #{}: Unsupported encoding '{}', expected 'rgb8' (RGB3/rgb24), 'jpeg'/'mjpeg' (MJPEG), or 'png'", frame_count, msg.encoding);
             continue;
         };
         

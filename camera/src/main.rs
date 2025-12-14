@@ -95,65 +95,67 @@ fn main() -> Result<(), CameraError> {
     };
     
     // Create frame buffer allocator
-    // Note: The FrameBufferAllocator API in libcamera-rs 0.6.0 appears to be different
-    // The allocate() and buffers() methods don't exist
-    // Let's try a different approach - maybe buffers are allocated automatically
-    // or we need to use the allocator differently
-    let _allocator = FrameBufferAllocator::new(&camera);
+    // Based on C++ libcamera API: allocator->allocate(stream) and allocator->buffers(stream)
+    // In Rust, these should be: allocator.allocate(&stream) and allocator.buffers(&stream)
+    let mut allocator = FrameBufferAllocator::new(&camera);
     
-    // Check if any buffers are allocated (allocated() takes no arguments)
-    let is_allocated = _allocator.allocated();
-    println!("Buffers allocated: {}", is_allocated);
+    // Allocate buffers for the stream
+    // C++: int ret = allocator->allocate(cfg.stream()); (returns < 0 on error)
+    // Rust equivalent: should return Result<usize> or Result<()>
+    println!("Allocating buffers for stream...");
     
-    // Since allocate() and buffers() methods don't exist, we'll try to work
-    // without explicit buffer allocation - maybe the camera handles it automatically
-    // or we need to use a different API
-    println!("Note: FrameBufferAllocator.allocate() and .buffers() methods not found");
-    println!("  Attempting to use camera without explicit buffer allocation");
-    println!("  Buffers may be allocated automatically or via different API");
+    // Try allocate - the exact return type may vary
+    // C++ returns int (< 0 on error), Rust might return Result<usize> or Result<()>
+    // Try without type annotation first to see what the compiler says
+    allocator.allocate(&stream)
+        .map_err(|e| CameraError::Configuration(format!("Failed to allocate buffers: {:?}", e)))?;
     
-    // Start the camera
+    println!("Buffers allocated successfully");
+    
+    // Get allocated buffers
+    // C++: const std::vector<std::unique_ptr<FrameBuffer>> &buffers = allocator->buffers(stream);
+    // Rust equivalent should return &[FrameBuffer] or Vec<FrameBuffer> or similar
+    println!("Retrieving allocated buffers...");
+    let buffers = allocator.buffers(&stream);
+    println!("Retrieved {} buffer(s)", buffers.len());
+    
+    if buffers.is_empty() {
+        return Err(CameraError::Configuration("No buffers allocated".to_string()));
+    }
+    
+    // Start the camera before queuing requests
     camera.start(None)
         .map_err(|e| CameraError::CameraStart(format!("Failed to start camera: {:?}", e)))?;
     
-    println!("Camera started, attempting to capture a frame...");
+    println!("Camera started, capturing a frame...");
     
-    // Try to create a request without explicit buffers
-    // Maybe the camera/request API handles buffer allocation automatically
+    // Create a request and add a buffer to it
+    // C++: request->addBuffer(stream, buffer.get());
     let mut request = camera.create_request(None)
         .ok_or(CameraError::Request("Failed to create request".to_string()))?;
     
-    // Try to queue request without adding buffer - see what error we get
-    // This will help us understand if buffers are needed and how to get them
-    match camera.queue_request(request) {
-        Ok(_) => {
-            println!("Request queued successfully (without explicit buffer)");
-        }
-        Err(e) => {
-            println!("Failed to queue request without buffer: {:?}", e);
-            println!("  This suggests we need to add buffers to requests");
-            println!("  But FrameBufferAllocator API needs to be determined");
-            return Err(CameraError::Request(format!("Need buffers but allocation API unknown: {:?}", e)));
-        }
-    }
+    // Add buffer to request (use first buffer)
+    // C++: int ret = request->addBuffer(stream, buffer.get());
+    let buffer = &buffers[0];
+    request.add_buffer(&stream, buffer)
+        .map_err(|e| CameraError::Request(format!("Failed to add buffer to request: {:?}", e)))?;
     
-    println!("Request queued, waiting for frame...");
+    // Queue the request
+    // C++: camera->queueRequest(request.get());
+    camera.queue_request(request)
+        .map_err(|e| CameraError::Request(format!("Failed to queue request: {:?}", e)))?;
     
-    // Wait a bit for frame capture
+    println!("Request queued, waiting for frame completion...");
+    
+    // Wait for request completion
+    // In C++, this is handled via signals/slots (camera->requestCompleted.connect(callback))
+    // In Rust, we need to find the equivalent API
     std::thread::sleep(Duration::from_millis(500));
     
-    println!("Note: Complete implementation requires:");
-    println!("  1. Finding FrameBufferAllocator API to allocate/get buffers");
-    println!("  2. Adding buffers to requests");
-    println!("  3. Waiting for request completion");
-    println!("  4. Getting frame data from completed request");
-    println!("  5. Converting NV12 to RGB");
-    println!("  6. Saving as image file");
-    
-    println!("\nTo find the correct API, check:");
-    println!("  - libcamera-rs 0.6.0 source code on GitHub");
-    println!("  - Example code (e.g., jpeg_capture example)");
-    println!("  - libcamera C++ API documentation (Rust bindings should mirror it)");
+    println!("Note: Request completion handling needs to be implemented");
+    println!("  In C++: camera->requestCompleted.connect(callback)");
+    println!("  In Rust: Need to find equivalent signal/callback API");
+    println!("  Once request completes, extract frame data and save as image");
     
     Ok(())
 }

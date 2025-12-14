@@ -55,3 +55,4 @@ pub fn rgb8_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
     
     Ok(png_bytes)
 }
+

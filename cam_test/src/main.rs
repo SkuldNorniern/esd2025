@@ -34,18 +34,16 @@ impl std::fmt::Display for CameraError {
 impl std::error::Error for CameraError {}
 
 fn find_v4l_device() -> Result<String, CameraError> {
-    // Try common V4L2 device paths
-    let device_paths = ["/dev/video0", "/dev/video1", "/dev/video2"];
+    // Use /dev/video2 specifically as requested
+    let device_path = "/dev/video2";
     
-    for path in device_paths.iter() {
-        if std::path::Path::new(path).exists() {
-            // Try to open it to verify it's a capture device
-            if let Ok(dev) = v4l::Device::with_path(path) {
-                if let Ok(caps) = dev.query_caps() {
-                    // Check if device supports video capture
-                    if caps.capabilities.contains(v4l::capability::Flags::VIDEO_CAPTURE) {
-                        return Ok(path.to_string());
-                    }
+    if std::path::Path::new(device_path).exists() {
+        // Try to open it to verify it's a capture device
+        if let Ok(dev) = v4l::Device::with_path(device_path) {
+            if let Ok(caps) = dev.query_caps() {
+                // Check if device supports video capture
+                if caps.capabilities.contains(v4l::capability::Flags::VIDEO_CAPTURE) {
+                    return Ok(device_path.to_string());
                 }
             }
         }
@@ -124,12 +122,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Device: {}", caps.card);
     println!("Driver: {}", caps.driver);
 
-    // Set format: 320x240 RGB3/rgb24 (24-bit RGB 8-8-8, no conversion needed)
-    // RGB3 (V4L2) / rgb24 (ffmpeg): Stepwise 16x16 - 16376x16376 with step 1/1
+    // Set format: 320x240 MJPEG (Motion JPEG, compressed format)
+    // MJPEG is more commonly supported by webcams and uses less bandwidth
     let width = 320;
     let height = 240;
     
-    let format = Format::new(width, height, v4l::FourCC::new(b"RGB3"));
+    let format = Format::new(width, height, v4l::FourCC::new(b"MJPG"));
     dev.set_format(&format)
         .map_err(|e| CameraError::Format(format!("Failed to set format: {:?}", e)))?;
 
@@ -170,7 +168,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!();
-    println!("Publishing RGB3/rgb24 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
+    if is_mjpeg {
+        println!("Publishing MJPEG (compressed JPEG) images to /image topic (press Ctrl+C to stop)");
+    } else {
+        println!("Publishing RGB3/rgb24 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
+    }
 
     // Main capture loop
     let mut frame_count = 0u64;
@@ -194,98 +196,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Get stride (bytes per line) from format
         let row_stride = actual_format.stride;
-
-        // Verify buffer size matches expected RGB3 size
-        let expected_size = (row_stride * height) as usize;
-        if buffer.len() != expected_size {
-            eprintln!("Warning: Buffer size mismatch. Expected {} bytes (stride {} * height {}), got {} bytes", 
-                expected_size, row_stride, height, buffer.len());
-            if buffer.len() < expected_size {
-                eprintln!("Buffer is too small, skipping frame");
-                continue;
-            }
-        }
-
-        // Check if buffer is all zeros (camera not ready yet)
-        // Sample multiple parts of the buffer to be sure
-        let sample_size = (buffer.len() / 10).min(1024);
-        let is_all_zeros = buffer.iter().take(sample_size).all(|&b| b == 0) &&
-                          buffer.iter().skip(buffer.len() / 2).take(sample_size).all(|&b| b == 0) &&
-                          buffer.iter().skip(buffer.len() - sample_size).all(|&b| b == 0);
         
-        if is_all_zeros {
+        // For MJPEG, use the actual bytes used (compressed size)
+        // For uncompressed formats, use stride * height
+        let is_mjpeg = actual_format.fourcc.to_string() == "MJPG";
+        let image_data = if is_mjpeg {
+            // MJPEG: use only the bytes actually used (compressed JPEG data)
+            // meta.bytesused contains the actual compressed size
+            let bytes_used = meta.bytesused as usize;
+            if bytes_used > buffer.len() {
+                eprintln!("Warning: Bytes used ({}) exceeds buffer size ({}), using buffer size", 
+                    bytes_used, buffer.len());
+                &buffer[..]
+            } else {
+                &buffer[..bytes_used]
+            }
+        } else {
+            // Uncompressed format: verify buffer size
+            let expected_size = if row_stride > 0 {
+                (row_stride * height) as usize
+            } else {
+                (width * height * 3) as usize // RGB3 fallback
+            };
+            
+            if buffer.len() != expected_size {
+                eprintln!("Warning: Buffer size mismatch. Expected {} bytes (stride {} * height {}), got {} bytes", 
+                    expected_size, row_stride, height, buffer.len());
+                if buffer.len() < expected_size {
+                    eprintln!("Buffer is too small, skipping frame");
+                    continue;
+                }
+            }
+            &buffer[..]
+        };
+
+        // For MJPEG, check if it's a valid JPEG (starts with FF D8)
+        // For uncompressed, check if buffer is all zeros
+        let is_valid = if is_mjpeg {
+            // MJPEG: check JPEG header (FF D8)
+            image_data.len() >= 2 && image_data[0] == 0xFF && image_data[1] == 0xD8
+        } else {
+            // Uncompressed: check if not all zeros
+            let sample_size = (image_data.len() / 10).min(1024);
+            !(image_data.iter().take(sample_size).all(|&b| b == 0) &&
+              image_data.iter().skip(image_data.len() / 2).take(sample_size).all(|&b| b == 0) &&
+              image_data.iter().skip(image_data.len().saturating_sub(sample_size)).all(|&b| b == 0))
+        };
+        
+        if !is_valid {
             if frame_count <= 10 {
-                println!("Frame #{}: Buffer is all zeros (seq: {}, bytesused: {}), skipping (camera may still be initializing)", 
-                    frame_count, meta.sequence, meta.bytesused);
+                if is_mjpeg {
+                    println!("Frame #{}: Invalid JPEG (seq: {}, bytesused: {}), skipping (camera may still be initializing)", 
+                        frame_count, meta.sequence, meta.bytesused);
+                } else {
+                    println!("Frame #{}: Buffer is all zeros (seq: {}, bytesused: {}), skipping (camera may still be initializing)", 
+                        frame_count, meta.sequence, meta.bytesused);
+                }
                 continue;
             } else if frame_count == 11 {
-                eprintln!("ERROR: Camera is returning all-zero frames! This indicates a hardware or driver issue.");
+                eprintln!("ERROR: Camera is returning invalid frames!");
                 eprintln!("  Sequence: {}, Bytes used: {}, Buffer size: {}", 
                     meta.sequence, meta.bytesused, buffer.len());
-                eprintln!("  Please check:");
-                eprintln!("    1. Camera is properly connected and powered");
-                eprintln!("    2. Test with: v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=test.raw");
-                eprintln!("    3. Check if RGB3 format is supported: v4l2-ctl -d /dev/video0 --list-formats-ext");
-                eprintln!("    4. Try a different format (YUYV) if RGB3 doesn't work");
-                eprintln!("  Continuing to publish zeros (will stop warnings)...");
-                // Continue anyway but stop spamming warnings
+                eprintln!("  Continuing to publish (will stop warnings)...");
             }
-            // After first warning, just continue silently
-            // The data is still zeros but we don't want to spam
         }
         
         // Debug: Print first few bytes of first valid frame to verify format
-        if frame_count == 1 || (!is_all_zeros && frame_count <= 5) {
+        if frame_count == 1 || (is_valid && frame_count <= 5) {
             println!("Frame #{}: First 16 bytes: {:?}", frame_count,
-                &buffer[..buffer.len().min(16)]);
+                &image_data[..image_data.len().min(16)]);
             println!("  Sequence: {}, Bytes used: {}, Buffer size: {}", 
                 meta.sequence, meta.bytesused, buffer.len());
-            if frame_count == 1 && !is_all_zeros {
-                println!("Using stride: {} bytes per line (RGB3/rgb24 format)", row_stride);
-                if let Err(e) = std::fs::write("debug_raw_frame.bin", &buffer) {
-                    eprintln!("Failed to save raw frame: {:?}", e);
+            if frame_count == 1 && is_valid {
+                if is_mjpeg {
+                    println!("Format: MJPEG (compressed JPEG)");
+                    if let Err(e) = std::fs::write("debug_mjpeg_frame.jpg", image_data) {
+                        eprintln!("Failed to save MJPEG frame: {:?}", e);
+                    } else {
+                        println!("Saved MJPEG frame to debug_mjpeg_frame.jpg ({} bytes)", image_data.len());
+                    }
                 } else {
-                    println!("Saved raw frame to debug_raw_frame.bin ({} bytes)", buffer.len());
+                    println!("Using stride: {} bytes per line", row_stride);
+                    if let Err(e) = std::fs::write("debug_raw_frame.bin", image_data) {
+                        eprintln!("Failed to save raw frame: {:?}", e);
+                    } else {
+                        println!("Saved raw frame to debug_raw_frame.bin ({} bytes)", image_data.len());
+                    }
                 }
             }
         }
-
-        // Extract RGB data from buffer (handling stride/padding if needed)
-        let rgb_data = if row_stride == width * 3 {
-            // No padding, use buffer directly
-            buffer.to_vec()
-        } else {
-            // Has padding, extract pixel data
-            extract_rgb(&buffer, width, height, row_stride)
-        };
         
-        // Verify RGB data size
-        let expected_rgb_size = (width * height * 3) as usize;
-        if rgb_data.len() != expected_rgb_size {
-            eprintln!("Warning: RGB data size mismatch. Expected {} bytes, got {} bytes",
-                expected_rgb_size, rgb_data.len());
-            if rgb_data.len() < expected_rgb_size {
-                eprintln!("RGB data too small, skipping frame");
-                continue;
-            }
-        }
-        
-        // Save first valid RGB frame for debugging
-        if frame_count == 4 {
-            if let Err(e) = std::fs::write("debug_rgb_frame.raw", &rgb_data) {
-                eprintln!("Failed to save RGB frame: {:?}", e);
-            } else {
-                println!("Saved RGB frame to debug_rgb_frame.raw ({} bytes)", rgb_data.len());
-            }
-        }
-        
-        // Create ROS2 sensor_msgs/Image message with raw RGB3/rgb24 data
-        // RGB3 (V4L2) / rgb24 (ffmpeg) (24-bit RGB 8-8-8) is sent as "rgb8" encoding in ROS
+        // Create ROS2 sensor_msgs/Image message
+        // For MJPEG: send compressed JPEG data with "jpeg" encoding
+        // For RGB3: send raw RGB data with "rgb8" encoding
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         
-        let data_size = rgb_data.len(); // Save size before moving rgb_data into msg
+        let data_size = image_data.len();
+        let (encoding, step) = if is_mjpeg {
+            ("jpeg".to_string(), 0u32) // MJPEG: compressed, no step
+        } else {
+            ("rgb8".to_string(), (width * 3) as u32) // RGB3: 3 bytes per pixel
+        };
+        
         let msg = Image {
             header: ros_wrapper::std_msgs::msg::Header {
                 stamp: ros_wrapper::r2r::builtin_interfaces::msg::Time {
@@ -296,10 +310,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             height,
             width,
-            encoding: "rgb8".to_string(), // ROS encoding name for RGB3/rgb24 (24-bit RGB 8-8-8)
+            encoding,
             is_bigendian: 0,
-            step: (width * 3) as u32, // RGB3/rgb24: 3 bytes per pixel (R, G, B)
-            data: rgb_data,
+            step,
+            data: image_data.to_vec(),
         };
         
         // Send message through channel
@@ -310,10 +324,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Log frame capture info periodically
         if frame_count % 30 == 0 {
-            println!("Published frame #{}: {}x{} RGB3/rgb24 ({} bytes)", 
-                frame_count,
-                width, height, 
-                data_size);
+            if is_mjpeg {
+                println!("Published frame #{}: {}x{} MJPEG ({} bytes compressed)", 
+                    frame_count,
+                    width, height, 
+                    data_size);
+            } else {
+                println!("Published frame #{}: {}x{} RGB3/rgb24 ({} bytes)", 
+                    frame_count,
+                    width, height, 
+                    data_size);
+            }
         }
         
         // Note: stream.next() automatically re-queues the buffer when called again,
