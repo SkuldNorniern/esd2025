@@ -2,6 +2,7 @@ use libcamera::camera_manager::CameraManager;
 use libcamera::stream::StreamRole;
 use libcamera::pixel_format::PixelFormat;
 use libcamera::geometry::Size;
+use libcamera::formats;
 use std::time::Duration;
 
 // Error type for camera operations
@@ -56,24 +57,28 @@ fn main() -> Result<(), CameraError> {
     }
 
     // Use first available camera
-    let camera_info = &cameras[0];
+    // CameraList doesn't support indexing, use get() or iterate
+    let camera_info = cameras.get(0)
+        .ok_or(CameraError::NoCameras)?;
     println!("Using camera: {:?}", camera_info.id());
 
     // Acquire camera
     let mut camera = camera_info.acquire()
         .map_err(|e| CameraError::CameraAcquire(format!("Failed to acquire camera: {:?}", e)))?;
 
-    // Generate configuration for video capture
+    // Generate configuration for video recording
     // Start with low resolution (320x240) as suggested in README for low latency
-    let mut config = camera.generate_configuration(&[StreamRole::VideoCapture])
+    // StreamRole variants: Viewfinder, VideoRecording, StillCapture, Raw
+    let mut config = camera.generate_configuration(&[StreamRole::VideoRecording])
         .map_err(|e| CameraError::Configuration(format!("Failed to generate configuration: {:?}", e)))?;
 
     // Configure stream settings
     if let Some(stream_config) = config.streams_mut().get_mut(0) {
         // Set resolution to 320x240 for low latency
         stream_config.size = Size::new(320, 240);
-        // Use YUV420 format (common for video)
-        stream_config.pixel_format = PixelFormat::Yuv420;
+        // Use NV12 format (common for video, similar to YUV420)
+        // PixelFormat is created from predefined formats
+        stream_config.pixel_format = formats::NV12;
     }
 
     // Validate and apply configuration
