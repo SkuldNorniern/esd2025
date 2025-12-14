@@ -1,6 +1,6 @@
 // Utility module for image format conversion
-// Converts RGB3 (24-bit RGB 8-8-8) raw data to PNG format for YOLO processing
-// RGB3 format: Stepwise 16x16 - 16376x16376 with step 1/1
+// Converts RGB3/rgb24 (24-bit RGB 8-8-8) raw data to PNG format for YOLO processing
+// RGB3 (V4L2) / rgb24 (ffmpeg): Stepwise 16x16 - 16376x16376 with step 1/1
 
 use image::{ImageBuffer, Rgb, RgbImage};
 use std::io::Cursor;
@@ -23,9 +23,9 @@ impl std::fmt::Display for ImageUtilsError {
 
 impl std::error::Error for ImageUtilsError {}
 
-// Convert RGB3 (24-bit RGB 8-8-8) raw data to PNG bytes
-// RGB3 format: 3 bytes per pixel (R, G, B) in row-major order
-// Input: raw RGB3 data (received as "rgb8" encoding in ROS), width, height
+// Convert RGB3/rgb24 (24-bit RGB 8-8-8) raw data to PNG bytes
+// RGB3 (V4L2) / rgb24 (ffmpeg) format: 3 bytes per pixel (R, G, B) in row-major order
+// Input: raw RGB3/rgb24 data (received as "rgb8" encoding in ROS), width, height
 // Output: PNG-encoded bytes
 pub fn rgb8_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, ImageUtilsError> {
     // Verify RGB data size

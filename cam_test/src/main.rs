@@ -160,9 +160,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| CameraError::Stream(format!("Failed to start streaming: {:?}", e)))?;
 
     println!("Camera started, waiting for stream to stabilize...");
-    // Wait a bit for the camera to start filling buffers (first frames are often empty/black)
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    
+    // Wait longer for the camera to start filling buffers (first frames are often empty/black)
+    // Some cameras need 1-2 seconds to initialize
+    for i in 1..=20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if i % 5 == 0 {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout())?;
+        }
+    }
+    println!();
     println!("Publishing RGB3/rgb24 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
 
     // Main capture loop
@@ -176,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.tick().await;
         
         // Dequeue a buffer (wait for frame)
-        let (buffer, _meta) = stream.next()
+        let (buffer, meta) = stream.next()
             .map_err(|e| CameraError::Frame(format!("Failed to capture frame: {:?}", e)))?;
 
         frame_count += 1;
@@ -199,25 +206,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Skip first few frames (often empty/black while camera stabilizes)
-        if frame_count <= 3 {
-            // Check if buffer is all zeros (camera not ready yet)
-            let is_all_zeros = buffer.iter().take(1024).all(|&b| b == 0);
-            if is_all_zeros {
-                println!("Frame #{}: Buffer is all zeros, skipping (camera may still be initializing)", frame_count);
+        // Check if buffer is all zeros (camera not ready yet)
+        // Sample multiple parts of the buffer to be sure
+        let sample_size = (buffer.len() / 10).min(1024);
+        let is_all_zeros = buffer.iter().take(sample_size).all(|&b| b == 0) &&
+                          buffer.iter().skip(buffer.len() / 2).take(sample_size).all(|&b| b == 0) &&
+                          buffer.iter().skip(buffer.len() - sample_size).all(|&b| b == 0);
+        
+        if is_all_zeros {
+            if frame_count <= 10 {
+                println!("Frame #{}: Buffer is all zeros (seq: {}, bytesused: {}), skipping (camera may still be initializing)", 
+                    frame_count, meta.sequence, meta.bytesused);
                 continue;
+            } else {
+                eprintln!("Warning: Frame #{} still all zeros after 10 frames! Camera may not be working properly.", frame_count);
+                eprintln!("  Sequence: {}, Bytes used: {}, Buffer size: {}", 
+                    meta.sequence, meta.bytesused, buffer.len());
+                // Continue anyway to see if it recovers
             }
         }
         
         // Debug: Print first few bytes of first valid frame to verify format
-        if frame_count == 4 {
-            println!("First 16 bytes of raw frame: {:?}", 
+        if frame_count == 1 || (!is_all_zeros && frame_count <= 5) {
+            println!("Frame #{}: First 16 bytes: {:?}", frame_count,
                 &buffer[..buffer.len().min(16)]);
-            println!("Using stride: {} bytes per line (RGB3/rgb24 format)", row_stride);
-            if let Err(e) = std::fs::write("debug_raw_frame.bin", &buffer) {
-                eprintln!("Failed to save raw frame: {:?}", e);
-            } else {
-                println!("Saved raw frame to debug_raw_frame.bin ({} bytes)", buffer.len());
+            println!("  Sequence: {}, Bytes used: {}, Buffer size: {}", 
+                meta.sequence, meta.bytesused, buffer.len());
+            if frame_count == 1 && !is_all_zeros {
+                println!("Using stride: {} bytes per line (RGB3/rgb24 format)", row_stride);
+                if let Err(e) = std::fs::write("debug_raw_frame.bin", &buffer) {
+                    eprintln!("Failed to save raw frame: {:?}", e);
+                } else {
+                    println!("Saved raw frame to debug_raw_frame.bin ({} bytes)", buffer.len());
+                }
             }
         }
 
