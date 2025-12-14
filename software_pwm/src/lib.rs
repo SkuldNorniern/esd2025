@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-// Precise busy-wait with minimal overhead
-// Simple, direct approach for maximum consistency
+// Precise busy-wait function that doesn't yield to scheduler
+// Uses CPU cycles for accurate microsecond-level timing
 #[inline(never)]
 fn busy_wait_until(target: Instant) {
-    // Simple tight loop - most predictable timing
-    // Instant::now() is fast enough for microsecond precision
+    // Use a tight loop without yielding to maintain precise timing
+    // This is acceptable in a dedicated PWM thread
     while Instant::now() < target {
+        // Empty loop - compiler won't optimize this away due to Instant::now()
         std::hint::spin_loop();
     }
 }
@@ -59,40 +60,35 @@ impl SoftwarePwmServo {
             const PERIOD_US: u64 = 20_000; // 50Hz = 20ms period
             const PERIOD_DURATION: Duration = Duration::from_micros(PERIOD_US);
             
-            // Pre-calculate all possible pulse widths to avoid repeated calculations
-            // This eliminates division in the hot loop
-            let mut pulse_widths: [u64; 181] = [0; 181];
-            for angle in 0..=180 {
-                pulse_widths[angle as usize] = 1000u64 + ((angle as u64 * 1000u64) / 180u64);
-            }
-            
-            // Cache angle and pulse width to minimize atomic reads and calculations
+            // Cache angle to reduce atomic reads
             let mut cached_angle = 90u8;
-            let mut cached_pulse_width_us = pulse_widths[90];
             let mut angle_update_counter = 0u32;
             
             loop {
                 // Check if we should stop (non-blocking atomic check - no locks!)
-                // Use Relaxed ordering - we don't need strict ordering for a stop flag
                 if !running_clone.load(Ordering::Relaxed) {
                     break;
                 }
                 
-                // Read angle atomically - update every period for responsiveness
-                // But only recalculate pulse width if angle changed
+                // Read angle atomically - no lock needed, always fast
+                // Update cached angle every 10 periods to reduce atomic reads
+                // This is safe because servo movement is slow (0.1s/60°)
                 angle_update_counter += 1;
-                if angle_update_counter >= 5 {
-                    // Use Relaxed ordering - we don't need strict ordering here
-                    let new_angle = angle_clone.load(Ordering::Relaxed).min(180);
-                    if new_angle != cached_angle {
-                        cached_angle = new_angle;
-                        cached_pulse_width_us = pulse_widths[cached_angle as usize];
-                    }
+                if angle_update_counter >= 10 {
+                    cached_angle = angle_clone.load(Ordering::Relaxed);
                     angle_update_counter = 0;
                 }
                 
+                let angle = cached_angle.min(180) as u64;
+                
+                // Convert angle to pulse width in microseconds
+                // 0° = 1000μs (1ms), 90° = 1500μs (1.5ms), 180° = 2000μs (2ms)
+                // Linear interpolation: pulse = 1000 + (angle * 1000) / 180
+                // Using integer math for speed
+                let pulse_width_us = 1000u64 + ((angle * 1000u64) / 180u64);
+                
                 // Generate one PWM period with precise timing
-                // Capture start time immediately before setting pin to minimize delay
+                // Capture start time immediately before setting pin
                 let period_start = Instant::now();
                 
                 // High pulse - set pin high
@@ -100,10 +96,10 @@ impl SoftwarePwmServo {
                 pin.set_high();
                 
                 // Calculate target time for high pulse end
-                let high_end = period_start + Duration::from_micros(cached_pulse_width_us);
+                let high_end = period_start + Duration::from_micros(pulse_width_us);
                 
-                // Optimized busy-wait for high pulse duration
-                // Uses calibrated delay + precise timing to minimize overhead
+                // Precise busy-wait for high pulse duration
+                // Don't use sleep or yield - they cause jitter
                 busy_wait_until(high_end);
                 
                 // Low pulse - set pin low
@@ -112,7 +108,7 @@ impl SoftwarePwmServo {
                 // Calculate target time for period end (exactly 20ms from start)
                 let period_end = period_start + PERIOD_DURATION;
                 
-                // Optimized busy-wait for remaining period time
+                // Precise busy-wait for remaining period time
                 // This ensures exact 20ms period for stable 50Hz frequency
                 // Critical for servo stability - any jitter here causes servo jitter
                 busy_wait_until(period_end);
@@ -142,8 +138,7 @@ impl SoftwarePwmServo {
     /// servo.set_angle(180)?; // Rightmost position
     /// ```
     pub fn set_angle(&self, angle: u8) -> Result<(), rppal::gpio::Error> {
-        // Atomic write - use Relaxed ordering for speed
-        // The angle is checked frequently enough that strict ordering isn't needed
+        // Atomic write - no lock needed, always fast
         self.angle.store(angle.min(180), Ordering::Relaxed);
         Ok(())
     }
