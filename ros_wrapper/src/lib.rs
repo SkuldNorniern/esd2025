@@ -71,7 +71,7 @@ where
         .map_err(|e| RosWrapperError::ContextCreation(format!("{:?}", e)))?;
     
     // Create node
-    let node = Node::create(ctx, node_name, "")
+    let mut node = Node::create(ctx, node_name, "")
         .map_err(|e| RosWrapperError::NodeCreation(format!("{:?}", e)))?;
     
     // Create publisher
@@ -137,7 +137,7 @@ where
         .map_err(|e| RosWrapperError::ContextCreation(format!("{:?}", e)))?;
     
     // Create node
-    let node = Node::create(ctx, node_name, "")
+    let mut node = Node::create(ctx, node_name, "")
         .map_err(|e| RosWrapperError::NodeCreation(format!("{:?}", e)))?;
     
     // Create subscriber
