@@ -1,6 +1,6 @@
 use ros_wrapper::{create_topic_receiver, QosProfile, std_msgs::msg::String as StringMsg};
-use rppal::gpio::{Gpio, Level, OutputPin};
-use rppal::pwm::{Channel, Pwm};
+use rppal::gpio::{Gpio, OutputPin};
+use rppal::pwm::{Channel, Pwm, Polarity};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 
@@ -45,7 +45,8 @@ impl ServoController {
             .map_err(|e| TrackerError::Gpio(format!("Failed to initialize GPIO: {:?}", e)))?;
 
         // GPIO18 is PWM0 (hardware PWM)
-        let pan_pwm = Pwm::with_frequency(Channel::Pwm0, 50.0, 0.075, false)
+        // Polarity::Normal means high pulse width represents duty cycle
+        let pan_pwm = Pwm::with_frequency(Channel::Pwm0, 50.0, 0.075, Polarity::Normal, false)
             .map_err(|e| TrackerError::Pwm(format!("Failed to create pan PWM: {:?}", e)))?;
         pan_pwm.enable()
             .map_err(|e| TrackerError::Pwm(format!("Failed to enable pan PWM: {:?}", e)))?;
@@ -302,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Initialize servo controller
-    let mut servo = ServoController::new()?;
+    let servo = ServoController::new()?;
     println!("Servo controller initialized");
 
     // Set initial position to center
