@@ -104,8 +104,8 @@ fn main() -> Result<(), CameraError> {
     };
     
     // Create frame buffer allocator
-    let mut allocator = FrameBufferAllocator::new(&camera)
-        .map_err(|e| CameraError::Configuration(format!("Failed to create buffer allocator: {:?}", e)))?;
+    // FrameBufferAllocator::new() returns FrameBufferAllocator directly, not Result
+    let mut allocator = FrameBufferAllocator::new(&camera);
     
     // Allocate buffers for the stream
     allocator.allocate(&stream)
