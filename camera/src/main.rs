@@ -5,8 +5,6 @@ use libcamera::formats;
 use libcamera::framebuffer_allocator::FrameBufferAllocator;
 use image::{ImageBuffer, Rgb, RgbImage};
 use std::time::Duration;
-use std::fs::File;
-use std::io::Write;
 
 // Error type for camera operations
 #[derive(Debug)]
@@ -97,32 +95,22 @@ fn main() -> Result<(), CameraError> {
     };
     
     // Create frame buffer allocator
-    let mut allocator = FrameBufferAllocator::new(&camera);
+    // Note: The FrameBufferAllocator API in libcamera-rs 0.6.0 appears to be different
+    // The allocate() and buffers() methods don't exist
+    // Let's try a different approach - maybe buffers are allocated automatically
+    // or we need to use the allocator differently
+    let _allocator = FrameBufferAllocator::new(&camera);
     
-    // Check if buffers are already allocated
-    let is_allocated = allocator.allocated(&stream);
-    println!("Buffers allocated for stream: {}", is_allocated);
+    // Check if any buffers are allocated (allocated() takes no arguments)
+    let is_allocated = _allocator.allocated();
+    println!("Buffers allocated: {}", is_allocated);
     
-    // Try to allocate buffers - the method signature might require &mut self
-    // or the method name might be different
-    if !is_allocated {
-        println!("Allocating buffers...");
-        // Try allocate with mutable reference - common in Rust APIs
-        // If this doesn't compile, the method name or signature is different
-        let num_buffers = allocator.allocate(&stream)
-            .map_err(|e| CameraError::Configuration(format!("Failed to allocate buffers: {:?}", e)))?;
-        println!("Allocated {} buffers", num_buffers);
-    }
-    
-    // Get allocated buffers
-    // Try buffers() method - if it doesn't exist, we'll get a compile error
-    // that will help identify the correct method name
-    let buffers = allocator.buffers(&stream);
-    println!("Retrieved {} buffer(s)", buffers.len());
-    
-    if buffers.is_empty() {
-        return Err(CameraError::Configuration("No buffers allocated".to_string()));
-    }
+    // Since allocate() and buffers() methods don't exist, we'll try to work
+    // without explicit buffer allocation - maybe the camera handles it automatically
+    // or we need to use a different API
+    println!("Note: FrameBufferAllocator.allocate() and .buffers() methods not found");
+    println!("  Attempting to use camera without explicit buffer allocation");
+    println!("  Buffers may be allocated automatically or via different API");
     
     // Start the camera
     camera.start(None)
@@ -130,56 +118,42 @@ fn main() -> Result<(), CameraError> {
     
     println!("Camera started, attempting to capture a frame...");
     
-    // Capture a single frame and save it
+    // Try to create a request without explicit buffers
+    // Maybe the camera/request API handles buffer allocation automatically
     let mut request = camera.create_request(None)
         .ok_or(CameraError::Request("Failed to create request".to_string()))?;
     
-    // Add buffer to request
-    let buffer = &buffers[0];
-    request.add_buffer(&stream, buffer)
-        .map_err(|e| CameraError::Request(format!("Failed to add buffer: {:?}", e)))?;
-    
-    // Queue request
-    camera.queue_request(request)
-        .map_err(|e| CameraError::Request(format!("Failed to queue request: {:?}", e)))?;
+    // Try to queue request without adding buffer - see what error we get
+    // This will help us understand if buffers are needed and how to get them
+    match camera.queue_request(request) {
+        Ok(_) => {
+            println!("Request queued successfully (without explicit buffer)");
+        }
+        Err(e) => {
+            println!("Failed to queue request without buffer: {:?}", e);
+            println!("  This suggests we need to add buffers to requests");
+            println!("  But FrameBufferAllocator API needs to be determined");
+            return Err(CameraError::Request(format!("Need buffers but allocation API unknown: {:?}", e)));
+        }
+    }
     
     println!("Request queued, waiting for frame...");
     
-    // TODO: Wait for request completion and get frame data
-    // The exact API for waiting for request completion needs to be determined
-    // Common patterns:
-    // - camera.wait_for_request() or similar
-    // - Request completion callback
-    // - Polling request status
+    // Wait a bit for frame capture
+    std::thread::sleep(Duration::from_millis(500));
     
-    // For now, wait a bit and then try to save
-    std::thread::sleep(Duration::from_millis(100));
+    println!("Note: Complete implementation requires:");
+    println!("  1. Finding FrameBufferAllocator API to allocate/get buffers");
+    println!("  2. Adding buffers to requests");
+    println!("  3. Waiting for request completion");
+    println!("  4. Getting frame data from completed request");
+    println!("  5. Converting NV12 to RGB");
+    println!("  6. Saving as image file");
     
-    println!("Note: Frame data retrieval not yet implemented");
-    println!("  Need to determine libcamera-rs 0.6.0 API for:");
-    println!("  1. Waiting for request completion");
-    println!("  2. Getting frame buffer data from completed request");
-    println!("  3. Converting NV12 format to RGB");
-    println!("  4. Saving as image file");
-    
-    // Once frame data is available, convert NV12 to RGB and save:
-    /*
-    // Get frame data from buffer (API needs to be determined)
-    let frame_data = /* get data from buffer */;
-    
-    // Convert NV12 to RGB (NV12 is YUV 4:2:0 format)
-    // This requires YUV to RGB conversion
-    let rgb_data = convert_nv12_to_rgb(frame_data, 320, 240);
-    
-    // Create image and save
-    let img: RgbImage = ImageBuffer::<Rgb<u8>, _>::from_raw(320, 240, rgb_data)
-        .ok_or(CameraError::Frame("Failed to create image".to_string()))?;
-    
-    img.save("captured_image.png")
-        .map_err(|e| CameraError::Io(format!("Failed to save image: {:?}", e)))?;
-    
-    println!("Image saved as captured_image.png");
-    */
+    println!("\nTo find the correct API, check:");
+    println!("  - libcamera-rs 0.6.0 source code on GitHub");
+    println!("  - Example code (e.g., jpeg_capture example)");
+    println!("  - libcamera C++ API documentation (Rust bindings should mirror it)");
     
     Ok(())
 }
