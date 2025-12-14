@@ -27,31 +27,39 @@ fn optimize_thread_for_realtime(cpu_core: Option<usize>) -> Result<(), String> {
     // Set real-time scheduling policy (requires CAP_SYS_NICE or root)
     #[cfg(target_os = "linux")]
     {
-        use thread_priority::*;
+        use thread_priority::{ThreadPriority, ThreadSchedulePolicy, RealtimeThreadSchedulePolicy, ThreadPriorityValue};
+        use thread_priority::unix::{set_thread_priority_and_policy, thread_native_id};
+        
+        // Get current thread ID
+        let thread_id = thread_native_id();
         
         // Try to set real-time priority with SCHED_FIFO policy
         // SCHED_FIFO gives highest priority, preempts normal threads
         let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
         
         // Use priority 50 (reasonable value, 1-99 range for SCHED_FIFO)
+        // try_from returns Result, not Option
         match ThreadPriorityValue::try_from(50) {
-            Some(priority_value) => {
-                if let Err(e) = set_current_thread_priority_and_policy(
+            Ok(priority_value) => {
+                if let Err(e) = set_thread_priority_and_policy(
+                    thread_id,
                     ThreadPriority::Crossplatform(priority_value),
                     policy
                 ) {
                     // If real-time fails, try to at least increase priority
-                    if let Some(fallback_priority) = ThreadPriorityValue::try_from(10) {
-                        if let Err(_) = set_current_thread_priority(ThreadPriority::Crossplatform(fallback_priority)) {
+                    if let Ok(fallback_priority) = ThreadPriorityValue::try_from(10) {
+                        use thread_priority::set_thread_priority;
+                        if let Err(_) = set_thread_priority(thread_id, ThreadPriority::Crossplatform(fallback_priority)) {
                             return Err(format!("Failed to set thread priority: {:?}. Run with sudo or set CAP_SYS_NICE capability", e));
                         }
                     }
                 }
             }
-            None => {
+            Err(_) => {
                 // Try lower priority if 50 fails
-                if let Some(priority_value) = ThreadPriorityValue::try_from(1) {
-                    if let Err(e) = set_current_thread_priority_and_policy(
+                if let Ok(priority_value) = ThreadPriorityValue::try_from(1) {
+                    if let Err(e) = set_thread_priority_and_policy(
+                        thread_id,
                         ThreadPriority::Crossplatform(priority_value),
                         policy
                     ) {
