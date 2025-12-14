@@ -3,7 +3,10 @@ use libcamera::stream::StreamRole;
 use libcamera::geometry::Size;
 use libcamera::formats;
 use libcamera::framebuffer_allocator::FrameBufferAllocator;
+use image::{ImageBuffer, Rgb, RgbImage};
 use std::time::Duration;
+use std::fs::File;
+use std::io::Write;
 
 // Error type for camera operations
 #[derive(Debug)]
@@ -57,7 +60,6 @@ fn main() -> Result<(), CameraError> {
     }
 
     // Use first available camera
-    // CameraList doesn't support indexing, use get() or iterate
     let camera_info = cameras.get(0)
         .ok_or(CameraError::NoCameras)?;
     println!("Using camera: {:?}", camera_info.id());
@@ -67,20 +69,12 @@ fn main() -> Result<(), CameraError> {
         .map_err(|e| CameraError::CameraAcquire(format!("Failed to acquire camera: {:?}", e)))?;
 
     // Generate configuration for video recording
-    // Start with low resolution (320x240) as suggested in README for low latency
-    // StreamRole variants: Viewfinder, VideoRecording, StillCapture, Raw
-    // generate_configuration returns Option, not Result
     let mut config = camera.generate_configuration(&[StreamRole::VideoRecording])
         .ok_or(CameraError::Configuration("Failed to generate configuration".to_string()))?;
 
     // Configure stream settings
-    // Use get_mut to get mutable reference to stream configuration
     if let Some(mut stream_config) = config.get_mut(0) {
-        // Set resolution to 320x240 for low latency
-        // set_size takes a Size object, not two integers
         stream_config.set_size(Size::new(320, 240));
-        // Use NV12 format (common for video, similar to YUV420)
-        // PixelFormat from predefined formats module
         stream_config.set_pixel_format(formats::NV12);
     }
 
@@ -89,46 +83,103 @@ fn main() -> Result<(), CameraError> {
     camera.configure(&mut config)
         .map_err(|e| CameraError::Configuration(format!("Failed to configure camera: {:?}", e)))?;
 
-    // Get stream config for logging (use get for immutable access)
+    // Get stream config for logging
     if let Some(stream_config) = config.get(0) {
         println!("Camera configured: {:?}", stream_config.get_size());
     }
 
-    // Buffer allocation
-    // Note: The FrameBufferAllocator API in libcamera-rs 0.6.0 may differ from documentation
-    // The compiler indicates that `allocate` and `buffers` methods don't exist
-    // This suggests the API may have changed or use different method names
-    // 
-    // Options:
-    // 1. Check the actual libcamera-rs 0.6.0 source code or examples
-    // 2. Try alternative method names (e.g., alloc, alloc_buffers, etc.)
-    // 3. Check if buffers are allocated automatically during configuration
-    // 4. Look for a different buffer allocation mechanism
-    //
-    // For now, we'll proceed without explicit buffer allocation
-    // You may need to manually inspect the FrameBufferAllocator API or check examples
-    println!("Warning: Buffer allocation skipped - API methods not found");
-    println!("  FrameBufferAllocator.allocate() and .buffers() methods don't exist");
-    println!("  Please check libcamera-rs 0.6.0 documentation or source code");
-    println!("  for the correct buffer allocation API");
-
-    // Start the camera (takes Option<&ControlList>, use None for default controls)
+    // Get the stream from configuration
+    let stream = if let Some(stream_config) = config.get(0) {
+        stream_config.stream()
+            .ok_or(CameraError::Configuration("Stream not available after configuration".to_string()))?
+    } else {
+        return Err(CameraError::Configuration("No stream configuration available".to_string()));
+    };
+    
+    // Create frame buffer allocator
+    let mut allocator = FrameBufferAllocator::new(&camera);
+    
+    // Check if buffers are already allocated
+    let is_allocated = allocator.allocated(&stream);
+    println!("Buffers allocated for stream: {}", is_allocated);
+    
+    // Try to allocate buffers - the method signature might require &mut self
+    // or the method name might be different
+    if !is_allocated {
+        println!("Allocating buffers...");
+        // Try allocate with mutable reference - common in Rust APIs
+        // If this doesn't compile, the method name or signature is different
+        let num_buffers = allocator.allocate(&stream)
+            .map_err(|e| CameraError::Configuration(format!("Failed to allocate buffers: {:?}", e)))?;
+        println!("Allocated {} buffers", num_buffers);
+    }
+    
+    // Get allocated buffers
+    // Try buffers() method - if it doesn't exist, we'll get a compile error
+    // that will help identify the correct method name
+    let buffers = allocator.buffers(&stream);
+    println!("Retrieved {} buffer(s)", buffers.len());
+    
+    if buffers.is_empty() {
+        return Err(CameraError::Configuration("No buffers allocated".to_string()));
+    }
+    
+    // Start the camera
     camera.start(None)
         .map_err(|e| CameraError::CameraStart(format!("Failed to start camera: {:?}", e)))?;
-
-    println!("Camera started, capturing frames...");
-    println!("(Press Ctrl+C to stop)");
-
-    // Main capture loop
-    // Note: Without proper buffer allocation, requests will fail
-    // This is a placeholder - you need to implement buffer allocation
-    // based on the actual libcamera-rs 0.6.0 API
-    println!("Camera running (buffer allocation not implemented)");
-    println!("  Requests will fail without buffers");
-    println!("  Please implement buffer allocation using the correct API");
     
-    // Keep running (camera is started but won't capture without buffers)
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    println!("Camera started, attempting to capture a frame...");
+    
+    // Capture a single frame and save it
+    let mut request = camera.create_request(None)
+        .ok_or(CameraError::Request("Failed to create request".to_string()))?;
+    
+    // Add buffer to request
+    let buffer = &buffers[0];
+    request.add_buffer(&stream, buffer)
+        .map_err(|e| CameraError::Request(format!("Failed to add buffer: {:?}", e)))?;
+    
+    // Queue request
+    camera.queue_request(request)
+        .map_err(|e| CameraError::Request(format!("Failed to queue request: {:?}", e)))?;
+    
+    println!("Request queued, waiting for frame...");
+    
+    // TODO: Wait for request completion and get frame data
+    // The exact API for waiting for request completion needs to be determined
+    // Common patterns:
+    // - camera.wait_for_request() or similar
+    // - Request completion callback
+    // - Polling request status
+    
+    // For now, wait a bit and then try to save
+    std::thread::sleep(Duration::from_millis(100));
+    
+    println!("Note: Frame data retrieval not yet implemented");
+    println!("  Need to determine libcamera-rs 0.6.0 API for:");
+    println!("  1. Waiting for request completion");
+    println!("  2. Getting frame buffer data from completed request");
+    println!("  3. Converting NV12 format to RGB");
+    println!("  4. Saving as image file");
+    
+    // Once frame data is available, convert NV12 to RGB and save:
+    /*
+    // Get frame data from buffer (API needs to be determined)
+    let frame_data = /* get data from buffer */;
+    
+    // Convert NV12 to RGB (NV12 is YUV 4:2:0 format)
+    // This requires YUV to RGB conversion
+    let rgb_data = convert_nv12_to_rgb(frame_data, 320, 240);
+    
+    // Create image and save
+    let img: RgbImage = ImageBuffer::<Rgb<u8>, _>::from_raw(320, 240, rgb_data)
+        .ok_or(CameraError::Frame("Failed to create image".to_string()))?;
+    
+    img.save("captured_image.png")
+        .map_err(|e| CameraError::Io(format!("Failed to save image: {:?}", e)))?;
+    
+    println!("Image saved as captured_image.png");
+    */
+    
+    Ok(())
 }

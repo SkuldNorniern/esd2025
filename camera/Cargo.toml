@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 libcamera = { version = "0.6.0", features = ["vendor_rpi"] }
+image = "0.25"
