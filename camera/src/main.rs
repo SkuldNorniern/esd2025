@@ -2,7 +2,7 @@ use libcamera::camera_manager::CameraManager;
 use libcamera::stream::StreamRole;
 use libcamera::geometry::Size;
 use libcamera::formats;
-use libcamera::frame_buffer_allocator::FrameBufferAllocator;
+use libcamera::FrameBufferAllocator;
 use std::time::Duration;
 
 // Error type for camera operations
@@ -95,9 +95,10 @@ fn main() -> Result<(), CameraError> {
     }
 
     // Allocate buffers for the stream
-    // Get the stream from configuration (stream() returns Immutable wrapper)
-    let stream_ref = if let Some(stream_config) = config.get(0) {
+    // Get the stream from configuration (stream() returns Option<Stream>)
+    let stream = if let Some(stream_config) = config.get(0) {
         stream_config.stream()
+            .ok_or(CameraError::Configuration("Stream not available after configuration".to_string()))?
     } else {
         return Err(CameraError::Configuration("No stream configuration available".to_string()));
     };
@@ -107,12 +108,11 @@ fn main() -> Result<(), CameraError> {
         .map_err(|e| CameraError::Configuration(format!("Failed to create buffer allocator: {:?}", e)))?;
     
     // Allocate buffers for the stream
-    // Note: stream_ref might be Immutable<Stream>, check if we need to unwrap or use as_ref
-    allocator.allocate(&stream_ref)
+    allocator.allocate(&stream)
         .map_err(|e| CameraError::Configuration(format!("Failed to allocate buffers: {:?}", e)))?;
     
     // Get allocated buffers
-    let buffers = allocator.buffers(&stream_ref);
+    let buffers = allocator.buffers(&stream);
     println!("Allocated {} buffers for stream", buffers.len());
     
     if buffers.is_empty() {
@@ -140,7 +140,7 @@ fn main() -> Result<(), CameraError> {
 
         // Add buffer to request (cycle through available buffers)
         let buffer = &buffers[buffer_index % num_buffers];
-        request.add_buffer(&stream_ref, buffer)
+        request.add_buffer(&stream, buffer)
             .map_err(|e| CameraError::Request(format!("Failed to add buffer to request: {:?}", e)))?;
         
         buffer_index += 1;
