@@ -85,69 +85,6 @@ fn extract_rgb(rgb_buffer: &[u8], width: u32, height: u32, row_stride: u32) -> V
     rgb_data
 }
 
-// Convert YUYV format to RGB8
-// YUYV format: 4 bytes per 2 pixels: Y0 U Y1 V
-// Each pair of pixels shares U and V components
-// row_stride: bytes per row (may include padding)
-fn yuyv_to_rgb(yuyv_data: &[u8], width: u32, height: u32, row_stride: u32) -> Vec<u8> {
-    let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
-    let row_stride_bytes = row_stride as usize;
-    
-    for y in 0..height {
-        let row_offset = (y as usize) * row_stride_bytes;
-        
-        for x in (0..width).step_by(2) {
-            // Calculate byte index for this pixel pair
-            // Each pair is 4 bytes: Y0 U Y1 V
-            let byte_idx = row_offset + ((x / 2) * 4) as usize;
-            
-            if byte_idx + 3 >= yuyv_data.len() {
-                eprintln!("Warning: Buffer overflow at row {}, col {}", y, x);
-                break;
-            }
-            
-            // Extract YUYV components: Y0 U Y1 V
-            let y0 = yuyv_data[byte_idx] as i32;
-            let u = yuyv_data[byte_idx + 1] as i32;
-            let y1 = yuyv_data[byte_idx + 2] as i32;
-            let v = yuyv_data[byte_idx + 3] as i32;
-            
-            // Convert YUV to RGB for first pixel
-            let (r0, g0, b0) = yuv_to_rgb(y0, u, v);
-            rgb_data.push(r0);
-            rgb_data.push(g0);
-            rgb_data.push(b0);
-            
-            // Convert YUV to RGB for second pixel (if not at end of row)
-            if x + 1 < width {
-                let (r1, g1, b1) = yuv_to_rgb(y1, u, v);
-                rgb_data.push(r1);
-                rgb_data.push(g1);
-                rgb_data.push(b1);
-            }
-        }
-    }
-    
-    rgb_data
-}
-
-// Convert YUV to RGB using standard conversion formula
-fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
-    let c = y - 16;
-    let d = u - 128;
-    let e = v - 128;
-    
-    let r = (298 * c + 409 * e + 128) >> 8;
-    let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-    let b = (298 * c + 516 * d + 128) >> 8;
-    
-    (
-        r.max(0).min(255) as u8,
-        g.max(0).min(255) as u8,
-        b.max(0).min(255) as u8,
-    )
-}
-
 // Convert RGB to PNG bytes
 fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CameraError> {
     use image::{ImageBuffer, Rgb, RgbImage};
@@ -240,64 +177,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| CameraError::Format(format!("Failed to set format: {:?}", e)))?;
 
     // Verify the format was set correctly
-    let mut actual_format = dev.format()
+    let actual_format = dev.format()
         .map_err(|e| CameraError::Format(format!("Failed to get format: {:?}", e)))?;
-    println!("Camera format (after set): {}x{} {:?}", 
+    println!("Camera format: {}x{} {:?}", 
         actual_format.width, 
         actual_format.height,
         actual_format.fourcc);
     
-    // Verify format is actually RGB3, fallback to YUYV if not
-    let format_fourcc_str = actual_format.fourcc.to_string();
-    if format_fourcc_str != "RGB3" {
-        eprintln!("WARNING: Format was not set to RGB3! Got: {:?}", actual_format.fourcc);
-        eprintln!("  Camera may not support RGB3, or format setting failed.");
-        eprintln!("  Trying YUYV format instead...");
-        
-        // Try YUYV instead
-        let yuyv_format = Format::new(width, height, v4l::FourCC::new(b"YUYV"));
-        dev.set_format(&yuyv_format)
-            .map_err(|e| CameraError::Format(format!("Failed to set YUYV format: {:?}", e)))?;
-        
-        actual_format = dev.format()
-            .map_err(|e| CameraError::Format(format!("Failed to get format: {:?}", e)))?;
-        println!("Camera format (YUYV): {}x{} {:?}", 
-            actual_format.width, 
-            actual_format.height,
-            actual_format.fourcc);
-    }
-    
-    // Store format info for use in loop
-    let format_fourcc = actual_format.fourcc.to_string();
-    let format_width = actual_format.width;
-    let format_height = actual_format.height;
-    let format_stride = actual_format.stride;
-    
-    // Check stride (bytes per line)
-    let expected_stride = if format_fourcc == "RGB3" {
-        format_width * 3
-    } else {
-        format_width * 2  // YUYV
-    };
+    // Check stride (bytes per line might be different from width * 3 for RGB3)
+    let stride = actual_format.stride;
     println!("Stride (bytes per line): {} (expected: {})", 
-        format_stride, 
-        expected_stride);
-    if format_stride != expected_stride {
+        stride, 
+        actual_format.width * 3);
+    if stride != actual_format.width * 3 {
         eprintln!("Warning: Stride mismatch! This may cause image corruption.");
-        eprintln!("  Using stride {} instead of expected {}", format_stride, expected_stride);
+        eprintln!("  Using stride {} instead of expected {}", stride, actual_format.width * 3);
     }
 
     // Create capture stream with 4 buffers
-    // Note: Stream::with_buffers should automatically start streaming
     let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 4)
         .map_err(|e| CameraError::Stream(format!("Failed to create stream: {:?}", e)))?;
 
-    println!("Camera stream created, waiting for first frame...");
-    
-    // Give the camera a moment to start filling buffers
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    
-    println!("Camera ready, capturing frames...");
+    // Start streaming (critical - without this, buffers won't be filled)
+    stream.start()
+        .map_err(|e| CameraError::Stream(format!("Failed to start streaming: {:?}", e)))?;
+
+    println!("Camera started, capturing frames...");
     println!("Publishing PNG images to /image topic (press Ctrl+C to stop)");
 
     // Main capture loop
@@ -311,17 +216,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.tick().await;
         
         // Dequeue a buffer (wait for frame)
-        let (buffer, _meta) = stream.next()
+        let (buffer, meta) = stream.next()
             .map_err(|e| CameraError::Frame(format!("Failed to capture frame: {:?}", e)))?;
 
         frame_count += 1;
 
-        // Use stored format info
-        let width = format_width;
-        let height = format_height;
-        let row_stride = format_stride;
+        // Get frame dimensions from format
+        let width = actual_format.width;
+        let height = actual_format.height;
+        
+        // Get stride (bytes per line) from format
+        let row_stride = actual_format.stride;
 
-        // Verify buffer size
+        // Verify buffer size matches expected RGB3 size
         let expected_size = (row_stride * height) as usize;
         if buffer.len() != expected_size {
             eprintln!("Warning: Buffer size mismatch. Expected {} bytes (stride {} * height {}), got {} bytes", 
@@ -332,47 +239,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Debug: Print first few bytes and check if buffer has data
+        // Debug: Print first few bytes of first frame to verify format
         if frame_count == 1 {
-            println!("First 32 bytes of raw frame: {:?}", 
-                &buffer[..buffer.len().min(32)]);
-            println!("Format: {}, Stride: {} bytes per line", format_fourcc, row_stride);
-            
-            // Check if buffer is all zeros (black image)
-            let non_zero_count = buffer.iter().take(1000).filter(|&&b| b != 0).count();
-            println!("Non-zero bytes in first 1000 bytes: {} (if 0, buffer is empty/black)", non_zero_count);
-            
+            println!("First 16 bytes of raw frame: {:?}", 
+                &buffer[..buffer.len().min(16)]);
+            println!("Using stride: {} bytes per line (RGB3 format)", row_stride);
             if let Err(e) = std::fs::write("debug_raw_frame.bin", &buffer) {
                 eprintln!("Failed to save raw frame: {:?}", e);
             } else {
                 println!("Saved raw frame to debug_raw_frame.bin ({} bytes)", buffer.len());
             }
         }
-        
-        // Check if buffer is all zeros (black/empty)
-        let sample_size = buffer.len().min(1000);
-        let all_zeros = buffer[..sample_size].iter().all(|&b| b == 0);
-        if all_zeros && frame_count <= 5 {
-            eprintln!("Warning: Buffer appears to be all zeros (black image). Stream may not be started.");
-            eprintln!("  Buffer size: {} bytes, first {} bytes are all zero", buffer.len(), sample_size);
-        }
 
-        // Convert to RGB based on format
-        let rgb_data = if format_fourcc == "RGB3" {
-            // RGB3 format: direct RGB data
-            if row_stride == width * 3 {
-                // No padding, use buffer directly
-                buffer.to_vec()
-            } else {
-                // Has padding, extract pixel data
-                extract_rgb(&buffer, width, height, row_stride)
-            }
-        } else if format_fourcc == "YUYV" {
-            // YUYV format: need conversion
-            yuyv_to_rgb(&buffer, width, height, row_stride)
+        // Extract RGB data from buffer (handling stride/padding if needed)
+        let rgb_data = if row_stride == width * 3 {
+            // No padding, use buffer directly
+            buffer.to_vec()
         } else {
-            eprintln!("ERROR: Unsupported format: {}", format_fourcc);
-            continue;
+            // Has padding, extract pixel data
+            extract_rgb(&buffer, width, height, row_stride)
         };
         
         // Verify RGB data size
@@ -434,5 +319,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 width, height, 
                 png_size);
         }
+        
+        // Re-queue the buffer so it can be filled with the next frame
+        stream.queue(meta.index)
+            .map_err(|e| CameraError::Frame(format!("Failed to re-queue buffer: {:?}", e)))?;
     }
 }
