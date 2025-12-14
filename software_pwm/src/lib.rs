@@ -7,46 +7,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-// Ultra-precise busy-wait optimized to minimize Instant::now() overhead
-// Uses batched spin loops with periodic time checks for longer waits
+// Ultra-precise busy-wait with consistent timing
+// Uses a simple, predictable loop for maximum consistency
 #[inline(never)]
 fn busy_wait_until(target: Instant) {
-    let mut now = Instant::now();
-    if now >= target {
-        return;
-    }
-    
-    let remaining = target.duration_since(now);
-    
-    // For waits longer than 100μs, use batched spin loops with periodic checks
-    // This reduces Instant::now() overhead while maintaining precision
-    if remaining.as_micros() > 100 {
-        // Check time every ~100μs (approximately)
-        // Each batch of spin_loop() takes roughly 1-2μs on modern CPUs
-        const BATCH_SIZE: usize = 50; // ~50-100μs per batch
-        
-        // Coarse wait: spin in batches, check time periodically
-        loop {
-            // Batch of spin loops
-            for _ in 0..BATCH_SIZE {
-                std::hint::spin_loop();
-            }
-            
-            // Check if we're close to target
-            now = Instant::now();
-            if now >= target {
-                return;
-            }
-            
-            // If we're very close (<50μs), switch to precise mode
-            let remaining = target.duration_since(now);
-            if remaining.as_micros() < 50 {
-                break;
-            }
-        }
-    }
-    
-    // Precise timing for the final bit (or for short waits)
+    // Simple, consistent loop - no batching that could introduce timing variations
+    // The key is consistency, not minimizing Instant::now() calls
     while Instant::now() < target {
         std::hint::spin_loop();
     }
@@ -100,30 +66,24 @@ impl SoftwarePwmServo {
                 pulse_widths[angle as usize] = 1000u64 + ((angle as u64 * 1000u64) / 180u64);
             }
             
-            // Cache angle and pulse width to minimize atomic reads and calculations
+            // Cache angle and pulse width to minimize calculations
             let mut cached_angle = 90u8;
             let mut cached_pulse_width_us = pulse_widths[90];
-            let mut angle_update_counter = 0u32;
             
             loop {
                 // Check if we should stop (non-blocking atomic check - no locks!)
-                // Use Acquire ordering to ensure we see the latest value
-                if !running_clone.load(Ordering::Acquire) {
+                // Use Relaxed ordering for speed (single writer, single reader)
+                if !running_clone.load(Ordering::Relaxed) {
                     break;
                 }
                 
-                // Read angle atomically - update less frequently to reduce overhead
-                // Update cached angle every 20 periods (400ms) instead of 10
-                // This is safe because servo movement is slow (0.1s/60°)
-                angle_update_counter += 1;
-                if angle_update_counter >= 20 {
-                    // Use Acquire ordering for consistency
-                    let new_angle = angle_clone.load(Ordering::Acquire).min(180);
-                    if new_angle != cached_angle {
-                        cached_angle = new_angle;
-                        cached_pulse_width_us = pulse_widths[cached_angle as usize];
-                    }
-                    angle_update_counter = 0;
+                // Read angle atomically every period for maximum responsiveness
+                // Only recalculate pulse width if angle changed
+                // Use Relaxed ordering for maximum speed (single writer, single reader)
+                let new_angle = angle_clone.load(Ordering::Relaxed).min(180);
+                if new_angle != cached_angle {
+                    cached_angle = new_angle;
+                    cached_pulse_width_us = pulse_widths[cached_angle as usize];
                 }
                 
                 // Generate one PWM period with precise timing
@@ -177,9 +137,9 @@ impl SoftwarePwmServo {
     /// servo.set_angle(180)?; // Rightmost position
     /// ```
     pub fn set_angle(&self, angle: u8) -> Result<(), rppal::gpio::Error> {
-        // Atomic write - use Release ordering to ensure visibility
-        // This ensures the PWM thread sees the update promptly
-        self.angle.store(angle.min(180), Ordering::Release);
+        // Atomic write - use Relaxed ordering for speed
+        // Single writer, single reader pattern doesn't need stronger ordering
+        self.angle.store(angle.min(180), Ordering::Relaxed);
         Ok(())
     }
 }
