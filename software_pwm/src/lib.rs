@@ -39,34 +39,21 @@ fn optimize_thread_for_realtime(cpu_core: Option<usize>) -> Result<(), String> {
         
         // Use priority 50 (reasonable value, 1-99 range for SCHED_FIFO)
         // try_from returns Result, not Option
-        match ThreadPriorityValue::try_from(50) {
-            Ok(priority_value) => {
-                if let Err(e) = set_thread_priority_and_policy(
-                    thread_id,
-                    ThreadPriority::Crossplatform(priority_value),
-                    policy
-                ) {
-                    // If real-time fails, try to at least increase priority
-                    if let Ok(fallback_priority) = ThreadPriorityValue::try_from(10) {
-                        use thread_priority::unix::set_thread_priority;
-                        if let Err(_) = set_thread_priority(thread_id, ThreadPriority::Crossplatform(fallback_priority)) {
-                            return Err(format!("Failed to set thread priority: {:?}. Run with sudo or set CAP_SYS_NICE capability", e));
-                        }
-                    }
-                }
+        let priority_result = ThreadPriorityValue::try_from(50)
+            .or_else(|_| ThreadPriorityValue::try_from(1)); // Fallback to priority 1 if 50 fails
+        
+        if let Ok(priority_value) = priority_result {
+            if let Err(e) = set_thread_priority_and_policy(
+                thread_id,
+                ThreadPriority::Crossplatform(priority_value),
+                policy
+            ) {
+                // If real-time fails, just warn but continue
+                // PWM will still work, just with more potential jitter
+                return Err(format!("Failed to set real-time thread priority: {:?}. PWM will work but may have more jitter. Run with sudo or set CAP_SYS_NICE capability", e));
             }
-            Err(_) => {
-                // Try lower priority if 50 fails
-                if let Ok(priority_value) = ThreadPriorityValue::try_from(1) {
-                    if let Err(e) = set_thread_priority_and_policy(
-                        thread_id,
-                        ThreadPriority::Crossplatform(priority_value),
-                        policy
-                    ) {
-                        return Err(format!("Failed to set thread priority: {:?}. Run with sudo or set CAP_SYS_NICE capability", e));
-                    }
-                }
-            }
+        } else {
+            return Err("Failed to create thread priority value".to_string());
         }
         
         // Set CPU affinity to pin thread to specific core
