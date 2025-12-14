@@ -1,5 +1,6 @@
 // Ball Detection Node - YOLO-based detection using ort-rs and ROS2
-// Uses ros_wrapper for ROS communication and receives RGB8 or PNG images via sensor_msgs/Image
+// Uses ros_wrapper for ROS communication and receives RGB3 (24-bit RGB 8-8-8) or PNG images via sensor_msgs/Image
+// RGB3 format: Stepwise 16x16 - 16376x16376 with step 1/1
 // Publishes ball coordinates as a single string message: "x1,y1,x2,y2" or "none"
 mod image_utils;
 
@@ -296,13 +297,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Size: {}x{}", msg.width, msg.height);
         }
         
-        // Convert RGB8 to PNG if needed, or use PNG data directly
+        // Convert RGB3 (received as "rgb8" encoding) to PNG if needed, or use PNG data directly
         let png_data = if msg.encoding == "rgb8" {
-            // Convert RGB8 raw data to PNG
+            // Convert RGB3 (24-bit RGB 8-8-8) raw data to PNG
+            // ROS uses "rgb8" encoding name for RGB3 format
             match rgb8_to_png(&msg.data, msg.width, msg.height) {
                 Ok(png) => png,
                 Err(e) => {
-                    eprintln!("Frame #{}: Failed to convert RGB8 to PNG: {}", frame_count, e);
+                    eprintln!("Frame #{}: Failed to convert RGB3 to PNG: {}", frame_count, e);
                     continue;
                 }
             }
@@ -310,7 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Already PNG, use directly
             msg.data.clone()
         } else {
-            eprintln!("Frame #{}: Unsupported encoding '{}', expected 'rgb8' or 'png'", frame_count, msg.encoding);
+            eprintln!("Frame #{}: Unsupported encoding '{}', expected 'rgb8' (RGB3) or 'png'", frame_count, msg.encoding);
             continue;
         };
         

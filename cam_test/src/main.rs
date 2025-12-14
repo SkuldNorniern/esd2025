@@ -124,7 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Device: {}", caps.card);
     println!("Driver: {}", caps.driver);
 
-    // Set format: 320x240 RGB3 (24-bit RGB, no conversion needed)
+    // Set format: 320x240 RGB3 (24-bit RGB 8-8-8, no conversion needed)
+    // RGB3 format: Stepwise 16x16 - 16376x16376 with step 1/1
     let width = 320;
     let height = 240;
     
@@ -159,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| CameraError::Stream(format!("Failed to start streaming: {:?}", e)))?;
 
     println!("Camera started, capturing frames...");
-    println!("Publishing RGB8 raw images to /image topic (press Ctrl+C to stop)");
+    println!("Publishing RGB3 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
 
     // Main capture loop
     let mut frame_count = 0u64;
@@ -172,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.tick().await;
         
         // Dequeue a buffer (wait for frame)
-        let (buffer, meta) = stream.next()
+        let (buffer, _meta) = stream.next()
             .map_err(|e| CameraError::Frame(format!("Failed to capture frame: {:?}", e)))?;
 
         frame_count += 1;
@@ -236,11 +237,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Create ROS2 sensor_msgs/Image message with raw RGB8 data
+        // Create ROS2 sensor_msgs/Image message with raw RGB3 data
+        // RGB3 (24-bit RGB 8-8-8) is sent as "rgb8" encoding in ROS
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         
+        let data_size = rgb_data.len(); // Save size before moving rgb_data into msg
         let msg = Image {
             header: ros_wrapper::std_msgs::msg::Header {
                 stamp: ros_wrapper::r2r::builtin_interfaces::msg::Time {
@@ -251,9 +254,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             height,
             width,
-            encoding: "rgb8".to_string(),
+            encoding: "rgb8".to_string(), // ROS encoding name for RGB3 (24-bit RGB 8-8-8)
             is_bigendian: 0,
-            step: (width * 3) as u32, // RGB8: 3 bytes per pixel
+            step: (width * 3) as u32, // RGB3: 3 bytes per pixel (R, G, B)
             data: rgb_data,
         };
         
@@ -265,10 +268,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Log frame capture info periodically
         if frame_count % 30 == 0 {
-            println!("Published frame #{}: {}x{} RGB8 ({} bytes)", 
+            println!("Published frame #{}: {}x{} RGB3 ({} bytes)", 
                 frame_count,
                 width, height, 
-                msg.data.len());
+                data_size);
         }
         
         // Note: stream.next() automatically re-queues the buffer when called again,
