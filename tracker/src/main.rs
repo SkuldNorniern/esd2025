@@ -109,8 +109,8 @@ struct Controller {
 impl Controller {
     fn new(image_width: u32, image_height: u32) -> Self {
         Self {
-            kp_pan: 0.08,  // Reduced gain to prevent oscillation
-            kp_tilt: 0.08,
+            kp_pan: 0.15,  // Higher gain for accurate tracking
+            kp_tilt: 0.15,
             pan_angle: 90.0,  // Start at center
             tilt_angle: 90.0,
             image_width,
@@ -119,11 +119,12 @@ impl Controller {
             pan_max: 180.0,
             tilt_min: 0.0,
             tilt_max: 180.0,
-            max_rate: 3.0,  // Reduced max rate to prevent overshoot (3 degrees per update)
+            max_rate: 10.0,  // Higher rate for faster response
             last_update: Instant::now(),
             // Set to true if servos are mounted in reverse
-            invert_pan: false,  // Set to true if pan direction is reversed
-            invert_tilt: false, // Set to true if tilt direction is reversed
+            // If tracker drifts right when ball is left, set invert_pan: true
+            invert_pan: true,  // Try inverting if drifting wrong direction
+            invert_tilt: false,
         }
     }
 
@@ -146,7 +147,7 @@ impl Controller {
         let normalized_error_x = error_x / image_center_x;
         let normalized_error_y = error_y / image_center_y;
 
-        // Apply P-control
+        // Apply P-control - focus on accuracy, not smoothness
         // Image coordinates: (0,0) is top-left, x increases right, y increases down
         // Servo convention: 0° = left/up, 90° = center, 180° = right/down
         // 
@@ -168,34 +169,6 @@ impl Controller {
         }
         if self.invert_tilt {
             delta_tilt = -delta_tilt;
-        }
-        
-        // Add dead zone to reduce jitter when ball is near center
-        // When ball is very close to center, reduce movement significantly
-        let dead_zone = 0.10; // 10% of image size (about 64 pixels for 640x640)
-        if normalized_error_x.abs() < dead_zone {
-            // Ball is near center horizontally, reduce pan movement
-            // Use quadratic reduction for smoother transition
-            let ratio = normalized_error_x.abs() / dead_zone;
-            delta_pan *= ratio * ratio; // Quadratic reduction
-        }
-        if normalized_error_y.abs() < dead_zone {
-            // Ball is near center vertically, reduce tilt movement
-            let ratio = normalized_error_y.abs() / dead_zone;
-            delta_tilt *= ratio * ratio; // Quadratic reduction
-        }
-        
-        // Add damping to prevent oscillation
-        // Reduce movement when we're already close to the target
-        let pan_error_magnitude = normalized_error_x.abs();
-        let tilt_error_magnitude = normalized_error_y.abs();
-        
-        // If error is small, apply additional damping
-        if pan_error_magnitude < 0.15 {
-            delta_pan *= 0.5; // Reduce movement by 50% when close
-        }
-        if tilt_error_magnitude < 0.15 {
-            delta_tilt *= 0.5; // Reduce movement by 50% when close
         }
 
         // Rate limiting
@@ -369,10 +342,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let error_x = ball_center_x - image_center_x;
                 let error_y = ball_center_y - image_center_y;
                 
-                // Log periodically or when angle changes significantly
+                // Log more frequently to debug direction issues
                 let pan_diff = (pan_angle - last_logged_pan).abs();
                 let tilt_diff = (tilt_angle - last_logged_tilt).abs();
-                if pan_diff > 1.0 || tilt_diff > 1.0 || frame_count % 50 == 0 {
+                if pan_diff > 0.5 || tilt_diff > 0.5 || frame_count % 20 == 0 {
                     // Show normalized errors and direction
                     let norm_error_x = error_x / image_center_x;
                     let norm_error_y = error_y / image_center_y;
