@@ -29,3 +29,4 @@ yolo/tennis-1
 /target
 ball_detect/Cargo.lock
 cam_test/Cargo.lock
+**/*.lock
