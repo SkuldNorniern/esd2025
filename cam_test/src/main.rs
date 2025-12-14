@@ -118,12 +118,12 @@ fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Camer
     let img: RgbImage = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, rgb_data.to_vec())
         .ok_or_else(|| CameraError::Image("Failed to create image buffer".to_string()))?;
     
-    // Encode to PNG
+    // Encode to PNG using the newer API
     let mut png_bytes = Vec::new();
     {
-        let mut encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
-        encoder.encode(
-            &img,
+        let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
+        encoder.write_image(
+            img.as_raw(),
             width,
             height,
             image::ColorType::Rgb8,
@@ -219,6 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Convert RGB to PNG bytes
         let png_bytes = rgb_to_png(&rgb_data, width, height)?;
+        let png_size = png_bytes.len(); // Save size before moving png_bytes
         
         // Create ROS2 sensor_msgs/Image message with PNG data
         // For PNG, we'll use encoding "png" and put PNG bytes in data field
@@ -238,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             width,
             encoding: "png".to_string(),
             is_bigendian: 0,
-            step: png_bytes.len() as u32, // For PNG, step is the total size
+            step: png_size as u32, // For PNG, step is the total size
             data: png_bytes,
         };
         
@@ -253,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Published frame #{}: {}x{} PNG ({} bytes)", 
                 frame_count,
                 width, height, 
-                msg.data.len());
+                png_size);
         }
     }
 }
