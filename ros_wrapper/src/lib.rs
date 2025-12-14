@@ -13,6 +13,7 @@ pub use r2r;
 // Re-export commonly used types for convenience
 pub use r2r::QosProfile;
 pub use r2r::std_msgs;
+pub use r2r::sensor_msgs;
 
 /// Error type for ROS wrapper operations
 #[derive(Debug)]

@@ -8,10 +8,8 @@ name = "test_yolo"
 path = "src/test_yolo.rs"
 
 [dependencies]
+ros_wrapper = { path = "../ros_wrapper" }
 ort = { version = "2.0.0-rc.10", features = [] }
 image = "0.25"
-ros2-client = "0.8.2"
 ndarray = "0.16"
-base64 = "0.22"
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

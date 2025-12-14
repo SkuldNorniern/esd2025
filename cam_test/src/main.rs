@@ -1,18 +1,9 @@
-use ros2_client::{Context, NodeName, NodeOptions, MessageTypeName, Name};
-use ros2_client::rustdds::QosPolicies;
+use ros_wrapper::{create_topic_sender, QosProfile, sensor_msgs::msg::Image};
 use v4l::video::Capture;
 use v4l::Format;
 use v4l::io::mmap::Stream;
 use v4l::io::traits::CaptureStream;
-use base64::{Engine as _, engine::general_purpose};
-use serde::Serialize;
-
-// Message struct matching std_msgs/String format
-// ROS2 std_msgs/String has a single field "data" of type string
-#[derive(Serialize, Debug, Clone)]
-struct StringMessage {
-    data: String,
-}
+use std::time::Duration;
 
 // Error type for camera operations
 #[derive(Debug)]
@@ -24,7 +15,7 @@ enum CameraError {
     Stream(String),
     Frame(String),
     Ros2(String),
-    Message(String),
+    Image(String),
 }
 
 impl std::fmt::Display for CameraError {
@@ -37,7 +28,7 @@ impl std::fmt::Display for CameraError {
             CameraError::Stream(msg) => write!(f, "Stream error: {}", msg),
             CameraError::Frame(msg) => write!(f, "Frame error: {}", msg),
             CameraError::Ros2(msg) => write!(f, "ROS2 error: {}", msg),
-            CameraError::Message(msg) => write!(f, "Message error: {}", msg),
+            CameraError::Image(msg) => write!(f, "Image error: {}", msg),
         }
     }
 }
@@ -54,7 +45,6 @@ fn find_v4l_device() -> Result<String, CameraError> {
             if let Ok(dev) = v4l::Device::with_path(path) {
                 if let Ok(caps) = dev.query_caps() {
                     // Check if device supports video capture
-                    // Flags::VIDEO_CAPTURE is a bitflag from capability module
                     if caps.capabilities.contains(v4l::capability::Flags::VIDEO_CAPTURE) {
                         return Ok(path.to_string());
                     }
@@ -120,76 +110,55 @@ fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
     )
 }
 
-fn main() -> Result<(), CameraError> {
+// Convert RGB to PNG bytes
+fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CameraError> {
+    use image::{ImageBuffer, Rgb, RgbImage};
+    
+    // Create RGB image from raw data
+    let img: RgbImage = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, rgb_data.to_vec())
+        .ok_or_else(|| CameraError::Image("Failed to create image buffer".to_string()))?;
+    
+    // Encode to PNG
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
+        encoder.encode(
+            &img,
+            width,
+            height,
+            image::ColorType::Rgb8,
+        )
+        .map_err(|e| CameraError::Image(format!("Failed to encode PNG: {:?}", e)))?;
+    }
+    
+    Ok(png_bytes)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing camera node with V4L2...");
 
-    // Initialize ROS2 context
-    let ctx = Context::new()
-        .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 context: {:?}", e)))?;
-    
-    // Create node using Context::new_node
-    // Node name: camera_node (on Raspberry Pi)
-    let node_name = NodeName::new("/", "camera_node")
-        .map_err(|e| CameraError::Ros2(format!("Failed to create node name: {:?}", e)))?;
-    
-    println!("ROS2 node name: camera_node");
-    println!("ROS_DOMAIN_ID: {}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
-    let mut node = ctx
-        .new_node(node_name, NodeOptions::new().enable_rosout(true))
-        .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
-
-    // CRITICAL: Start the node spinner in a background thread to process DDS events
-    // This is required for the publisher to send messages properly!
-    // Based on ros2-client examples: https://github.com/Atostek/ros2-client/blob/master/examples/minimal_action_client/main.rs
-    let spinner = node.spinner()
-        .map_err(|e| CameraError::Ros2(format!("Failed to create node spinner: {:?}", e)))?;
-    std::thread::spawn(move || {
-        spinner.spin();
-    });
-
-    // Create publisher for /image topic using std_msgs/String for base64-encoded images
+    // Create topic sender using ros_wrapper
     println!("Creating ROS2 publisher on /image topic...");
-    let topic_name = Name::new("/", "image")
-        .map_err(|e| CameraError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
-    let message_type = MessageTypeName::new("std_msgs", "String");
-    
-    // Create topic first, then use it to create publisher
-    // Clone message_type since we need it later to create messages
-    let image_topic = node
-        .create_topic(&topic_name, message_type.clone(), &QosPolicies::default())
-        .map_err(|e| CameraError::Ros2(format!("Failed to create topic: {:?}", e)))?;
-    
-    // Create publisher with matching QoS to ensure compatibility
-    let mut publisher = node
-        .create_publisher(&image_topic, Some(QosPolicies::default()))
-        .map_err(|e| CameraError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
-    
+    let (tx, _node) = create_topic_sender::<Image>(
+        "camera_node",
+        "/image",
+        QosProfile::default(),
+    )
+    .map_err(|e| CameraError::Ros2(format!("Failed to create topic sender: {:?}", e)))?;
+
     println!("Publisher created successfully");
+    println!("ROS_DOMAIN_ID: {}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
     
-    // Wait longer for the publisher to establish connections with subscribers
-    // This is critical for cross-device communication where DDS discovery takes time
+    // Wait for publisher to establish connections
     println!("Waiting for publisher to establish connections with subscribers...");
     println!("  (DDS discovery can take 5-10 seconds for cross-device communication)");
-    for i in 1..=10 {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+    for _i in 1..=10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         print!(".");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::io::Write::flush(&mut std::io::stdout())?;
     }
     println!();
-    
-    // Test publish a small message to verify publishing works
-    let test_msg = StringMessage {
-        data: "test".to_string(),
-    };
-    println!("Testing publisher with a small message...");
-    match publisher.publish(test_msg) {
-        Ok(()) => println!("  Test publish succeeded!"),
-        Err(e) => {
-            eprintln!("  WARNING: Test publish failed: {:?}", e);
-            eprintln!("  This may indicate a connection issue. Continuing anyway...");
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(100));
     println!("Publisher ready, starting to publish frames...");
 
     // Find and open V4L2 device
@@ -205,8 +174,7 @@ fn main() -> Result<(), CameraError> {
     println!("Device: {}", caps.card);
     println!("Driver: {}", caps.driver);
 
-    // Set format: 320x240 YUYV (common V4L2 format, similar to YUV420)
-    // YUYV is a packed YUV format that's widely supported
+    // Set format: 320x240 YUYV
     let width = 320;
     let height = 240;
     
@@ -222,19 +190,22 @@ fn main() -> Result<(), CameraError> {
         actual_format.height,
         actual_format.fourcc);
 
-    // Create capture stream with 4 buffers for double buffering
+    // Create capture stream with 4 buffers
     let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 4)
         .map_err(|e| CameraError::Stream(format!("Failed to create stream: {:?}", e)))?;
 
     println!("Camera started, capturing frames...");
-    println!("Publishing to /image topic (press Ctrl+C to stop)");
+    println!("Publishing PNG images to /image topic (press Ctrl+C to stop)");
 
     // Main capture loop
     let mut frame_count = 0u64;
+    let mut interval = tokio::time::interval(Duration::from_millis(100)); // ~10 FPS
+    
     loop {
+        interval.tick().await;
+        
         // Dequeue a buffer (wait for frame)
-        // The stream.next() returns a Result with (buffer, metadata)
-        let (buffer, meta) = stream.next()
+        let (buffer, _meta) = stream.next()
             .map_err(|e| CameraError::Frame(format!("Failed to capture frame: {:?}", e)))?;
 
         frame_count += 1;
@@ -242,89 +213,47 @@ fn main() -> Result<(), CameraError> {
         // Get frame dimensions from format
         let width = actual_format.width;
         let height = actual_format.height;
-        let frame_size = buffer.len();
 
-        // Convert YUYV to RGB8 for ball_detect
+        // Convert YUYV to RGB8
         let rgb_data = yuyv_to_rgb(&buffer, width, height);
         
-        // Base64 encode the RGB image data
-        let base64_data = general_purpose::STANDARD.encode(&rgb_data);
+        // Convert RGB to PNG bytes
+        let png_bytes = rgb_to_png(&rgb_data, width, height)?;
         
-        // Create JSON message with metadata and base64-encoded image
-        // Format: {"width": 320, "height": 240, "encoding": "rgb8", "data": "base64_string"}
-        let json_msg = format!(
-            r#"{{"width":{},"height":{},"encoding":"rgb8","data":"{}"}}"#,
-            width, height, base64_data
-        );
+        // Create ROS2 sensor_msgs/Image message with PNG data
+        // For PNG, we'll use encoding "png" and put PNG bytes in data field
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         
-        // Create ROS2 std_msgs/String message
-        // std_msgs/String has a single "data" field of type string
-        // Use the same struct definition as the test message
-        let msg = StringMessage {
-            data: json_msg,
+        let msg = Image {
+            header: ros_wrapper::std_msgs::msg::Header {
+                stamp: ros_wrapper::r2r::builtin_interfaces::msg::Time {
+                    sec: now.as_secs() as i32,
+                    nanosec: now.subsec_nanos(),
+                },
+                frame_id: "camera_frame".to_string(),
+            },
+            height,
+            width,
+            encoding: "png".to_string(),
+            is_bigendian: 0,
+            step: png_bytes.len() as u32, // For PNG, step is the total size
+            data: png_bytes,
         };
         
-        // Publish using the publisher
-        // Handle WouldBlock errors gracefully - they occur when the publisher buffer is full
-        // or connections aren't ready yet. Retry a few times before giving up.
-        let mut publish_attempts = 0;
-        const MAX_PUBLISH_ATTEMPTS: u32 = 10;
-        let mut msg_to_publish = msg.clone();
-        let mut publish_succeeded = false;
-        loop {
-            match publisher.publish(msg_to_publish) {
-                Ok(()) => {
-                    // Successfully published
-                    publish_succeeded = true;
-                    break;
-                }
-                Err(e) => {
-                    // Check if it's a WouldBlock error (transient, can retry)
-                    let error_str = format!("{:?}", e);
-                    if error_str.contains("WouldBlock") {
-                        publish_attempts += 1;
-                        if publish_attempts >= MAX_PUBLISH_ATTEMPTS {
-                            // After max attempts, log error and continue
-                            if frame_count % 10 == 0 {
-                                eprintln!("ERROR: Failed to publish frame #{} after {} attempts (WouldBlock - publisher buffer may be full or no subscribers connected)", 
-                                    frame_count, publish_attempts);
-                            }
-                            break;
-                        }
-                        // Brief sleep before retry - increase delay with each attempt
-                        std::thread::sleep(std::time::Duration::from_millis(20 * publish_attempts as u64));
-                        // Clone again for retry
-                        msg_to_publish = msg.clone();
-                        continue;
-                    } else {
-                        // Other errors are more serious
-                        eprintln!("ERROR: Failed to publish message: {:?}", e);
-                        return Err(CameraError::Message(format!("Failed to publish message: {:?}", e)));
-                    }
-                }
-            }
+        // Send message through channel
+        if let Err(e) = tx.send(msg).await {
+            eprintln!("Failed to send message: {:?}", e);
+            // Continue anyway
         }
         
         // Log frame capture info periodically
         if frame_count % 30 == 0 {
-            if publish_succeeded {
-                println!("Published frame #{}: {}x{} RGB ({} bytes raw, {} bytes base64, sequence: {})", 
-                    frame_count,
-                    width, height, 
-                    rgb_data.len(),
-                    base64_data.len(),
-                    meta.sequence);
-            } else {
-                eprintln!("SKIPPED frame #{}: {}x{} RGB (publish failed after {} attempts)", 
-                    frame_count,
-                    width, height, 
-                    publish_attempts);
-            }
+            println!("Published frame #{}: {}x{} PNG ({} bytes)", 
+                frame_count,
+                width, height, 
+                msg.data.len());
         }
-        
-        // Add a delay to avoid overwhelming the subscriber and prevent message loss
-        // Reduced to ~10 FPS (100ms) to ensure reliable delivery of large base64-encoded messages
-        // This gives the subscriber time to process each message before the next one arrives
-        std::thread::sleep(std::time::Duration::from_millis(100)); // ~10 FPS max
     }
 }

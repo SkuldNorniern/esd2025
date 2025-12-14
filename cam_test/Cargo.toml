@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ros_wrapper = { path = "../ros_wrapper" }
 v4l = "0.14.0"
-ros2-client = "0.8.2"
-base64 = "0.22"
-serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+image = "0.25"

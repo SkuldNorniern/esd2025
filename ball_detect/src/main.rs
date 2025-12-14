@@ -1,26 +1,14 @@
 // Ball Detection Node - YOLO-based detection using ort-rs and ROS2
-// Based on: https://medium.com/@alfred.weirich/rust-ort-onnx-real-time-yolo-on-a-live-webcam-part-1-b6edfb50bf9b
-use ros2_client::{Context, NodeOptions, NodeName, MessageTypeName, Name};
-use ros2_client::rustdds::QosPolicies;
+// Uses ros_wrapper for ROS communication and receives PNG images via sensor_msgs/Image
+use ros_wrapper::{create_topic_receiver, QosProfile, sensor_msgs::msg::Image};
 use std::time::{Duration, Instant};
-use std::io::Write;
-use std::path::Path;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use ndarray::Array4;
 use ort::{
     session::builder::SessionBuilder,
     value::Value,
 };
-use base64::{Engine as _, engine::general_purpose};
-use serde_json::Value as JsonValue;
-use serde::{Deserialize, Serialize};
-
-// Message struct matching std_msgs/String format
-// ROS2 std_msgs/String has a single field "data" of type string
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct StringMessage {
-    data: String,
-}
+use std::path::Path;
 
 // Error type for ball detection operations
 #[derive(Debug)]
@@ -30,8 +18,6 @@ enum BallDetectError {
     Detection(String),
     Ort(String),
     Io(String),
-    Json(String),
-    Base64(String),
 }
 
 impl std::fmt::Display for BallDetectError {
@@ -42,8 +28,6 @@ impl std::fmt::Display for BallDetectError {
             BallDetectError::Detection(msg) => write!(f, "Detection error: {}", msg),
             BallDetectError::Ort(msg) => write!(f, "ONNX Runtime error: {}", msg),
             BallDetectError::Io(msg) => write!(f, "IO error: {}", msg),
-            BallDetectError::Json(msg) => write!(f, "JSON error: {}", msg),
-            BallDetectError::Base64(msg) => write!(f, "Base64 error: {}", msg),
         }
     }
 }
@@ -84,44 +68,21 @@ impl BallDetector {
     }
 
     // Detect ball in image using YOLO
-    // Input: image data, width, height, encoding
+    // Input: PNG image data
     // Output: bounding box (x1, y1, x2, y2) or None
     fn detect(
         &mut self,
-        image_data: &[u8],
-        width: u32,
-        height: u32,
-        encoding: &str,
+        png_data: &[u8],
     ) -> Result<Option<(f32, f32, f32, f32)>, BallDetectError> {
-        // Convert ROS2 image to RGB image buffer
-        let rgb_image = match encoding {
-            "rgb8" => {
-                ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, image_data.to_vec())
-                    .ok_or_else(|| BallDetectError::Image("Failed to create RGB image".to_string()))?
-            }
-            "bgr8" => {
-                // BGR to RGB conversion
-                let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
-                for chunk in image_data.chunks_exact(3) {
-                    rgb_data.push(chunk[2]); // R
-                    rgb_data.push(chunk[1]); // G
-                    rgb_data.push(chunk[0]); // B
-                }
-                ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, rgb_data)
-                    .ok_or_else(|| BallDetectError::Image("Failed to create RGB image from BGR".to_string()))?
-            }
-            _ => {
-                return Err(BallDetectError::Image(format!(
-                    "Unsupported encoding: {}",
-                    encoding
-                )));
-            }
-        };
-
-        let dynamic_image = DynamicImage::ImageRgb8(rgb_image);
+        // Decode PNG image
+        let img = image::load_from_memory(png_data)
+            .map_err(|e| BallDetectError::Image(format!("Failed to decode PNG: {:?}", e)))?;
+        
+        let (width, height) = (img.width(), img.height());
+        let rgb_image = img.to_rgb8();
 
         // Resize image to model input size
-        let resized = dynamic_image.resize_exact(
+        let resized = DynamicImage::ImageRgb8(rgb_image).resize_exact(
             self.input_shape.1 as u32,
             self.input_shape.0 as u32,
             image::imageops::FilterType::Triangle,
@@ -245,51 +206,12 @@ impl BallDetector {
     }
 }
 
-// Parse JSON message and decode base64 image data
-// Expected format: {"width":320,"height":240,"encoding":"rgb8","data":"base64_string"}
-fn parse_image_message(json_str: &str) -> Result<(Vec<u8>, u32, u32, String), BallDetectError> {
-    let json: JsonValue = serde_json::from_str(json_str)
-        .map_err(|e| BallDetectError::Json(format!("Failed to parse JSON: {:?}", e)))?;
-    
-    let width = json["width"]
-        .as_u64()
-        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'width' field".to_string()))?
-        as u32;
-    
-    let height = json["height"]
-        .as_u64()
-        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'height' field".to_string()))?
-        as u32;
-    
-    let encoding = json["encoding"]
-        .as_str()
-        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'encoding' field".to_string()))?
-        .to_string();
-    
-    let base64_data = json["data"]
-        .as_str()
-        .ok_or_else(|| BallDetectError::Json("Missing or invalid 'data' field".to_string()))?;
-    
-    let image_data = general_purpose::STANDARD
-        .decode(base64_data)
-        .map_err(|e| BallDetectError::Base64(format!("Failed to decode base64: {:?}", e)))?;
-    
-    Ok((image_data, width, height, encoding))
-}
-
-fn main() -> Result<(), BallDetectError> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Ball Detection Node (YOLO-based with ONNX Runtime)");
     println!("====================================================");
     println!("This node runs on a more powerful device than the Raspberry Pi");
     println!("It subscribes to /image from the Pi and publishes bounding box coordinates");
-    println!();
-
-    // Configure ROS2 to connect to RPi3
-    let rpi_ip = "100.114.136.109";
-    println!("Target Raspberry Pi IP: {}", rpi_ip);
-    println!("Note: Ensure ROS2 is configured for distributed communication");
-    println!("  - Both machines should use the same ROS_DOMAIN_ID");
-    println!("  - Or configure ROS_DISCOVERY_SERVER if using discovery server");
     println!();
 
     // Get model path from environment or use default
@@ -308,202 +230,77 @@ fn main() -> Result<(), BallDetectError> {
     println!("YOLO model loaded successfully");
     println!();
 
-    // Initialize ROS2 context
-    let ctx = Context::new()
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create ROS2 context: {:?}", e)))?;
-
-    // Create node using Context::new_node
-    // NodeName requires a namespace - use "/" for root namespace
-    let node_name = NodeName::new("/", "ball_detect_node")
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create node name: {:?}", e)))?;
-    let mut node = ctx
-        .new_node(node_name, NodeOptions::new().enable_rosout(true))
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
-
-    // CRITICAL: Start the node spinner in a background thread to process DDS events
-    // This is required for the subscription to receive messages!
-    // Based on ros2-client examples: https://github.com/Atostek/ros2-client/blob/master/examples/minimal_action_client/main.rs
-    let spinner = node.spinner()
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create node spinner: {:?}", e)))?;
-    std::thread::spawn(move || {
-        spinner.spin();
-    });
-
-    println!("ROS2 node created: ball_detect_node");
-    println!("ROS_DOMAIN_ID: {:?}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
-    println!("Node spinner started in background thread");
-    println!();
-
-    // Create subscriber for /image topic
-    // Expecting std_msgs/String messages with JSON-encoded base64 images
+    // Create topic receiver using ros_wrapper
     println!("Subscribing to /image topic...");
-    let image_topic_name = Name::new("/", "image")
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
-    let string_msg_type = MessageTypeName::new("std_msgs", "String");
-    
-    let image_topic = node
-        .create_topic(&image_topic_name, string_msg_type, &QosPolicies::default())
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
-    
-    // Create subscription using StringMessage struct
-    // This struct matches std_msgs/String format and implements Deserialize
-    // IMPORTANT: Use the exact same QoS as the publisher (Some(QosPolicies::default()))
-    // to ensure compatibility - this must match exactly!
-    let subscriber = node
-        .create_subscription::<StringMessage>(&image_topic, Some(QosPolicies::default()))
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create subscriber: {:?}", e)))?;
-    
+    let (mut rx, _node) = create_topic_receiver::<Image>(
+        "ball_detect_node",
+        "/image",
+        QosProfile::default(),
+    )
+    .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic receiver: {:?}", e)))?;
+
     println!("Subscriber created successfully");
     println!("  Topic: /image");
-    println!("  Message type: std_msgs/String");
+    println!("  Message type: sensor_msgs/Image");
     println!("  Node: ball_detect_node");
+    println!("ROS_DOMAIN_ID: {}", std::env::var("ROS_DOMAIN_ID").unwrap_or_else(|_| "0".to_string()));
     println!();
     
     // Wait for the subscriber to establish connections with publishers
-    // This is critical for cross-device communication where DDS discovery takes time
     println!("Waiting for subscriber to establish connections with publishers...");
     println!("  (DDS discovery can take 5-10 seconds for cross-device communication)");
-    for i in 1..=10 {
-        std::thread::sleep(Duration::from_secs(1));
+    for _i in 1..=10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         print!(".");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::io::Write::flush(&mut std::io::stdout())?;
     }
     println!();
     println!("Subscriber ready, waiting for messages...");
-    println!();
-
-    // Create publishers for bounding box coordinates
-    println!("Creating publishers for detection results...");
-    let float_msg_type = MessageTypeName::new("std_msgs", "Float32");
-    
-    let ball_x1_topic_name = Name::new("/", "ball_x1")
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
-    let ball_x1_topic = node
-        .create_topic(&ball_x1_topic_name, float_msg_type.clone(), &QosPolicies::default())
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
-    
-    let ball_y1_topic_name = Name::new("/", "ball_y1")
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
-    let ball_y1_topic = node
-        .create_topic(&ball_y1_topic_name, float_msg_type.clone(), &QosPolicies::default())
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
-    
-    let ball_x2_topic_name = Name::new("/", "ball_x2")
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
-    let ball_x2_topic = node
-        .create_topic(&ball_x2_topic_name, float_msg_type.clone(), &QosPolicies::default())
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
-    
-    let ball_y2_topic_name = Name::new("/", "ball_y2")
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic name: {:?}", e)))?;
-    let ball_y2_topic = node
-        .create_topic(&ball_y2_topic_name, float_msg_type, &QosPolicies::default())
-        .map_err(|e| BallDetectError::Ros2(format!("Failed to create topic: {:?}", e)))?;
-    
-    // Publishers commented out until we resolve the Message trait type issue
-    // The API requires concrete types, not traits, for type parameters
-    // TODO: Find the correct way to use dynamic messages or use concrete message types
-    // let mut _publisher_x1 = node
-    //     .create_publisher(&ball_x1_topic, None)
-    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
-    // let mut _publisher_y1 = node
-    //     .create_publisher(&ball_y1_topic, None)
-    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
-    // let mut _publisher_x2 = node
-    //     .create_publisher(&ball_x2_topic, None)
-    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
-    // let mut _publisher_y2 = node
-    //     .create_publisher(&ball_y2_topic, None)
-    //     .map_err(|e| BallDetectError::Ros2(format!("Failed to create publisher: {:?}", e)))?;
-    
-    println!("Publishers created successfully");
-    println!("  /ball_x1 - top-left x coordinate");
-    println!("  /ball_y1 - top-left y coordinate");
-    println!("  /ball_x2 - bottom-right x coordinate");
-    println!("  /ball_y2 - bottom-right y coordinate");
-    println!();
-
-    println!("Waiting for images on /image topic...");
     println!("(Press Ctrl+C to stop)");
-    println!();
-
-    // Event-driven message reception loop
-    // Based on ros2-client service examples: https://github.com/Atostek/ros2-client/blob/master/examples/ros2_service_client/main.rs
-    // Note: Subscriptions don't support mio::Poll directly, so we use timer-based polling
-    println!("Starting event-driven message reception loop...");
-    println!("Node names:");
-    println!("  Publisher: camera_node (on Raspberry Pi)");
-    println!("  Subscriber: ball_detect_node (on this device)");
-    println!("Topic: /image");
-    println!("Message type: std_msgs/String");
     println!();
 
     let mut frame_count = 0u64;
     let mut last_log_time = Instant::now();
     
-    println!("Event loop started, waiting for messages...");
-    println!();
-
-    loop {
-        // Event-driven polling: check for messages periodically
-        // Process all available messages in a batch
-        loop {
-            match subscriber.take() {
-                Ok(Some((msg, _info))) => {
-                    frame_count += 1;
-                    
-                    if frame_count == 1 {
-                        println!("✓ First message received!");
-                    }
-                    
-                    // Extract the JSON string from the message
-                    let json_str = &msg.data;
-                    
-                    // Parse JSON and decode base64 image
-                    match parse_image_message(json_str) {
-                        Ok((image_data, width, height, encoding)) => {
-                            // Run detection
-                            match detector.detect(&image_data, width, height, &encoding) {
-                                Ok(Some((x1, y1, x2, y2))) => {
-                                    println!("Frame #{}: Ball detected at ({:.1}, {:.1}) to ({:.1}, {:.1})", 
-                                        frame_count, x1, y1, x2, y2);
-                                }
-                                Ok(None) => {
-                                    if frame_count % 30 == 0 {
-                                        println!("Frame #{}: No ball detected", frame_count);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Detection error on frame #{}: {}", frame_count, e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to parse image message on frame #{}: {}", frame_count, e);
-                        }
-                    }
+    // Process incoming messages from channel
+    while let Some(msg) = rx.recv().await {
+        frame_count += 1;
+        
+        if frame_count == 1 {
+            println!("✓ First message received!");
+        }
+        
+        // Check encoding - should be "png"
+        if msg.encoding != "png" {
+            eprintln!("Frame #{}: Unexpected encoding '{}', expected 'png'", frame_count, msg.encoding);
+            continue;
+        }
+        
+        // Run detection on PNG data
+        match detector.detect(&msg.data) {
+            Ok(Some((x1, y1, x2, y2))) => {
+                println!("Frame #{}: Ball detected at ({:.1}, {:.1}) to ({:.1}, {:.1})", 
+                    frame_count, x1, y1, x2, y2);
+            }
+            Ok(None) => {
+                if frame_count % 30 == 0 {
+                    println!("Frame #{}: No ball detected", frame_count);
                 }
-                Ok(None) => {
-                    // No more messages available, break inner loop
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("Error taking message from subscription: {:?}", e);
-                    break;
-                }
+            }
+            Err(e) => {
+                eprintln!("Detection error on frame #{}: {}", frame_count, e);
             }
         }
         
-        // Log periodically if no messages received yet (similar to service example rate limiting)
+        // Log periodically if no messages received yet
         if frame_count == 0 {
             let now = Instant::now();
             if now.duration_since(last_log_time) > Duration::from_secs(2) {
-                println!("Waiting for messages... (event loop polling)");
+                println!("Waiting for messages...");
                 last_log_time = now;
             }
         }
-        
-        // Small sleep to avoid busy-waiting (similar to service example)
-        std::thread::sleep(Duration::from_millis(10));
     }
+
+    Ok(())
 }
