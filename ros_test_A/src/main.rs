@@ -72,21 +72,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut timer = node.create_wall_timer(Duration::from_millis(100))?;
 
     // Main publishing loop
+    // We need to periodically spin the node to process events
     let mut message_count = 0u64;
+    let mut spin_interval = tokio::time::interval(Duration::from_millis(50));
     loop {
-        timer.tick().await?;
-        message_count += 1;
+        tokio::select! {
+            _ = timer.tick() => {
+                message_count += 1;
 
-        // Create message
-        let msg = StringMsg {
-            data: format!("Hello from ros_test_A! Message #{}", message_count),
-        };
+                // Create message
+                let msg = StringMsg {
+                    data: format!("Hello from ros_test_A! Message #{}", message_count),
+                };
 
-        // Publish message
-        publisher.publish(&msg)?;
+                // Publish message
+                publisher.publish(&msg)?;
 
-        if message_count % 10 == 0 {
-            println!("Published message #{}", message_count);
+                if message_count % 10 == 0 {
+                    println!("Published message #{}", message_count);
+                }
+            }
+            _ = spin_interval.tick() => {
+                // Periodically spin the node to process DDS events
+                node.spin_once(Duration::from_millis(10));
+            }
         }
     }
 }
