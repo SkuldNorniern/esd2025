@@ -48,7 +48,7 @@ fn optimize_thread_for_realtime(cpu_core: Option<usize>) -> Result<(), String> {
                 ) {
                     // If real-time fails, try to at least increase priority
                     if let Ok(fallback_priority) = ThreadPriorityValue::try_from(10) {
-                        use thread_priority::set_thread_priority;
+                        use thread_priority::unix::set_thread_priority;
                         if let Err(_) = set_thread_priority(thread_id, ThreadPriority::Crossplatform(fallback_priority)) {
                             return Err(format!("Failed to set thread priority: {:?}. Run with sudo or set CAP_SYS_NICE capability", e));
                         }
