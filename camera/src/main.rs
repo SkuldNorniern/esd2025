@@ -1,6 +1,5 @@
 use libcamera::{CameraManager, StreamRole, PixelFormat};
-use ros2_client::{Context, Node, NodeOptions, QosProfile};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 // Error type for camera operations
 #[derive(Debug)]
@@ -12,8 +11,7 @@ enum CameraError {
     CameraStart(String),
     Request(String),
     Frame(String),
-    Ros2(String),
-    Message(String),
+    Io(String),
 }
 
 impl std::fmt::Display for CameraError {
@@ -26,8 +24,7 @@ impl std::fmt::Display for CameraError {
             CameraError::CameraStart(msg) => write!(f, "Camera start error: {}", msg),
             CameraError::Request(msg) => write!(f, "Request error: {}", msg),
             CameraError::Frame(msg) => write!(f, "Frame error: {}", msg),
-            CameraError::Ros2(msg) => write!(f, "ROS2 error: {}", msg),
-            CameraError::Message(msg) => write!(f, "Message error: {}", msg),
+            CameraError::Io(msg) => write!(f, "IO error: {}", msg),
         }
     }
 }
@@ -35,24 +32,7 @@ impl std::fmt::Display for CameraError {
 impl std::error::Error for CameraError {}
 
 fn main() -> Result<(), CameraError> {
-    println!("Initializing camera node...");
-
-    // Initialize ROS2 context
-    let ctx = Context::new()
-        .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 context: {:?}", e)))?;
-    let node = Node::new(&ctx, "camera_node", &NodeOptions::new().enable_rosout(true))
-        .map_err(|e| CameraError::Ros2(format!("Failed to create ROS2 node: {:?}", e)))?;
-
-    // Create publisher for /image topic
-    // Note: ros2-client uses message type names as strings
-    // sensor_msgs/msg/Image is the standard ROS2 message type
-    println!("Creating ROS2 publisher on /image topic...");
-    
-    // Create publisher with sensor_msgs/msg/Image message type
-    // The exact API may vary, but typically it's something like:
-    // let publisher = node.create_publisher::<sensor_msgs::msg::Image>(...)
-    // For now, we'll set up the structure and capture frames
-    // The actual publishing will be implemented once we confirm the message type API
+    println!("Initializing camera with libcamera-rs...");
 
     // Initialize CameraManager
     let cm = CameraManager::new()
@@ -115,9 +95,10 @@ fn main() -> Result<(), CameraError> {
     }
 
     println!("Camera started, capturing frames...");
-    println!("Publishing to /image topic (press Ctrl+C to stop)");
+    println!("(Press Ctrl+C to stop)");
 
     // Main capture loop
+    let mut frame_count = 0u64;
     loop {
         // Wait for completed request
         let completed_request = active_camera.wait_for_request(Duration::from_secs(1))
@@ -136,46 +117,30 @@ fn main() -> Result<(), CameraError> {
                 continue;
             }
 
-            // Convert frame to ROS2 Image message format
-            // For YUV420, we need to handle the planar format
-            // Collect all plane data into a single buffer
+            // Collect all plane data
             let mut frame_data = Vec::new();
             for plane in planes.iter() {
                 frame_data.extend_from_slice(plane);
             }
             
-            // Create ROS2 Image message
-            // sensor_msgs/Image structure:
-            // - header (std_msgs/Header): stamp, frame_id
-            // - height: u32
-            // - width: u32
-            // - encoding: String (e.g., "yuv420", "rgb8")
-            // - is_bigendian: u8
-            // - step: u32 (bytes per row)
-            // - data: Vec<u8>
+            frame_count += 1;
             
-            // For YUV420 format:
-            // - encoding: "yuv420"
-            // - step: width (for Y plane, but YUV420 is planar so this is approximate)
-            // - data: concatenated Y, U, V planes
+            // Log frame info periodically
+            if frame_count == 1 {
+                println!("First frame captured: {}x{} ({} bytes total)", 
+                    width, height, 
+                    frame_data.len());
+                println!("  Format: {:?}", stream_config.pixel_format);
+                println!("  Planes: {}", planes.len());
+                for (i, plane) in planes.iter().enumerate() {
+                    println!("    Plane {}: {} bytes", i, plane.len());
+                }
+            }
             
-            // TODO: Create actual ROS2 message using ros2-client API
-            // The exact API depends on how ros2-client handles message types
-            // Example structure (may need adjustment based on actual API):
-            // let image_msg = sensor_msgs::msg::Image {
-            //     header: ...,
-            //     height,
-            //     width,
-            //     encoding: "yuv420".to_string(),
-            //     is_bigendian: 0,
-            //     step: width, // approximate for YUV420
-            //     data: frame_data,
-            // };
-            // publisher.publish(&image_msg)?;
-            
-            println!("Captured frame: {}x{} ({} bytes) - ready to publish", 
-                width, height, 
-                frame_data.len());
+            if frame_count % 30 == 0 {
+                println!("Captured frame #{}: {}x{} ({} bytes)", 
+                    frame_count, width, height, frame_data.len());
+            }
         }
 
         // Re-queue the request for next frame
