@@ -9,6 +9,7 @@ enum TrackerError {
     Ros2(String),
     Pwm(String),
     Control(String),
+    Servo(String),
 }
 
 impl std::fmt::Display for TrackerError {
@@ -17,6 +18,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Ros2(msg) => write!(f, "ROS2 error: {}", msg),
             TrackerError::Pwm(msg) => write!(f, "PWM error: {}", msg),
             TrackerError::Control(msg) => write!(f, "Control error: {}", msg),
+            TrackerError::Servo(msg) => write!(f, "Servo error: {}", msg),
         }
     }
 }
@@ -25,12 +27,12 @@ impl std::error::Error for TrackerError {}
 
 // Servo control using PWM
 // GPIO18: Pan (Left-Right) - Hardware PWM
-// GPIO19: Tilt (Up-Down) - Software PWM using software_pwm library
+// GPIO19: Tilt (Up-Down) - Software PWM
 struct ServoController {
     // Hardware PWM for GPIO18 (PWM0)
     pan_pwm: Option<Pwm>,
     // Software PWM for GPIO19 using software_pwm library
-    tilt_servo: Option<SoftwarePwmServo>,
+    tilt_servo: SoftwarePwmServo,
 }
 
 impl ServoController {
@@ -41,30 +43,26 @@ impl ServoController {
         pan_pwm.enable()
             .map_err(|e| TrackerError::Pwm(format!("Failed to enable pan PWM: {:?}", e)))?;
 
-        // GPIO19 - use software PWM library (pin to CPU core 3 for best performance)
+        // GPIO19 - use software PWM library (pinned to CPU core 3 for best performance)
         let tilt_servo = SoftwarePwmServo::new(19, Some(3))
-            .map_err(|e| TrackerError::Pwm(format!("Failed to create tilt servo: {:?}", e)))?;
+            .map_err(|e| TrackerError::Servo(format!("Failed to create tilt servo: {:?}", e)))?;
 
         Ok(Self {
             pan_pwm: Some(pan_pwm),
-            tilt_servo: Some(tilt_servo),
+            tilt_servo,
         })
     }
 
     // Convert angle (0-180 degrees) to pulse width in milliseconds
     // Standard servos: 1.0ms (0°) to 2.0ms (180°)
-    // Some servos: 0.5ms (0°) to 2.5ms (180°)
     fn angle_to_pulse_width(angle: f64) -> f64 {
-        // Clamp angle to 0-180
         let angle = angle.max(0.0).min(180.0);
-        // Map 0-180 degrees to 1.0-2.0ms
         1.0 + (angle / 180.0) * 1.0
     }
 
     // Convert pulse width to duty cycle for hardware PWM (50Hz, 20ms period)
     fn pulse_width_to_duty_cycle(pulse_width_ms: f64) -> f64 {
-        let period_ms = 20.0; // 50Hz
-        (pulse_width_ms / period_ms) * 100.0
+        (pulse_width_ms / 20.0) * 100.0
     }
 
     // Set pan servo position (0-180 degrees)
@@ -83,24 +81,9 @@ impl ServoController {
     // Set tilt servo position (0-180 degrees)
     fn set_tilt(&self, angle: f64) -> Result<(), TrackerError> {
         let angle_u8 = angle.max(0.0).min(180.0) as u8;
-        if let Some(ref servo) = self.tilt_servo {
-            servo.set_angle(angle_u8)
-                .map_err(|e| TrackerError::Pwm(format!("Failed to set tilt angle: {:?}", e)))?;
-        }
+        self.tilt_servo.set_angle(angle_u8)
+            .map_err(|e| TrackerError::Servo(format!("Failed to set tilt angle: {:?}", e)))?;
         Ok(())
-    }
-
-    fn shutdown(&mut self) {
-        // Set servos to center position
-        self.set_pan(90.0).ok();
-        self.set_tilt(90.0).ok();
-        // Servo objects will be dropped here, stopping PWM threads
-    }
-}
-
-impl Drop for ServoController {
-    fn drop(&mut self) {
-        self.shutdown();
     }
 }
 

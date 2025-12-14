@@ -27,33 +27,38 @@ fn optimize_thread_for_realtime(cpu_core: Option<usize>) -> Result<(), String> {
     // Set real-time scheduling policy (requires CAP_SYS_NICE or root)
     #[cfg(target_os = "linux")]
     {
-        use thread_priority::{ThreadPriority, ThreadSchedulePolicy, RealtimeThreadSchedulePolicy, ThreadPriorityValue};
-        use thread_priority::unix::{set_thread_priority_and_policy, thread_native_id};
-        
-        // Get current thread ID
-        let thread_id = thread_native_id();
+        use thread_priority::*;
         
         // Try to set real-time priority with SCHED_FIFO policy
         // SCHED_FIFO gives highest priority, preempts normal threads
         let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
         
         // Use priority 50 (reasonable value, 1-99 range for SCHED_FIFO)
-        // try_from returns Result, not Option
-        let priority_result = ThreadPriorityValue::try_from(50)
-            .or_else(|_| ThreadPriorityValue::try_from(1)); // Fallback to priority 1 if 50 fails
-        
-        if let Ok(priority_value) = priority_result {
-            if let Err(e) = set_thread_priority_and_policy(
-                thread_id,
-                ThreadPriority::Crossplatform(priority_value),
-                policy
-            ) {
-                // If real-time fails, just warn but continue
-                // PWM will still work, just with more potential jitter
-                return Err(format!("Failed to set real-time thread priority: {:?}. PWM will work but may have more jitter. Run with sudo or set CAP_SYS_NICE capability", e));
+        match ThreadPriorityValue::try_from(50) {
+            Some(priority_value) => {
+                if let Err(e) = set_current_thread_priority_and_policy(
+                    ThreadPriority::Crossplatform(priority_value),
+                    policy
+                ) {
+                    // If real-time fails, try to at least increase priority
+                    if let Some(fallback_priority) = ThreadPriorityValue::try_from(10) {
+                        if let Err(_) = set_current_thread_priority(ThreadPriority::Crossplatform(fallback_priority)) {
+                            return Err(format!("Failed to set thread priority: {:?}. Run with sudo or set CAP_SYS_NICE capability", e));
+                        }
+                    }
+                }
             }
-        } else {
-            return Err("Failed to create thread priority value".to_string());
+            None => {
+                // Try lower priority if 50 fails
+                if let Some(priority_value) = ThreadPriorityValue::try_from(1) {
+                    if let Err(e) = set_current_thread_priority_and_policy(
+                        ThreadPriority::Crossplatform(priority_value),
+                        policy
+                    ) {
+                        return Err(format!("Failed to set thread priority: {:?}. Run with sudo or set CAP_SYS_NICE capability", e));
+                    }
+                }
+            }
         }
         
         // Set CPU affinity to pin thread to specific core
@@ -238,3 +243,27 @@ impl Drop for SoftwarePwmServo {
         self.running.store(false, Ordering::Relaxed);
     }
 }
+
+/// Create multiple servo controllers with shared CPU affinity
+/// This is a convenience function for initializing multiple servos efficiently
+/// 
+/// # Arguments
+/// * `pins` - Slice of GPIO pin numbers (BCM numbering)
+/// * `cpu_core` - Optional CPU core to pin all PWM threads to
+/// 
+/// # Returns
+/// * `Ok(Vec<SoftwarePwmServo>)` on success
+/// * `Err(rppal::gpio::Error)` on failure
+/// 
+/// # Example
+/// ```
+/// let servos = create_servos(&[18, 19], Some(3))?;
+/// servos[0].set_angle(90)?;
+/// servos[1].set_angle(45)?;
+/// ```
+pub fn create_servos(pins: &[u8], cpu_core: Option<usize>) -> Result<Vec<SoftwarePwmServo>, rppal::gpio::Error> {
+    pins.iter()
+        .map(|&pin| SoftwarePwmServo::new(pin, cpu_core))
+        .collect()
+}
+
