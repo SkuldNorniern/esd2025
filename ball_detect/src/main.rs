@@ -1,6 +1,8 @@
 // Ball Detection Node - YOLO-based detection using ort-rs and ROS2
-// Uses ros_wrapper for ROS communication and receives PNG images via sensor_msgs/Image
+// Uses ros_wrapper for ROS communication and receives RGB8 or PNG images via sensor_msgs/Image
 // Publishes ball coordinates as a single string message: "x1,y1,x2,y2" or "none"
+mod image_utils;
+
 use ros_wrapper::{create_topic_receiver, create_topic_sender, QosProfile, sensor_msgs::msg::Image, std_msgs::msg::String as StringMsg};
 use std::time::{Duration, Instant};
 use std::path::Path;
@@ -11,6 +13,7 @@ use ort::{
     session::builder::SessionBuilder,
     value::Value,
 };
+use image_utils::rgb8_to_png;
 
 // Error type for ball detection operations
 #[derive(Debug)]
@@ -289,18 +292,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         if frame_count == 1 {
             println!("✓ First message received!");
+            println!("  Encoding: {}", msg.encoding);
+            println!("  Size: {}x{}", msg.width, msg.height);
         }
         
-        // Check encoding - should be "png"
-        if msg.encoding != "png" {
-            eprintln!("Frame #{}: Unexpected encoding '{}', expected 'png'", frame_count, msg.encoding);
+        // Convert RGB8 to PNG if needed, or use PNG data directly
+        let png_data = if msg.encoding == "rgb8" {
+            // Convert RGB8 raw data to PNG
+            match rgb8_to_png(&msg.data, msg.width, msg.height) {
+                Ok(png) => png,
+                Err(e) => {
+                    eprintln!("Frame #{}: Failed to convert RGB8 to PNG: {}", frame_count, e);
+                    continue;
+                }
+            }
+        } else if msg.encoding == "png" {
+            // Already PNG, use directly
+            msg.data.clone()
+        } else {
+            eprintln!("Frame #{}: Unsupported encoding '{}', expected 'rgb8' or 'png'", frame_count, msg.encoding);
             continue;
-        }
+        };
         
         // Save image to sliding window buffer (keep last 3 images)
         let old_frame_to_remove = {
             let mut buffer = image_buffer.lock().unwrap();
-            buffer.push((frame_count, msg.data.clone()));
+            buffer.push((frame_count, png_data.clone()));
             
             // Keep only last 3 images in memory
             let old_frame = if buffer.len() > 3 {
@@ -312,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             // Save the new image to disk
             let filename = format!("frame_{:06}.png", frame_count);
-            if let Err(e) = std::fs::write(&filename, &msg.data) {
+            if let Err(e) = std::fs::write(&filename, &png_data) {
                 eprintln!("Failed to save image {}: {:?}", filename, e);
             } else if frame_count <= 3 || frame_count % 30 == 0 {
                 println!("Saved image: {} (keeping last 3 frames)", filename);
@@ -331,7 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         // Run detection on PNG data
-        let coords_string = match detector.detect(&msg.data) {
+        let coords_string = match detector.detect(&png_data) {
             Ok(Some((x1, y1, x2, y2))) => {
                 println!("Frame #{}: Ball detected at ({:.1}, {:.1}) to ({:.1}, {:.1})", 
                     frame_count, x1, y1, x2, y2);

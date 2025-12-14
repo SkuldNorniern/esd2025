@@ -15,7 +15,6 @@ enum CameraError {
     Stream(String),
     Frame(String),
     Ros2(String),
-    Image(String),
 }
 
 impl std::fmt::Display for CameraError {
@@ -28,7 +27,6 @@ impl std::fmt::Display for CameraError {
             CameraError::Stream(msg) => write!(f, "Stream error: {}", msg),
             CameraError::Frame(msg) => write!(f, "Frame error: {}", msg),
             CameraError::Ros2(msg) => write!(f, "ROS2 error: {}", msg),
-            CameraError::Image(msg) => write!(f, "Image error: {}", msg),
         }
     }
 }
@@ -85,48 +83,6 @@ fn extract_rgb(rgb_buffer: &[u8], width: u32, height: u32, row_stride: u32) -> V
     rgb_data
 }
 
-// Convert RGB to PNG bytes
-fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CameraError> {
-    use image::{ImageBuffer, Rgb, RgbImage};
-    use std::io::Cursor;
-    
-    // Verify RGB data size
-    let expected_size = (width * height * 3) as usize;
-    if rgb_data.len() != expected_size {
-        return Err(CameraError::Image(format!(
-            "RGB data size mismatch: expected {} bytes, got {} bytes",
-            expected_size, rgb_data.len()
-        )));
-    }
-    
-    // Create RGB image from raw data
-    // ImageBuffer expects data in row-major order: [R, G, B, R, G, B, ...]
-    let img: RgbImage = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, rgb_data.to_vec())
-        .ok_or_else(|| CameraError::Image(format!(
-            "Failed to create image buffer from {} bytes (expected {}x{}x3 = {} bytes)",
-            rgb_data.len(), width, height, expected_size
-        )))?;
-    
-    // Save first image for debugging
-    static SAVED_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SAVED_FIRST.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        if let Err(e) = img.save("debug_rgb_image.png") {
-            eprintln!("Failed to save debug RGB image: {:?}", e);
-        } else {
-            println!("Saved debug RGB image to debug_rgb_image.png");
-        }
-    }
-    
-    // Encode to PNG using write_to method
-    let mut png_bytes = Vec::new();
-    {
-        let mut cursor = Cursor::new(&mut png_bytes);
-        img.write_to(&mut cursor, image::ImageFormat::Png)
-            .map_err(|e| CameraError::Image(format!("Failed to encode PNG: {:?}", e)))?;
-    }
-    
-    Ok(png_bytes)
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -203,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| CameraError::Stream(format!("Failed to start streaming: {:?}", e)))?;
 
     println!("Camera started, capturing frames...");
-    println!("Publishing PNG images to /image topic (press Ctrl+C to stop)");
+    println!("Publishing RGB8 raw images to /image topic (press Ctrl+C to stop)");
 
     // Main capture loop
     let mut frame_count = 0u64;
@@ -280,12 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Convert RGB to PNG bytes
-        let png_bytes = rgb_to_png(&rgb_data, width, height)?;
-        let png_size = png_bytes.len(); // Save size before moving png_bytes
-        
-        // Create ROS2 sensor_msgs/Image message with PNG data
-        // For PNG, we'll use encoding "png" and put PNG bytes in data field
+        // Create ROS2 sensor_msgs/Image message with raw RGB8 data
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -300,10 +251,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             height,
             width,
-            encoding: "png".to_string(),
+            encoding: "rgb8".to_string(),
             is_bigendian: 0,
-            step: png_size as u32, // For PNG, step is the total size
-            data: png_bytes,
+            step: (width * 3) as u32, // RGB8: 3 bytes per pixel
+            data: rgb_data,
         };
         
         // Send message through channel
@@ -314,10 +265,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Log frame capture info periodically
         if frame_count % 30 == 0 {
-            println!("Published frame #{}: {}x{} PNG ({} bytes)", 
+            println!("Published frame #{}: {}x{} RGB8 ({} bytes)", 
                 frame_count,
                 width, height, 
-                png_size);
+                msg.data.len());
         }
         
         // Note: stream.next() automatically re-queues the buffer when called again,
