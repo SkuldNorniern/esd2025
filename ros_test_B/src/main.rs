@@ -1,19 +1,12 @@
-// Simple ROS2 Subscriber Example
+// Simple ROS2 Subscriber Example using rclrs
 // Subscribes to std_msgs/String messages on /test_topic
-// Based on ros2-client patterns from service examples
 
-use ros2_client::{Context, ContextOptions, NodeOptions, NodeName, MessageTypeName, Name};
-use ros2_client::rustdds::QosPolicies;
-use serde::{Deserialize, Serialize};
+use rclrs::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// Message struct matching std_msgs/String format
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct StringMessage {
-    data: String,
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), RclrsError> {
     println!("ROS2 Subscriber Test (ros_test_B)");
     println!("===================================");
     println!();
@@ -45,31 +38,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // Initialize ROS2 context with explicit domain ID
-    // CRITICAL: ros2-client requires explicit domain ID for cross-device communication
-    let ctx = Context::with_options(
-        ContextOptions::new().domain_id(ros_domain_id)
-    )
-        .map_err(|e| format!("Failed to create ROS2 context: {:?}", e))?;
+    // Initialize ROS2 context with domain ID from environment
+    // Using default_from_env which reads ROS_DOMAIN_ID automatically
+    let context = if ros_domain_id != 0 {
+        let args = std::env::args();
+        let init_options = InitOptions::new().with_domain_id(Some(ros_domain_id));
+        Context::new(args, init_options)?
+    } else {
+        Context::default_from_env()?
+    };
+
+    // Create executor
+    let mut executor = context.create_basic_executor();
 
     // Create node
-    let node_name = NodeName::new("/", "ros_test_subscriber")
-        .map_err(|e| format!("Failed to create node name: {:?}", e))?;
-    let mut node = ctx
-        .new_node(node_name, NodeOptions::new().enable_rosout(true))
-        .map_err(|e| format!("Failed to create ROS2 node: {:?}", e))?;
-
-    // CRITICAL: Start the node spinner in a background thread to process DDS events
-    // This is required for the subscription to receive messages!
-    // Note: spinner.spin() returns a Future, but in synchronous code we run it in a thread
-    // The spinner will process DDS events in the background
-    let spinner = node.spinner()
-        .map_err(|e| format!("Failed to create node spinner: {:?}", e))?;
-    let _spinner_handle = std::thread::spawn(move || {
-        // Run the spinner future in a blocking way
-        // This processes DDS events continuously
-        let _ = futures::executor::block_on(spinner.spin());
-    });
+    let node = executor.create_node("ros_test_subscriber")?;
 
     println!("ROS2 node created: ros_test_subscriber");
     println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
@@ -77,21 +60,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create subscriber for /test_topic
     println!("Subscribing to /test_topic...");
-    let topic_name = Name::new("/", "test_topic")
-        .map_err(|e| format!("Failed to create topic name: {:?}", e))?;
-    let message_type = MessageTypeName::new("std_msgs", "String");
+    
+    // Use atomic counter to track message count from callback
+    let message_count = Arc::new(AtomicU64::new(0));
+    let message_count_clone = Arc::clone(&message_count);
+    let first_message_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first_message_received_clone = Arc::clone(&first_message_received);
 
-    let test_topic = node
-        .create_topic(&topic_name, message_type, &QosPolicies::default())
-        .map_err(|e| format!("Failed to create topic: {:?}", e))?;
-
-    let subscriber = node
-        .create_subscription::<StringMessage>(&test_topic, Some(QosPolicies::default()))
-        .map_err(|e| format!("Failed to create subscriber: {:?}", e))?;
+    // Using example_interfaces::msg::String as shown in rclrs docs
+    // This is compatible with std_msgs/String in ROS 2
+    let _subscription = node.create_subscription(
+        "test_topic",
+        move |msg: example_interfaces::msg::String| {
+            let count = message_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            if !first_message_received_clone.swap(true, Ordering::Relaxed) {
+                println!("First message received!");
+            }
+            
+            println!("Received message #{}: {}", count, msg.data);
+        },
+    )?;
 
     println!("Subscriber created successfully");
     println!("  Topic: /test_topic");
-    println!("  Message type: std_msgs/String");
+    println!("  Message type: std_msgs/String (using example_interfaces::msg::String)");
     println!();
 
     // Wait for subscriber to establish connections
@@ -115,52 +108,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - If messages still not received, try increasing wait time or check firewall");
     println!();
 
-    // Event-driven message reception loop
-    // Based on ros2-client service examples pattern
-    let mut message_count = 0u64;
-    let mut last_log_time = Instant::now();
-
-    loop {
-        // Event-driven polling: process all available messages in a batch
+    // Start a thread to periodically log if no messages received yet
+    let message_count_log = Arc::clone(&message_count);
+    let _log_thread = std::thread::spawn(move || {
+        let mut last_log_time = Instant::now();
         loop {
-            match subscriber.take() {
-                Ok(Some((msg, _info))) => {
-                    message_count += 1;
-
-                    if message_count == 1 {
-                        println!("✓ First message received!");
-                    }
-
-                    // Print received message
-                    println!("Received message #{}: {}", message_count, msg.data);
-                }
-                Ok(None) => {
-                    // No more messages available, break inner loop
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("Error taking message from subscription: {:?}", e);
-                    break;
+            std::thread::sleep(Duration::from_secs(2));
+            if message_count_log.load(Ordering::Relaxed) == 0 {
+                let now = Instant::now();
+                if now.duration_since(last_log_time) > Duration::from_secs(2) {
+                    println!("Waiting for messages...");
+                    println!("  Troubleshooting:");
+                    println!("    - Verify publisher is running: ros2 node list");
+                    println!("    - Check topic info: ros2 topic info /test_topic");
+                    println!("    - Verify messages: ros2 topic echo /test_topic");
+                    println!("    - Ensure ROS_DOMAIN_ID matches on both devices");
+                    println!("    - Check firewall: UDP ports 7400-7500 should be open");
+                    last_log_time = now;
                 }
             }
         }
+    });
 
-        // Log periodically if no messages received yet (rate limiting similar to service examples)
-        if message_count == 0 {
-            let now = Instant::now();
-            if now.duration_since(last_log_time) > Duration::from_secs(2) {
-                println!("Waiting for messages... (event loop polling)");
-                println!("  Troubleshooting:");
-                println!("    - Verify publisher is running: ros2 node list");
-                println!("    - Check topic info: ros2 topic info /test_topic");
-                println!("    - Verify messages: ros2 topic echo /test_topic");
-                println!("    - Ensure ROS_DOMAIN_ID matches on both devices");
-                println!("    - Check firewall: UDP ports 7400-7500 should be open");
-                last_log_time = now;
-            }
-        }
+    // Spin the executor to process incoming messages
+    executor.spin(SpinOptions::default()).first_error()?;
 
-        // Small sleep to avoid busy-waiting (similar to service examples)
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    Ok(())
 }

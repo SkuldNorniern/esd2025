@@ -1,19 +1,10 @@
-// Simple ROS2 Publisher Example
+// Simple ROS2 Publisher Example using rclrs
 // Publishes std_msgs/String messages on /test_topic
-// Based on ros2-client patterns from service examples
 
-use ros2_client::{Context, ContextOptions, NodeName, NodeOptions, MessageTypeName, Name};
-use ros2_client::rustdds::QosPolicies;
-use serde::Serialize;
+use rclrs::*;
 use std::time::Duration;
 
-// Message struct matching std_msgs/String format
-#[derive(Serialize, Debug, Clone)]
-struct StringMessage {
-    data: String,
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), RclrsError> {
     println!("ROS2 Publisher Test (ros_test_A)");
     println!("==================================");
     println!();
@@ -45,49 +36,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // Initialize ROS2 context with explicit domain ID
-    // CRITICAL: ros2-client requires explicit domain ID for cross-device communication
-    let ctx = Context::with_options(
-        ContextOptions::new().domain_id(ros_domain_id)
-    )
-        .map_err(|e| format!("Failed to create ROS2 context: {:?}", e))?;
+    // Initialize ROS2 context with domain ID from environment
+    // Using default_from_env which reads ROS_DOMAIN_ID automatically
+    let context = if ros_domain_id != 0 {
+        let args = std::env::args();
+        let init_options = InitOptions::new().with_domain_id(Some(ros_domain_id));
+        Context::new(args, init_options)?
+    } else {
+        Context::default_from_env()?
+    };
+
+    // Create executor
+    let mut executor = context.create_basic_executor();
 
     // Create node
-    let node_name = NodeName::new("/", "ros_test_publisher")
-        .map_err(|e| format!("Failed to create node name: {:?}", e))?;
-    let mut node = ctx
-        .new_node(node_name, NodeOptions::new().enable_rosout(true))
-        .map_err(|e| format!("Failed to create ROS2 node: {:?}", e))?;
-
-    // CRITICAL: Start the node spinner in a background thread to process DDS events
-    // This is required for the publisher to send messages properly!
-    // Note: spinner.spin() returns a Future, but in synchronous code we run it in a thread
-    // The spinner will process DDS events in the background
-    let spinner = node.spinner()
-        .map_err(|e| format!("Failed to create node spinner: {:?}", e))?;
-    let _spinner_handle = std::thread::spawn(move || {
-        // Run the spinner future in a blocking way
-        // This processes DDS events continuously
-        let _ = futures::executor::block_on(spinner.spin());
-    });
+    let node = executor.create_node("ros_test_publisher")?;
 
     println!("ROS2 node created: ros_test_publisher");
     println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
     println!();
 
     // Create publisher for /test_topic
+    // Using example_interfaces::msg::String as shown in rclrs docs
+    // This is compatible with std_msgs/String in ROS 2
     println!("Creating ROS2 publisher on /test_topic...");
-    let topic_name = Name::new("/", "test_topic")
-        .map_err(|e| format!("Failed to create topic name: {:?}", e))?;
-    let message_type = MessageTypeName::new("std_msgs", "String");
-
-    let test_topic = node
-        .create_topic(&topic_name, message_type, &QosPolicies::default())
-        .map_err(|e| format!("Failed to create topic: {:?}", e))?;
-
-    let publisher = node
-        .create_publisher(&test_topic, Some(QosPolicies::default()))
-        .map_err(|e| format!("Failed to create publisher: {:?}", e))?;
+    let publisher = node.create_publisher::<example_interfaces::msg::String>("test_topic")?;
 
     println!("Publisher created successfully");
     println!();
@@ -113,29 +86,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         message_count += 1;
 
         // Create message
-        let msg = StringMessage {
+        let msg = example_interfaces::msg::String {
             data: format!("Hello from ros_test_A! Message #{}", message_count),
         };
 
         // Publish message
-        match publisher.publish(msg) {
-            Ok(()) => {
-                if message_count % 10 == 0 {
-                    println!("Published message #{}", message_count);
-                }
-            }
-            Err(e) => {
-                let error_str = format!("{:?}", e);
-                if error_str.contains("WouldBlock") {
-                    // WouldBlock is transient, just continue
-                    if message_count % 100 == 0 {
-                        eprintln!("Warning: WouldBlock on message #{} (publisher buffer may be full)", message_count);
-                    }
-                } else {
-                    eprintln!("ERROR: Failed to publish message #{}: {:?}", message_count, e);
-                    return Err(format!("Failed to publish: {:?}", e).into());
-                }
-            }
+        publisher.publish(&msg)?;
+
+        if message_count % 10 == 0 {
+            println!("Published message #{}", message_count);
         }
 
         // Publish at ~10 Hz (100ms delay)
