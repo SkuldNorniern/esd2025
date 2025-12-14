@@ -106,8 +106,9 @@ struct Controller {
 impl Controller {
     fn new(image_width: u32, image_height: u32) -> Self {
         Self {
-            kp_pan: 0.1,  // Tune these values
-            kp_tilt: 0.1,
+            // Increased gains for faster response
+            kp_pan: 0.15,  // Tuned for better tracking
+            kp_tilt: 0.15,
             pan_angle: 90.0,  // Start at center
             tilt_angle: 90.0,
             image_width,
@@ -116,7 +117,7 @@ impl Controller {
             pan_max: 180.0,
             tilt_min: 0.0,
             tilt_max: 180.0,
-            max_rate: 5.0,  // Max 5 degrees per update
+            max_rate: 10.0,  // Increased max rate for faster response (10 degrees per update)
             last_update: Instant::now(),
         }
     }
@@ -143,8 +144,23 @@ impl Controller {
         // Apply P-control
         // Positive error_x means ball is to the right, need to pan right (increase angle)
         // Positive error_y means ball is below center, need to tilt down (increase angle)
-        let delta_pan = self.kp_pan * normalized_error_x as f64 * 90.0; // Scale to degrees
-        let delta_tilt = self.kp_tilt * normalized_error_y as f64 * 90.0;
+        // Note: Image coordinates: (0,0) is top-left, y increases downward
+        // So positive error_y means ball is below center -> tilt down (increase angle)
+        let mut delta_pan = self.kp_pan * normalized_error_x as f64 * 90.0; // Scale to degrees
+        let mut delta_tilt = self.kp_tilt * normalized_error_y as f64 * 90.0;
+        
+        // Add dead zone to reduce jitter when ball is near center
+        let dead_zone = 0.08; // 8% of image size (about 51 pixels for 640x640)
+        if normalized_error_x.abs() < dead_zone {
+            // Ball is near center horizontally, reduce pan movement
+            let pan_reduction = normalized_error_x.abs() / dead_zone;
+            delta_pan *= pan_reduction;
+        }
+        if normalized_error_y.abs() < dead_zone {
+            // Ball is near center vertically, reduce tilt movement
+            let tilt_reduction = normalized_error_y.abs() / dead_zone;
+            delta_tilt *= tilt_reduction;
+        }
 
         // Rate limiting
         let elapsed = self.last_update.elapsed().as_secs_f64();
@@ -293,9 +309,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_detection_time = Instant::now();
     let timeout = Duration::from_secs(2); // Reset to center if no detection for 2 seconds
     let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut frame_count = 0u64;
+    let mut last_logged_pan = 90.0;
+    let mut last_logged_tilt = 90.0;
 
     loop {
         interval.tick().await;
+        frame_count += 1;
 
         // Check for ball detection coordinates
         if let Some((x1, y1, x2, y2)) = coords.get_coordinates() {
@@ -305,8 +325,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 servo.set_pan(pan_angle)?;
                 servo.set_tilt(tilt_angle)?;
 
-                println!("Ball at ({:.1}, {:.1}) to ({:.1}, {:.1}) -> Pan: {:.1}°, Tilt: {:.1}°",
-                    x1, y1, x2, y2, pan_angle, tilt_angle);
+                // Calculate ball center for logging
+                let ball_center_x = (x1 + x2) / 2.0;
+                let ball_center_y = (y1 + y2) / 2.0;
+                let image_center_x = 640.0 / 2.0;
+                let image_center_y = 640.0 / 2.0;
+                let error_x = ball_center_x - image_center_x;
+                let error_y = ball_center_y - image_center_y;
+                
+                // Log periodically or when angle changes significantly
+                let pan_diff = (pan_angle - last_logged_pan).abs();
+                let tilt_diff = (tilt_angle - last_logged_tilt).abs();
+                if pan_diff > 2.0 || tilt_diff > 2.0 || frame_count % 30 == 0 {
+                    println!("Ball center: ({:.1}, {:.1}), error: ({:.1}, {:.1}) -> Pan: {:.1}°, Tilt: {:.1}°",
+                        ball_center_x, ball_center_y, error_x, error_y, pan_angle, tilt_angle);
+                    last_logged_pan = pan_angle;
+                    last_logged_tilt = tilt_angle;
+                }
 
                 last_detection_time = Instant::now();
             } else {
