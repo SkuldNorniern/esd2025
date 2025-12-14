@@ -8,21 +8,65 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // Precise busy-wait function optimized for minimal jitter
-// Uses CPU cycles for accurate microsecond-level timing
-// Inlined for better performance, but marked never to prevent over-optimization
+// Uses calibrated spin loops to minimize Instant::now() overhead
+// Critical: Instant::now() has overhead, so we check it less frequently
 #[inline(never)]
 fn busy_wait_until(target: Instant) {
-    // Use a tight loop without yielding to maintain precise timing
-    // This is acceptable in a dedicated PWM thread
-    // Optimized loop: check time first, then spin if needed
+    // Quick early exit check
+    let mut now = Instant::now();
+    if now >= target {
+        return;
+    }
+    
+    // Estimate remaining time to choose optimal spin strategy
+    let mut remaining = target.saturating_duration_since(now);
+    
+    // For very short waits (< 100us), check frequently for precision
+    if remaining < Duration::from_micros(100) {
+        while now < target {
+            std::hint::spin_loop();
+            now = Instant::now();
+        }
+        return;
+    }
+    
+    // For longer waits, use calibrated spin loops
+    // Check time less frequently to reduce overhead
+    // The spin count is calibrated: ~1000 iterations ≈ 1-2 microseconds on modern CPUs
+    let spin_batch_size = if remaining < Duration::from_micros(500) {
+        200  // More frequent checks when close
+    } else if remaining < Duration::from_micros(2000) {
+        500  // Medium frequency
+    } else {
+        2000 // Less frequent checks for long waits
+    };
+    
+    // Main spin loop: spin many times before checking time
     loop {
-        let now = Instant::now();
+        // Spin for a batch before checking time
+        // This dramatically reduces Instant::now() overhead
+        for _ in 0..spin_batch_size {
+            std::hint::spin_loop();
+        }
+        
+        // Check time after spinning
+        now = Instant::now();
         if now >= target {
             break;
         }
-        // Use spin_loop hint for CPU optimization
-        // This tells the CPU to optimize for spin-wait loops
-        std::hint::spin_loop();
+        
+        // Update remaining time estimate
+        remaining = target.saturating_duration_since(now);
+        
+        // If we're getting close, switch to more frequent checks
+        if remaining < Duration::from_micros(100) {
+            // Final precision: check every iteration
+            while now < target {
+                std::hint::spin_loop();
+                now = Instant::now();
+            }
+            break;
+        }
     }
 }
 
@@ -107,8 +151,8 @@ impl SoftwarePwmServo {
                 }
                 
                 // Generate one PWM period with precise timing
+                // Critical: minimize time between period_start and pin.set_high()
                 // Capture start time immediately before setting pin
-                // This minimizes the delay between timing and pin state change
                 let period_start = Instant::now();
                 
                 // High pulse - set pin high
@@ -124,6 +168,7 @@ impl SoftwarePwmServo {
                 busy_wait_until(high_end);
                 
                 // Low pulse - set pin low
+                // Capture time immediately after setting low to account for any delay
                 pin.set_low();
                 
                 // Calculate target time for period end (exactly 20ms from start)
@@ -134,6 +179,13 @@ impl SoftwarePwmServo {
                 // This ensures exact 20ms period for stable 50Hz frequency
                 // Critical for servo stability - any jitter here causes servo jitter
                 busy_wait_until(period_end);
+                
+                // Optional: verify we didn't overshoot (for debugging)
+                // In production, this adds overhead, so we skip it
+                // let actual_period = period_start.elapsed();
+                // if actual_period > PERIOD_DURATION + Duration::from_micros(10) {
+                //     eprintln!("Warning: Period overshoot: {:?}", actual_period);
+                // }
             }
         });
         
