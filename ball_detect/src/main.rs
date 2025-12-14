@@ -3,13 +3,14 @@
 // Publishes ball coordinates as a single string message: "x1,y1,x2,y2" or "none"
 use ros_wrapper::{create_topic_receiver, create_topic_sender, QosProfile, sensor_msgs::msg::Image, std_msgs::msg::String as StringMsg};
 use std::time::{Duration, Instant};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use image::{DynamicImage, ImageBuffer, Rgb};
 use ndarray::Array4;
 use ort::{
     session::builder::SessionBuilder,
     value::Value,
 };
-use std::path::Path;
 
 // Error type for ball detection operations
 #[derive(Debug)]
@@ -275,6 +276,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Format: \"x1,y1,x2,y2\" or \"none\"");
     println!();
 
+    // Sliding window to save last 3 images
+    // Store: (frame_number, image_data)
+    let image_buffer: Arc<Mutex<Vec<(u64, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+
     let mut frame_count = 0u64;
     let mut last_log_time = Instant::now();
     
@@ -290,6 +295,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if msg.encoding != "png" {
             eprintln!("Frame #{}: Unexpected encoding '{}', expected 'png'", frame_count, msg.encoding);
             continue;
+        }
+        
+        // Save image to sliding window buffer (keep last 3 images)
+        let old_frame_to_remove = {
+            let mut buffer = image_buffer.lock().unwrap();
+            buffer.push((frame_count, msg.data.clone()));
+            
+            // Keep only last 3 images in memory
+            let old_frame = if buffer.len() > 3 {
+                let removed = buffer.remove(0);
+                Some(removed.0)
+            } else {
+                None
+            };
+            
+            // Save the new image to disk
+            let filename = format!("frame_{:06}.png", frame_count);
+            if let Err(e) = std::fs::write(&filename, &msg.data) {
+                eprintln!("Failed to save image {}: {:?}", filename, e);
+            } else if frame_count <= 3 || frame_count % 30 == 0 {
+                println!("Saved image: {} (keeping last 3 frames)", filename);
+            }
+            
+            old_frame
+        };
+        
+        // Clean up old image file if we removed one from buffer
+        if let Some(old_frame) = old_frame_to_remove {
+            let old_filename = format!("frame_{:06}.png", old_frame);
+            if let Err(e) = std::fs::remove_file(&old_filename) {
+                // Ignore errors (file might not exist)
+                eprintln!("Note: Could not remove old image {}: {:?}", old_filename, e);
+            }
         }
         
         // Run detection on PNG data
