@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-r2r = "0.9"
+ros_wrapper = { path = "../ros_wrapper" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

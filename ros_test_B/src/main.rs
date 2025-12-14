@@ -1,12 +1,10 @@
-// Simple ROS2 Subscriber Example using r2r
+// Simple ROS2 Subscriber Example using ros_wrapper
 // Subscribes to std_msgs/String messages on /test_topic
 
-use r2r::{Context, Node, QosProfile};
-use r2r::std_msgs::msg::String as StringMsg;
+use ros_wrapper::{create_topic_receiver, QosProfile, std_msgs::msg::String as StringMsg};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use futures::stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,27 +39,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // Initialize ROS2 context
-    let ctx = Context::create()?;
-    let mut node = Node::create(ctx, "ros_test_subscriber", "")?;
-
-    println!("ROS2 node created: ros_test_subscriber");
-    println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
-    println!();
-
-    // Create subscriber for /test_topic
+    // Create topic receiver using ros_wrapper
     println!("Subscribing to /test_topic...");
-    
-    // Use atomic counter to track message count from callback
-    let message_count = Arc::new(AtomicU64::new(0));
-    let first_message_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Create subscriber
-    let mut subscriber = node.subscribe::<StringMsg>("/test_topic", QosProfile::default())?;
+    let (mut rx, _node) = create_topic_receiver::<StringMsg>(
+        "ros_test_subscriber",
+        "/test_topic",
+        QosProfile::default(),
+    )?;
 
     println!("Subscriber created successfully");
     println!("  Topic: /test_topic");
     println!("  Message type: std_msgs/String");
+    println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
     println!();
 
     // Wait for subscriber to establish connections
@@ -85,6 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - If messages still not received, try increasing wait time or check firewall");
     println!();
 
+    // Use atomic counter to track message count
+    let message_count = Arc::new(AtomicU64::new(0));
+    let first_message_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Start a task to periodically log if no messages received yet
     let message_count_log = Arc::clone(&message_count);
     tokio::spawn(async move {
@@ -107,27 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Process incoming messages
-    // We need to periodically spin the node to process incoming messages
-    let mut spin_interval = tokio::time::interval(Duration::from_millis(50));
-    loop {
-        tokio::select! {
-            msg_result = subscriber.next() => {
-                if let Some(msg) = msg_result {
-                    let count = message_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    
-                    if !first_message_received.swap(true, Ordering::Relaxed) {
-                        println!("First message received!");
-                    }
-                    
-                    println!("Received message #{}: {}", count, msg.data);
-                }
-            }
-            _ = spin_interval.tick() => {
-                // Periodically spin the node to process DDS events and incoming messages
-                node.spin_once(Duration::from_millis(10));
-            }
+    // Process incoming messages from channel
+    while let Some(msg) = rx.recv().await {
+        let count = message_count.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        if !first_message_received.swap(true, Ordering::Relaxed) {
+            println!("First message received!");
         }
+        
+        println!("Received message #{}: {}", count, msg.data);
     }
 
     Ok(())

@@ -1,8 +1,7 @@
-// Simple ROS2 Publisher Example using r2r
+// Simple ROS2 Publisher Example using ros_wrapper
 // Publishes std_msgs/String messages on /test_topic
 
-use r2r::{Context, Node, QosProfile};
-use r2r::std_msgs::msg::String as StringMsg;
+use ros_wrapper::{create_topic_sender, QosProfile, std_msgs::msg::String as StringMsg};
 use std::time::Duration;
 
 #[tokio::main]
@@ -38,19 +37,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // Initialize ROS2 context
-    let ctx = Context::create()?;
-    let mut node = Node::create(ctx, "ros_test_publisher", "")?;
-
-    println!("ROS2 node created: ros_test_publisher");
-    println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
-    println!();
-
-    // Create publisher for /test_topic
+    // Create topic sender using ros_wrapper
     println!("Creating ROS2 publisher on /test_topic...");
-    let publisher = node.create_publisher::<StringMsg>("/test_topic", QosProfile::default())?;
+    let (tx, _node) = create_topic_sender::<StringMsg>(
+        "ros_test_publisher",
+        "/test_topic",
+        QosProfile::default(),
+    )?;
 
     println!("Publisher created successfully");
+    println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
     println!();
 
     // Wait for publisher to establish connections
@@ -68,34 +64,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("(Press Ctrl+C to stop)");
     println!();
 
-    // Create a timer to publish messages periodically
-    let mut timer = node.create_wall_timer(Duration::from_millis(100))?;
-
     // Main publishing loop
-    // We need to periodically spin the node to process events
     let mut message_count = 0u64;
-    let mut spin_interval = tokio::time::interval(Duration::from_millis(50));
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    
     loop {
-        tokio::select! {
-            _ = timer.tick() => {
-                message_count += 1;
+        interval.tick().await;
+        message_count += 1;
 
-                // Create message
-                let msg = StringMsg {
-                    data: format!("Hello from ros_test_A! Message #{}", message_count),
-                };
+        // Create message
+        let msg = StringMsg {
+            data: format!("Hello from ros_test_A! Message #{}", message_count),
+        };
 
-                // Publish message
-                publisher.publish(&msg)?;
+        // Send message through channel (will be published by background task)
+        if let Err(e) = tx.send(msg).await {
+            eprintln!("Failed to send message: {:?}", e);
+            break;
+        }
 
-                if message_count % 10 == 0 {
-                    println!("Published message #{}", message_count);
-                }
-            }
-            _ = spin_interval.tick() => {
-                // Periodically spin the node to process DDS events
-                node.spin_once(Duration::from_millis(10));
-            }
+        if message_count % 10 == 0 {
+            println!("Published message #{}", message_count);
         }
     }
+
+    Ok(())
 }
