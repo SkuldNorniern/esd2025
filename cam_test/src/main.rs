@@ -218,12 +218,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Frame #{}: Buffer is all zeros (seq: {}, bytesused: {}), skipping (camera may still be initializing)", 
                     frame_count, meta.sequence, meta.bytesused);
                 continue;
-            } else {
-                eprintln!("Warning: Frame #{} still all zeros after 10 frames! Camera may not be working properly.", frame_count);
+            } else if frame_count == 11 {
+                eprintln!("ERROR: Camera is returning all-zero frames! This indicates a hardware or driver issue.");
                 eprintln!("  Sequence: {}, Bytes used: {}, Buffer size: {}", 
                     meta.sequence, meta.bytesused, buffer.len());
-                // Continue anyway to see if it recovers
+                eprintln!("  Please check:");
+                eprintln!("    1. Camera is properly connected and powered");
+                eprintln!("    2. Test with: v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=test.raw");
+                eprintln!("    3. Check if RGB3 format is supported: v4l2-ctl -d /dev/video0 --list-formats-ext");
+                eprintln!("    4. Try a different format (YUYV) if RGB3 doesn't work");
+                eprintln!("  Continuing to publish zeros (will stop warnings)...");
+                // Continue anyway but stop spamming warnings
             }
+            // After first warning, just continue silently
+            // The data is still zeros but we don't want to spam
         }
         
         // Debug: Print first few bytes of first valid frame to verify format
