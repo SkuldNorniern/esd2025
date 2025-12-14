@@ -271,9 +271,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("(Press Ctrl+C to stop)");
     println!();
 
-    // Image dimensions (should match camera resolution: 320x240)
-    let image_width = 320;
-    let image_height = 240;
+    // Image dimensions (should match camera resolution: 640x640)
+    let image_width = 640;
+    let image_height = 640;
     let mut controller = Controller::new(image_width, image_height);
 
     // Spawn task to receive coordinates from single topic

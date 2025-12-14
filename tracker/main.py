@@ -4,11 +4,30 @@ Ball Tracker Node - Python implementation
 Subscribes to /ball_coords topic and controls pan/tilt servos to track the ball
 GPIO18: Pan servo (Left-Right)
 GPIO19: Tilt servo (Up-Down)
+
+Requirements:
+- ROS2 installed and sourced (source /opt/ros/<distro>/setup.bash)
+- rclpy installed: sudo apt install ros-<distro>-rclpy
+- gpiozero: pip install gpiozero pigpio
+- pigpio daemon running: sudo pigpiod
 """
 
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import String
+    RCLPY_AVAILABLE = True
+except ImportError as e:
+    RCLPY_AVAILABLE = False
+    print(f"Error: rclpy not available: {e}")
+    print("To install ROS2 Python packages:")
+    print("  1. Source ROS2: source /opt/ros/<distro>/setup.bash")
+    print("  2. Install rclpy: sudo apt install ros-<distro>-rclpy")
+    print("  3. Common distros: humble, foxy, galactic, iron")
+    print()
+    print("Alternatively, use the Rust version: cargo run --release -p tracker")
+    sys.exit(1)
+
 import time
 import os
 from typing import Optional, Tuple
@@ -168,6 +187,8 @@ class BallTrackerNode(Node):
     """ROS2 node for ball tracking"""
     
     def __init__(self):
+        if not RCLPY_AVAILABLE:
+            raise RuntimeError("rclpy not available")
         super().__init__('tracker_node')
         
         print("Initializing tracker node...")
@@ -277,6 +298,11 @@ class BallTrackerNode(Node):
 
 def main(args=None):
     """Main function"""
+    if not RCLPY_AVAILABLE:
+        print("Error: rclpy is not available. Cannot run tracker node.")
+        print("Please install ROS2 and rclpy, or use the Rust version instead.")
+        sys.exit(1)
+    
     rclpy.init(args=args)
     
     node = BallTrackerNode()
