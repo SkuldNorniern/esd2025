@@ -2,7 +2,7 @@ use libcamera::camera_manager::CameraManager;
 use libcamera::stream::StreamRole;
 use libcamera::geometry::Size;
 use libcamera::formats;
-use libcamera::FrameBufferAllocator;
+use libcamera::framebuffer_allocator::FrameBufferAllocator;
 use std::time::Duration;
 
 // Error type for camera operations
