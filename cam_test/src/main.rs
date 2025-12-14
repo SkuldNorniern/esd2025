@@ -124,8 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Device: {}", caps.card);
     println!("Driver: {}", caps.driver);
 
-    // Set format: 320x240 RGB3 (24-bit RGB 8-8-8, no conversion needed)
-    // RGB3 format: Stepwise 16x16 - 16376x16376 with step 1/1
+    // Set format: 320x240 RGB3/rgb24 (24-bit RGB 8-8-8, no conversion needed)
+    // RGB3 (V4L2) / rgb24 (ffmpeg): Stepwise 16x16 - 16376x16376 with step 1/1
     let width = 320;
     let height = 240;
     
@@ -159,8 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.start()
         .map_err(|e| CameraError::Stream(format!("Failed to start streaming: {:?}", e)))?;
 
-    println!("Camera started, capturing frames...");
-    println!("Publishing RGB3 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
+    println!("Camera started, waiting for stream to stabilize...");
+    // Wait a bit for the camera to start filling buffers (first frames are often empty/black)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    
+    println!("Publishing RGB3/rgb24 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
 
     // Main capture loop
     let mut frame_count = 0u64;
@@ -196,11 +199,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Debug: Print first few bytes of first frame to verify format
-        if frame_count == 1 {
+        // Skip first few frames (often empty/black while camera stabilizes)
+        if frame_count <= 3 {
+            // Check if buffer is all zeros (camera not ready yet)
+            let is_all_zeros = buffer.iter().take(1024).all(|&b| b == 0);
+            if is_all_zeros {
+                println!("Frame #{}: Buffer is all zeros, skipping (camera may still be initializing)", frame_count);
+                continue;
+            }
+        }
+        
+        // Debug: Print first few bytes of first valid frame to verify format
+        if frame_count == 4 {
             println!("First 16 bytes of raw frame: {:?}", 
                 &buffer[..buffer.len().min(16)]);
-            println!("Using stride: {} bytes per line (RGB3 format)", row_stride);
+            println!("Using stride: {} bytes per line (RGB3/rgb24 format)", row_stride);
             if let Err(e) = std::fs::write("debug_raw_frame.bin", &buffer) {
                 eprintln!("Failed to save raw frame: {:?}", e);
             } else {
@@ -228,8 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Save first RGB frame for debugging
-        if frame_count == 1 {
+        // Save first valid RGB frame for debugging
+        if frame_count == 4 {
             if let Err(e) = std::fs::write("debug_rgb_frame.raw", &rgb_data) {
                 eprintln!("Failed to save RGB frame: {:?}", e);
             } else {
@@ -237,8 +250,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        // Create ROS2 sensor_msgs/Image message with raw RGB3 data
-        // RGB3 (24-bit RGB 8-8-8) is sent as "rgb8" encoding in ROS
+        // Create ROS2 sensor_msgs/Image message with raw RGB3/rgb24 data
+        // RGB3 (V4L2) / rgb24 (ffmpeg) (24-bit RGB 8-8-8) is sent as "rgb8" encoding in ROS
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -254,9 +267,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             height,
             width,
-            encoding: "rgb8".to_string(), // ROS encoding name for RGB3 (24-bit RGB 8-8-8)
+            encoding: "rgb8".to_string(), // ROS encoding name for RGB3/rgb24 (24-bit RGB 8-8-8)
             is_bigendian: 0,
-            step: (width * 3) as u32, // RGB3: 3 bytes per pixel (R, G, B)
+            step: (width * 3) as u32, // RGB3/rgb24: 3 bytes per pixel (R, G, B)
             data: rgb_data,
         };
         
@@ -268,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Log frame capture info periodically
         if frame_count % 30 == 0 {
-            println!("Published frame #{}: {}x{} RGB3 ({} bytes)", 
+            println!("Published frame #{}: {}x{} RGB3/rgb24 ({} bytes)", 
                 frame_count,
                 width, height, 
                 data_size);
