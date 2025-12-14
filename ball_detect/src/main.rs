@@ -226,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let confidence_threshold = std::env::var("YOLO_CONFIDENCE_THRESHOLD")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.70);
+        .unwrap_or(0.65);
 
     println!("Loading YOLO ONNX model from: {}", model_path);
     println!("Confidence threshold: {:.2}", confidence_threshold);
