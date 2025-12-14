@@ -1,13 +1,15 @@
-// Simple ROS2 Subscriber Example using rclrs
+// Simple ROS2 Subscriber Example using r2r
 // Subscribes to std_msgs/String messages on /test_topic
 
-use rclrs::*;
-use rclrs::vendor::example_interfaces::msg::String as StringMsg;
+use r2r::{Context, Node, QosProfile};
+use r2r::std_msgs::msg::String as StringMsg;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use futures::stream::StreamExt;
 
-fn main() -> Result<(), RclrsError> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("ROS2 Subscriber Test (ros_test_B)");
     println!("===================================");
     println!();
@@ -39,21 +41,9 @@ fn main() -> Result<(), RclrsError> {
     }
     println!();
 
-    // Initialize ROS2 context with domain ID from environment
-    // Using default_from_env which reads ROS_DOMAIN_ID automatically
-    let context = if ros_domain_id != 0 {
-        let args = std::env::args();
-        let init_options = InitOptions::new().with_domain_id(Some(ros_domain_id));
-        Context::new(args, init_options)?
-    } else {
-        Context::default_from_env()?
-    };
-
-    // Create executor
-    let mut executor = context.create_basic_executor();
-
-    // Create node
-    let node = executor.create_node("ros_test_subscriber")?;
+    // Initialize ROS2 context
+    let ctx = Context::create()?;
+    let mut node = Node::create(ctx, "ros_test_subscriber", "")?;
 
     println!("ROS2 node created: ros_test_subscriber");
     println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
@@ -64,28 +54,14 @@ fn main() -> Result<(), RclrsError> {
     
     // Use atomic counter to track message count from callback
     let message_count = Arc::new(AtomicU64::new(0));
-    let message_count_clone = Arc::clone(&message_count);
     let first_message_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let first_message_received_clone = Arc::clone(&first_message_received);
 
-    // Using rclrs::vendor::example_interfaces::msg::String
-    // This is compatible with std_msgs/String in ROS 2
-    let _subscription = node.create_subscription(
-        "test_topic",
-        move |msg: StringMsg| {
-            let count = message_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            if !first_message_received_clone.swap(true, Ordering::Relaxed) {
-                println!("First message received!");
-            }
-            
-            println!("Received message #{}: {}", count, msg.data);
-        },
-    )?;
+    // Create subscriber
+    let mut subscriber = node.subscribe::<StringMsg>("/test_topic", QosProfile::default())?;
 
     println!("Subscriber created successfully");
     println!("  Topic: /test_topic");
-    println!("  Message type: std_msgs/String (using rclrs::vendor::example_interfaces::msg::String)");
+    println!("  Message type: std_msgs/String");
     println!();
 
     // Wait for subscriber to establish connections
@@ -95,9 +71,9 @@ fn main() -> Result<(), RclrsError> {
     println!("  (For same-device: Usually 2-5 seconds)");
     println!("  Check connection status with: ros2 topic info /test_topic");
     for _i in 1..=15 {
-        std::thread::sleep(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(1)).await;
         print!(".");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::io::Write::flush(&mut std::io::stdout())?;
     }
     println!();
     println!("Subscriber ready, waiting for messages...");
@@ -109,14 +85,14 @@ fn main() -> Result<(), RclrsError> {
     println!("  - If messages still not received, try increasing wait time or check firewall");
     println!();
 
-    // Start a thread to periodically log if no messages received yet
+    // Start a task to periodically log if no messages received yet
     let message_count_log = Arc::clone(&message_count);
-    let _log_thread = std::thread::spawn(move || {
-        let mut last_log_time = Instant::now();
+    tokio::spawn(async move {
+        let mut last_log_time = tokio::time::Instant::now();
         loop {
-            std::thread::sleep(Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_secs(2)).await;
             if message_count_log.load(Ordering::Relaxed) == 0 {
-                let now = Instant::now();
+                let now = tokio::time::Instant::now();
                 if now.duration_since(last_log_time) > Duration::from_secs(2) {
                     println!("Waiting for messages...");
                     println!("  Troubleshooting:");
@@ -131,8 +107,16 @@ fn main() -> Result<(), RclrsError> {
         }
     });
 
-    // Spin the executor to process incoming messages
-    executor.spin(SpinOptions::default()).first_error()?;
+    // Process incoming messages
+    while let Some(msg) = subscriber.next().await {
+        let count = message_count.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        if !first_message_received.swap(true, Ordering::Relaxed) {
+            println!("First message received!");
+        }
+        
+        println!("Received message #{}: {}", count, msg.data);
+    }
 
     Ok(())
 }

@@ -1,11 +1,12 @@
-// Simple ROS2 Publisher Example using rclrs
+// Simple ROS2 Publisher Example using r2r
 // Publishes std_msgs/String messages on /test_topic
 
-use rclrs::*;
-use rclrs::vendor::example_interfaces::msg::String as StringMsg;
+use r2r::{Context, Node, QosProfile};
+use r2r::std_msgs::msg::String as StringMsg;
 use std::time::Duration;
 
-fn main() -> Result<(), RclrsError> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("ROS2 Publisher Test (ros_test_A)");
     println!("==================================");
     println!();
@@ -37,31 +38,17 @@ fn main() -> Result<(), RclrsError> {
     }
     println!();
 
-    // Initialize ROS2 context with domain ID from environment
-    // Using default_from_env which reads ROS_DOMAIN_ID automatically
-    let context = if ros_domain_id != 0 {
-        let args = std::env::args();
-        let init_options = InitOptions::new().with_domain_id(Some(ros_domain_id));
-        Context::new(args, init_options)?
-    } else {
-        Context::default_from_env()?
-    };
-
-    // Create executor
-    let mut executor = context.create_basic_executor();
-
-    // Create node
-    let node = executor.create_node("ros_test_publisher")?;
+    // Initialize ROS2 context
+    let ctx = Context::create()?;
+    let mut node = Node::create(ctx, "ros_test_publisher", "")?;
 
     println!("ROS2 node created: ros_test_publisher");
     println!("DDS Domain ID: {} (from ROS_DOMAIN_ID)", ros_domain_id);
     println!();
 
     // Create publisher for /test_topic
-    // Using rclrs::vendor::example_interfaces::msg::String
-    // This is compatible with std_msgs/String in ROS 2
     println!("Creating ROS2 publisher on /test_topic...");
-    let publisher = node.create_publisher::<StringMsg>("test_topic")?;
+    let publisher = node.create_publisher::<StringMsg>("/test_topic", QosProfile::default())?;
 
     println!("Publisher created successfully");
     println!();
@@ -72,18 +59,22 @@ fn main() -> Result<(), RclrsError> {
     println!("  (For cross-device: DDS discovery can take 10-30 seconds)");
     println!("  (For same-device: Usually 2-5 seconds)");
     for _i in 1..=15 {
-        std::thread::sleep(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(1)).await;
         print!(".");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::io::Write::flush(&mut std::io::stdout())?;
     }
     println!();
     println!("Publisher ready, starting to publish messages...");
     println!("(Press Ctrl+C to stop)");
     println!();
 
+    // Create a timer to publish messages periodically
+    let mut timer = node.create_wall_timer(Duration::from_millis(100))?;
+
     // Main publishing loop
     let mut message_count = 0u64;
     loop {
+        timer.tick().await?;
         message_count += 1;
 
         // Create message
@@ -97,8 +88,5 @@ fn main() -> Result<(), RclrsError> {
         if message_count % 10 == 0 {
             println!("Published message #{}", message_count);
         }
-
-        // Publish at ~10 Hz (100ms delay)
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
