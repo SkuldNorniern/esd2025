@@ -57,22 +57,32 @@ fn find_v4l_device() -> Result<String, CameraError> {
 }
 
 // Convert YUYV format to RGB8
-// YUYV is packed format: Y0 U0 Y1 V0 Y2 U1 Y3 V1 ...
+// YUYV format: 4 bytes per 2 pixels: Y0 U Y1 V
 // Each pair of pixels shares U and V components
 fn yuyv_to_rgb(yuyv_data: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
     
+    // YUYV: each row is width * 2 bytes (2 pixels per 4 bytes)
+    let row_stride_bytes = (width * 2) as usize;
+    
     for y in 0..height {
+        let row_offset = (y as usize) * row_stride_bytes;
+        
         for x in (0..width).step_by(2) {
-            let idx = ((y * width + x) * 2) as usize;
-            if idx + 3 >= yuyv_data.len() {
+            // Calculate byte index for this pixel pair
+            // Each pair is 4 bytes: Y0 U Y1 V
+            let byte_idx = row_offset + ((x / 2) * 4) as usize;
+            
+            if byte_idx + 3 >= yuyv_data.len() {
+                eprintln!("Warning: Buffer overflow at row {}, col {}", y, x);
                 break;
             }
             
-            let y0 = yuyv_data[idx] as i32;
-            let u = yuyv_data[idx + 1] as i32;
-            let y1 = yuyv_data[idx + 2] as i32;
-            let v = yuyv_data[idx + 3] as i32;
+            // Extract YUYV components: Y0 U Y1 V
+            let y0 = yuyv_data[byte_idx] as i32;
+            let u = yuyv_data[byte_idx + 1] as i32;
+            let y1 = yuyv_data[byte_idx + 2] as i32;
+            let v = yuyv_data[byte_idx + 3] as i32;
             
             // Convert YUV to RGB for first pixel
             let (r0, g0, b0) = yuv_to_rgb(y0, u, v);
@@ -114,9 +124,32 @@ fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
 fn rgb_to_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CameraError> {
     use image::{ImageBuffer, ImageEncoder, Rgb, RgbImage};
     
+    // Verify RGB data size
+    let expected_size = (width * height * 3) as usize;
+    if rgb_data.len() != expected_size {
+        return Err(CameraError::Image(format!(
+            "RGB data size mismatch: expected {} bytes, got {} bytes",
+            expected_size, rgb_data.len()
+        )));
+    }
+    
     // Create RGB image from raw data
+    // ImageBuffer expects data in row-major order: [R, G, B, R, G, B, ...]
     let img: RgbImage = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, rgb_data.to_vec())
-        .ok_or_else(|| CameraError::Image("Failed to create image buffer".to_string()))?;
+        .ok_or_else(|| CameraError::Image(format!(
+            "Failed to create image buffer from {} bytes (expected {}x{}x3 = {} bytes)",
+            rgb_data.len(), width, height, expected_size
+        )))?;
+    
+    // Save first image for debugging
+    static SAVED_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAVED_FIRST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Err(e) = img.save("debug_rgb_image.png") {
+            eprintln!("Failed to save debug RGB image: {:?}", e);
+        } else {
+            println!("Saved debug RGB image to debug_rgb_image.png");
+        }
+    }
     
     // Encode to PNG using the newer API
     let mut png_bytes = Vec::new();
@@ -189,6 +222,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         actual_format.width, 
         actual_format.height,
         actual_format.fourcc);
+    
+    // Check if format has stride (bytes per line might be different from width * 2)
+    if let Some(bytesperline) = actual_format.bytesperline {
+        println!("Bytes per line: {} (expected: {})", 
+            bytesperline, 
+            actual_format.width * 2);
+        if bytesperline != actual_format.width * 2 {
+            eprintln!("Warning: Stride mismatch! This may cause image corruption.");
+        }
+    }
 
     // Create capture stream with 4 buffers
     let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 4)
@@ -217,8 +260,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let width = actual_format.width;
         let height = actual_format.height;
 
+        // Verify buffer size matches expected YUYV size (width * height * 2 bytes)
+        let expected_size = (width * height * 2) as usize;
+        if buffer.len() != expected_size {
+            eprintln!("Warning: Buffer size mismatch. Expected {} bytes, got {} bytes", 
+                expected_size, buffer.len());
+            if buffer.len() < expected_size {
+                eprintln!("Buffer is too small, skipping frame");
+                continue;
+            }
+        }
+
+        // Debug: Print first few bytes of first frame to verify format
+        if frame_count == 1 {
+            println!("First 16 bytes of raw frame: {:?}", 
+                &buffer[..buffer.len().min(16)]);
+            if let Err(e) = std::fs::write("debug_raw_frame.bin", &buffer) {
+                eprintln!("Failed to save raw frame: {:?}", e);
+            } else {
+                println!("Saved raw frame to debug_raw_frame.bin ({} bytes)", buffer.len());
+            }
+        }
+
         // Convert YUYV to RGB8
         let rgb_data = yuyv_to_rgb(&buffer, width, height);
+        
+        // Verify RGB data size
+        let expected_rgb_size = (width * height * 3) as usize;
+        if rgb_data.len() != expected_rgb_size {
+            eprintln!("Warning: RGB conversion size mismatch. Expected {} bytes, got {} bytes",
+                expected_rgb_size, rgb_data.len());
+        }
+        
+        // Save first RGB frame for debugging
+        if frame_count == 1 {
+            if let Err(e) = std::fs::write("debug_rgb_frame.raw", &rgb_data) {
+                eprintln!("Failed to save RGB frame: {:?}", e);
+            } else {
+                println!("Saved RGB frame to debug_rgb_frame.raw ({} bytes)", rgb_data.len());
+            }
+        }
         
         // Convert RGB to PNG bytes
         let png_bytes = rgb_to_png(&rgb_data, width, height)?;
