@@ -1,13 +1,16 @@
 // ROS wrapper library providing channel-based interface for ROS2 topics
 // Creates tokio channels (Sender/Receiver) that are backed by ROS publishers/subscribers
 
-use r2r::{Context, Node, QosProfile};
+use r2r::{Context, Node};
 use futures::stream::StreamExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-// Re-export commonly used types from r2r so users don't need to import r2r directly
+// Re-export r2r so users can access all r2r types through ros_wrapper
+pub use r2r;
+
+// Re-export commonly used types for convenience
 pub use r2r::QosProfile;
 pub use r2r::std_msgs;
 
@@ -58,7 +61,7 @@ impl std::error::Error for RosWrapperError {}
 pub fn create_topic_sender<T>(
     node_name: &str,
     topic: &str,
-    qos: QosProfile,
+    qos: r2r::QosProfile,
 ) -> Result<(mpsc::Sender<T>, Arc<Mutex<Node>>), RosWrapperError>
 where
     T: r2r::WrappedTypesupport + Clone + Send + 'static,
@@ -124,7 +127,7 @@ where
 pub fn create_topic_receiver<T>(
     node_name: &str,
     topic: &str,
-    qos: QosProfile,
+    qos: r2r::QosProfile,
 ) -> Result<(mpsc::Receiver<T>, Arc<Mutex<Node>>), RosWrapperError>
 where
     T: r2r::WrappedTypesupport + Send + 'static,
@@ -175,3 +178,4 @@ where
     
     Ok((rx, node_arc))
 }
+
