@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "ros_wrapper",
+    "cam_test",
+    "ball_detect",
+    "tracker",
+    "camera",
+    "servo_test",
+    "software_pwm",
+    "ros_test_A",
+    "ros_test_B",
+]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
