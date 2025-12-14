@@ -38,7 +38,7 @@ fn main() -> Result<(), CameraError> {
     println!("Initializing camera with libcamera-rs...");
 
     // Initialize CameraManager
-    let cm = CameraManager::new()
+    let mut cm = CameraManager::new()
         .map_err(|e| CameraError::CameraManager(format!("Failed to create CameraManager: {:?}", e)))?;
     
     cm.start()
