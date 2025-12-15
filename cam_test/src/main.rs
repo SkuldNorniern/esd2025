@@ -1,3 +1,13 @@
+// Optimized for Raspberry Pi 3 - reduced resolution, FPS, and frame skipping
+// Configuration is loaded from config.toml at compile time via build.rs
+// Environment variables can still override compile-time defaults:
+//   CAM_WIDTH, CAM_HEIGHT: Resolution (overrides config.toml)
+//   PUBLISH_EVERY_N: Skip N-1 frames between publishes (overrides config.toml)
+//   CAM_BUFFERS: Number of camera buffers (overrides config.toml)
+
+// Include auto-generated config constants
+include!(concat!(env!("OUT_DIR"), "/config.rs"));
+
 use ros_wrapper::{create_topic_sender, QosProfile, sensor_msgs::msg::Image};
 use v4l::video::Capture;
 use v4l::Format;
@@ -136,10 +146,17 @@ async fn async_main() -> Result<(), CameraError> {
     println!("Device: {}", caps.card);
     println!("Driver: {}", caps.driver);
 
-    // Set format: 640x640 MJPEG (Motion JPEG, compressed format)
-    // /dev/video1 supports MJPEG which is more efficient than raw formats
-    let width = 640;
-    let height = 640;
+    // Set format: Load from config.toml (512x512 default), can be overridden with env vars
+    let width: u32 = std::env::var("CAM_WIDTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CAM_WIDTH);
+    let height: u32 = std::env::var("CAM_HEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CAM_HEIGHT);
+    
+    println!("Requested resolution: {}x{} (from config.toml, use CAM_WIDTH/CAM_HEIGHT env vars to override)", width, height);
     
     let format = Format::new(width, height, v4l::FourCC::new(b"MJPG"));
     dev.set_format(&format)
@@ -169,8 +186,15 @@ async fn async_main() -> Result<(), CameraError> {
     // MJPEG is required and verified above
     let format_is_mjpeg = true;
 
-    // Create capture stream with 4 buffers
-    let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 4)
+    // Create capture stream with buffers from config.toml (default: 4)
+    // More buffers = less blocking when network sending is slow, but uses more memory
+    // Can be overridden with CAM_BUFFERS environment variable
+    let buffer_count: u32 = std::env::var("CAM_BUFFERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CAM_BUFFERS);
+    println!("Using {} camera buffers (from config.toml, use CAM_BUFFERS env var to override)", buffer_count);
+    let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, buffer_count)
         .map_err(|e| CameraError::Stream(format!("Failed to create stream: {:?}", e)))?;
 
     // Start streaming (critical - without this, buffers won't be filled)
@@ -190,32 +214,35 @@ async fn async_main() -> Result<(), CameraError> {
     println!();
     println!("Publishing MJPEG (compressed JPEG) images to /image topic (press Ctrl+C to stop)");
 
-    // Main capture loop
-    // Note: stream.next() is a blocking call, but for camera frames it should return quickly (~33ms)
-    // If it blocks longer, there may be an issue with the camera
+    // Main capture loop - optimized for Pi 3 performance
+    // Key optimizations:
+    // 1. Reduced buffer count (4) to reduce memory pressure on Pi 3
+    // 2. Increased frame skipping (15) to reduce network load  
+    // 3. Removed interval throttling - let camera run at natural rate, skip frames instead
+    // 4. Non-blocking network sends using try_send to prevent blocking camera capture
     let mut frame_count = 0u64;
-    // Publish every other frame to reduce network overhead (publish 1, skip 1).
-    // We still dequeue frames continuously so the camera driver buffers don't stall.
-    let publish_every_n: u64 = 2;
-    // For 30 FPS, we need ~33ms between frames
-    // But we'll capture as fast as possible and let the interval throttle
-    let mut interval = tokio::time::interval(Duration::from_millis(33)); // ~30 FPS (33ms = 1000/30)
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    
+    // Publish every Nth frame to reduce network overhead
+    // Load from config.toml (default: 15 for Pi 3), can be overridden with env var
+    let publish_every_n: u64 = std::env::var("PUBLISH_EVERY_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PUBLISH_EVERY_N);
+    println!("Publishing every {} frame(s) (from config.toml, use PUBLISH_EVERY_N env var to override)", publish_every_n);
     
     loop {
-        interval.tick().await;
-        
         // Dequeue a buffer (wait for frame)
         // stream.next() is blocking - use block_in_place to avoid stalling async runtime
-        // This allows the blocking call without moving the stream
         let frame_start = std::time::Instant::now();
         let result = tokio::task::block_in_place(|| {
             stream.next()
         });
         
         let elapsed = frame_start.elapsed();
+        // Warn if blocking is long - indicates camera buffers backing up
+        // This usually means network is slower than camera capture rate
         if elapsed > Duration::from_millis(100) {
-            eprintln!("WARNING: stream.next() took {:?} (unusually long)", elapsed);
+            eprintln!("WARNING: stream.next() took {:?} (frame #{}) - camera buffers backing up, try reducing resolution in config.toml or increasing PUBLISH_EVERY_N", elapsed, frame_count);
         }
         
         let (buffer, meta) = match result {
@@ -371,24 +398,41 @@ async fn async_main() -> Result<(), CameraError> {
             data: image_data.to_vec(),
         };
         
-        // Send message through channel
-        if let Err(e) = tx.send(msg).await {
-            eprintln!("Failed to send message: {:?}", e);
-            // Continue anyway
+        // Send message through channel (non-blocking)
+        // Use try_send to prevent blocking camera capture if network is slow
+        // The channel has capacity 100, so this should rarely fail unless network is very slow
+        match tx.try_send(msg) {
+            Ok(()) => {
+                // Successfully queued for sending
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Channel full - network sending is slower than camera capture
+                // Drop this frame and continue to prevent blocking camera
+                if frame_count % 30 == 0 {
+                    eprintln!("Dropping frame #{} - network sending queue is full (network too slow)", frame_count);
+                }
+                continue;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                eprintln!("ERROR: Network channel closed, exiting");
+                break;
+            }
         }
         
-        // Log frame capture info periodically
-        if frame_count % 30 == 0 {
+        // Log frame capture info periodically (less frequent to reduce overhead)
+        if frame_count % 60 == 0 {
             if format_is_mjpeg {
-                println!("Published frame #{}: {}x{} MJPEG ({} bytes compressed)", 
+                println!("Published frame #{}: {}x{} MJPEG ({} bytes compressed, skip={})", 
                     frame_count,
                     width, height, 
-                    data_size);
+                    data_size,
+                    publish_every_n);
             } else {
-                println!("Published frame #{}: {}x{} RGB3/rgb24 ({} bytes)", 
+                println!("Published frame #{}: {}x{} RGB3/rgb24 ({} bytes, skip={})", 
                     frame_count,
                     width, height, 
-                    data_size);
+                    data_size,
+                    publish_every_n);
             }
         }
         

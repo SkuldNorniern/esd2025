@@ -1,0 +1,19 @@
+# Camera configuration for Raspberry Pi 3
+# This file is read at compile time by build.rs
+
+[camera]
+# Resolution - 512x512 for better performance on Pi 3
+width = 512
+height = 512
+
+# Camera buffers - more buffers reduce blocking but use more memory
+# Reduced from 8 to 4 for Pi 3 to reduce memory pressure
+buffers = 4
+
+# Publish every Nth frame - higher value = less network traffic
+# Increased to 15 for Pi 3 to reduce network load
+publish_every_n = 3
+
+# Target FPS (for logging purposes, actual rate depends on camera and network)
+target_fps = 15
+

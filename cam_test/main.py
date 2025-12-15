@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# Optimized for Raspberry Pi 3 - reduced resolution, FPS, and frame skipping
+# Environment variables for tuning:
+#   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 480x360)
+#   CAM_FPS: Target FPS (default: 15)
+#   JPEG_QUALITY: JPEG compression quality 1-100 (default: 65)
+#   PUBLISH_EVERY_N: Skip N-1 frames between publishes (default: 3)
+#   PUBLISH_RAW: Set to "1" to enable raw RGB8 publishing (default: "0")
+#   CAM_WARMUP: Number of frames to discard on startup (default: 10)
 import os, sys, time, signal, warnings
 
 import rclpy
@@ -32,13 +40,15 @@ class CameraNode(Node):
         self.pub_jpeg = self.create_publisher(CompressedImage, "/image/compressed", 10)
 
         self.device_path = "/dev/video1"
-        self.req_w = 640
-        self.req_h = 480          # Don’t request 640x640 unless the camera actually supports it
-        self.req_fps = 30
-        self.jpeg_quality = 85
+        # Reduced resolution for Pi 3 - can be overridden with CAM_WIDTH/CAM_HEIGHT env vars
+        self.req_w = int(os.environ.get("CAM_WIDTH", "480"))
+        self.req_h = int(os.environ.get("CAM_HEIGHT", "360"))
+        self.req_fps = int(os.environ.get("CAM_FPS", "15"))  # Reduced FPS for Pi 3
+        # Lower JPEG quality for smaller file sizes - can be overridden with JPEG_QUALITY env var
+        self.jpeg_quality = int(os.environ.get("JPEG_QUALITY", "65"))
 
-        # If you really want to cut CPU, set PUBLISH_RAW=0 and only publish /image/compressed
-        self.publish_raw = os.environ.get("PUBLISH_RAW", "1") != "0"
+        # Disable raw by default for Pi 3 - set PUBLISH_RAW=1 to enable
+        self.publish_raw = os.environ.get("PUBLISH_RAW", "0") != "0"
 
         # Filter stderr spam (optional)
         self._orig_stderr = sys.stderr
@@ -72,14 +82,16 @@ class CameraNode(Node):
         if fourcc_str != "MJPG":
             self.get_logger().warn(f"Camera did not negotiate MJPG (got {fourcc_str}). You may get bandwidth issues.")
 
-        # Warm up / flush junk frames
-        for _ in range(30):
+        # Warm up / flush junk frames (reduced for faster startup)
+        warmup_frames = int(os.environ.get("CAM_WARMUP", "10"))
+        for _ in range(warmup_frames):
             self.cap.grab()
 
         self.frame_count = 0
         self.bad_count = 0
-        # Publish every other frame to reduce network overhead (publish 1, skip 1).
-        self.publish_every_n = 2
+        # Publish every Nth frame - higher value = less network traffic
+        # Can be overridden with PUBLISH_EVERY_N env var (default: 3 for Pi 3)
+        self.publish_every_n = int(os.environ.get("PUBLISH_EVERY_N", "3"))
 
         period = 1.0 / max(1.0, self.req_fps)
         self.timer = self.create_timer(period, self.capture_and_publish)
@@ -140,7 +152,10 @@ class CameraNode(Node):
             msg.data = rgb.tobytes()
             self.pub_raw.publish(msg)
 
-        # 2) Publish compressed JPEG on /image/compressed (this is the “MJPEG over ROS” path)
+        # 2) Publish compressed JPEG on /image/compressed
+        # Note: If camera provides MJPEG directly, we could use it without re-encoding
+        # But OpenCV doesn't expose raw MJPEG easily, so we re-encode
+        # For better performance, use the Rust version which uses raw MJPEG from camera
         enc_ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         if not enc_ok or jpeg is None or len(jpeg) < 100:
             self.bad_count += 1
