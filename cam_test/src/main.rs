@@ -184,6 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Main capture loop
+    // Note: stream.next() is a blocking call, but for camera frames it should return quickly (~33ms)
+    // If it blocks longer, there may be an issue with the camera
     let mut frame_count = 0u64;
     // For 30 FPS, we need ~33ms between frames
     // But we'll capture as fast as possible and let the interval throttle
@@ -194,8 +196,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.tick().await;
         
         // Dequeue a buffer (wait for frame)
-        let (buffer, meta) = stream.next()
-            .map_err(|e| CameraError::Frame(format!("Failed to capture frame: {:?}", e)))?;
+        // stream.next() is blocking but should return quickly for camera frames (~33ms)
+        // If it blocks indefinitely, the camera may have stopped or disconnected
+        // Note: This blocking call in async context can stall the runtime, but for camera
+        // frames it should be fast. If deadlocks occur, consider using spawn_blocking
+        // with proper stream handling (requires restructuring to move stream).
+        let (buffer, meta) = match stream.next() {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("ERROR: Failed to capture frame: {:?}", e);
+                eprintln!("  Camera may have disconnected or stopped streaming.");
+                eprintln!("  Frame count before error: {}", frame_count);
+                // Don't exit immediately - try to continue in case it's a temporary error
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
 
         frame_count += 1;
 
@@ -240,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // For MJPEG, check if it's a valid JPEG (starts with FF D8)
         // For uncompressed, check if buffer is all zeros
-        let is_valid = if is_mjpeg {
+        let is_valid = if format_is_mjpeg {
             // MJPEG: check JPEG header (FF D8)
             image_data.len() >= 2 && image_data[0] == 0xFF && image_data[1] == 0xD8
         } else {
