@@ -92,9 +92,9 @@ class Controller:
     """PID controller (P-only) for ball tracking"""
     
     def __init__(self, image_width: int, image_height: int):
-        # Proportional gains - balanced for stable tracking
-        self.kp_pan = 0.12
-        self.kp_tilt = 0.12
+        # Proportional gains - higher for accurate pointing
+        self.kp_pan = 0.20
+        self.kp_tilt = 0.20
         
         # Current servo positions (degrees)
         self.pan_angle = 90.0  # Start at center
@@ -111,14 +111,14 @@ class Controller:
         self.tilt_max = 180.0
         
         # Rate limiting (max change per update)
-        self.max_rate = 5.0  # Max 5 degrees per update to prevent overshoot
+        self.max_rate = 8.0  # Max 8 degrees per update for faster response
         
         self.last_update = time.time()
         
         # Track previous ball position to detect if ball is actually moving
         self.last_ball_center_x: Optional[float] = None
         self.last_ball_center_y: Optional[float] = None
-        self.position_change_threshold = 5.0  # Pixels - only move if ball moved more than this
+        self.position_change_threshold = 3.0  # Pixels - only move if ball moved more than this (reduced for accuracy)
     
     def update(self, x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float]:
         """Update servo positions based on ball detection"""
@@ -126,51 +126,68 @@ class Controller:
         ball_center_x = (x1 + x2) / 2.0
         ball_center_y = (y1 + y2) / 2.0
         
+        # Calculate image center and error early
+        image_center_x = self.image_width / 2.0
+        image_center_y = self.image_height / 2.0
+        error_x = ball_center_x - image_center_x
+        error_y = ball_center_y - image_center_y
+        error_magnitude = (error_x**2 + error_y**2)**0.5
+        
         # Check if ball position actually changed significantly
+        # But allow movement if error is large (ball is far from center)
         if self.last_ball_center_x is not None and self.last_ball_center_y is not None:
             ball_moved_x = abs(ball_center_x - self.last_ball_center_x)
             ball_moved_y = abs(ball_center_y - self.last_ball_center_y)
             
-            # If ball hasn't moved much, don't update servos (prevents drift when ball is stationary)
-            if ball_moved_x < self.position_change_threshold and ball_moved_y < self.position_change_threshold:
-                # Ball is stationary, keep current servo positions
+            # If ball hasn't moved much AND error is small, don't update servos
+            # But if error is large (ball is far from center), always update
+            # Also, always allow movement if ball is on the left (error_x < 0) to fix left-side issue
+            if (ball_moved_x < self.position_change_threshold and 
+                ball_moved_y < self.position_change_threshold and
+                error_magnitude < 50.0 and
+                error_x >= 0):  # Don't skip updates when ball is on left side
+                # Ball is stationary and near center on right side, keep current servo positions
                 return (self.pan_angle, self.tilt_angle)
         
         # Update last known ball position
         self.last_ball_center_x = ball_center_x
         self.last_ball_center_y = ball_center_y
         
-        # Calculate image center
-        image_center_x = self.image_width / 2.0
-        image_center_y = self.image_height / 2.0
-        
-        # Calculate error (pixels from center)
-        error_x = ball_center_x - image_center_x
-        error_y = ball_center_y - image_center_y
-        
         # Normalize error to -1.0 to 1.0 range
         normalized_error_x = error_x / image_center_x
         normalized_error_y = error_y / image_center_y
         
-        # Add dead zone - don't move if error is very small (prevents jitter when ball is near center)
-        dead_zone = 0.10  # 10% of image size (about 64 pixels for 640x640)
-        if abs(normalized_error_x) < dead_zone:
-            # Ball is very close to center horizontally, don't move pan
-            delta_pan = 0.0
-        else:
-            # Apply P-control only if outside dead zone
-            # Positive error_x means ball is to the right, need to pan right (increase angle)
-            # Negative error_x means ball is to the left, need to pan left (decrease angle)
-            # Since pan always moves right regardless of ball position, we need to invert
-            delta_pan = -self.kp_pan * normalized_error_x * 90.0  # Scale to degrees, INVERTED
+        # Calculate direct angle correction based on error
+        # Map image error to servo angle change
+        # For accurate pointing, we want direct proportional control
         
-        if abs(normalized_error_y) < dead_zone:
-            # Ball is very close to center vertically, don't move tilt
-            delta_tilt = 0.0
+        # Pan control:
+        # error_x > 0: ball is right of center -> pan right (increase angle toward 180°)
+        # error_x < 0: ball is left of center -> pan left (decrease angle toward 0°)
+        # Apply different gains for left vs right to compensate for asymmetry
+        if normalized_error_x > 0:
+            # Ball is on the right - reduce movement by 5%
+            delta_pan = self.kp_pan * normalized_error_x * 90.0 * 0.95  # 5% less movement
+        elif normalized_error_x < 0:
+            # Ball is on the left - ensure it moves (no dead zone for left side)
+            delta_pan = self.kp_pan * normalized_error_x * 90.0
         else:
-            # Apply P-control only if outside dead zone
-            # Positive error_y means ball is below center, need to tilt down (increase angle)
-            delta_tilt = self.kp_tilt * normalized_error_y * 90.0
+            delta_pan = 0.0
+        
+        # Tilt control:
+        # error_y > 0: ball is below center -> tilt down (increase angle toward 180°)
+        # error_y < 0: ball is above center -> tilt up (decrease angle toward 0°)
+        # If tilt keeps going up regardless of ball position, we need to invert
+        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted to fix direction
+        
+        # Add small dead zone only for very small errors to prevent micro-movements
+        # But don't apply dead zone to left side to ensure it moves
+        dead_zone = 0.05  # 5% of image size (about 32 pixels for 640x640)
+        if abs(normalized_error_x) < dead_zone and normalized_error_x >= 0:
+            # Only apply dead zone for right side or center
+            delta_pan = 0.0
+        if abs(normalized_error_y) < dead_zone:
+            delta_tilt = 0.0
         
         # Rate limiting
         elapsed = time.time() - self.last_update
@@ -307,6 +324,12 @@ class BallTrackerNode(Node):
                 error_x = ball_center_x - (self.image_width / 2.0)
                 error_y = ball_center_y - (self.image_height / 2.0)
                 
+                # Calculate what the delta should be for debugging
+                normalized_err_x = error_x / (self.image_width / 2.0)
+                normalized_err_y = error_y / (self.image_height / 2.0)
+                expected_delta_pan = self.controller.kp_pan * normalized_err_x * 90.0
+                expected_delta_tilt = self.controller.kp_tilt * normalized_err_y * 90.0
+                
                 # Determine expected direction for debugging
                 expected_pan_dir = "right" if error_x > 0 else "left" if error_x < 0 else "center"
                 actual_pan_dir = "right" if pan_angle > 90 else "left" if pan_angle < 90 else "center"
@@ -316,12 +339,12 @@ class BallTrackerNode(Node):
                     self._log_counter = 0
                 self._log_counter += 1
                 
-                if self._log_counter % 5 == 0:  # Log every 5th update
+                if self._log_counter % 3 == 0:  # Log every 3rd update for better debugging
                     self.get_logger().info(
-                        f'Ball center: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
-                        f'error: ({error_x:.1f}, {error_y:.1f}), '
-                        f'expected pan: {expected_pan_dir}, actual pan: {actual_pan_dir} -> '
-                        f'Pan: {pan_angle:.1f}°, Tilt: {tilt_angle:.1f}°'
+                        f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
+                        f'err: ({error_x:.1f}, {error_y:.1f}), '
+                        f'exp Δpan: {expected_delta_pan:.2f}° ({expected_pan_dir}), '
+                        f'Pan: {pan_angle:.1f}° ({actual_pan_dir}), Tilt: {tilt_angle:.1f}°'
                     )
                 
                 self.last_detection_time = current_time
