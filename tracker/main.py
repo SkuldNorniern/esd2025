@@ -251,20 +251,21 @@ class Controller:
         err_px_x = ball_center_x - laser_x
         err_px_y = ball_center_y - laser_y
 
-        # If the laser dot overlaps the detected ball region, stop moving.
+        # If the *measured* laser dot overlaps the detected ball region, stop moving.
         #
-        # Rationale:
-        # - The ball detector provides a bounding box; if the dot is inside that box, we consider
-        #   it "good enough" and we should not hunt due to jitter.
-        # - Simply forcing err_px=0 is not sufficient if kd != 0, because it can create a derivative
-        #   kick. Instead, we early-return and reset derivative state.
-        half_w = max(1.0, float(ball_width) / 2.0)
-        half_h = max(1.0, float(ball_height) / 2.0)
-        if abs(err_px_x) <= half_w and abs(err_px_y) <= half_h:
-            self.last_update = now_s
-            self.last_err_pan_deg = 0.0
-            self.last_err_tilt_deg = 0.0
-            return (self.pan_angle, self.tilt_angle)
+        # Important: do NOT do this when the laser is estimated (open-loop), because the estimate
+        # can be wrong; freezing based on a wrong estimate looks like "tracker does nothing".
+        #
+        # We use a tighter "center hit" region than the full bbox so the tracker still recenters
+        # the dot on the ball instead of stopping anywhere inside a large detector box.
+        if laser_measured:
+            tol = min(8.0, max(2.0, 0.2 * min(float(ball_width), float(ball_height))))
+            if abs(err_px_x) <= tol and abs(err_px_y) <= tol:
+                # Prevent derivative kick when we lock.
+                self.last_update = now_s
+                self.last_err_pan_deg = 0.0
+                self.last_err_tilt_deg = 0.0
+                return (self.pan_angle, self.tilt_angle)
 
         # Convert pixel error to angular error (degrees).
         err_pan_deg = self._px_to_deg_x(err_px_x)
@@ -616,35 +617,17 @@ class BallTrackerNode(Node):
                     laser_x, laser_y = None, None
                     laser_source = "estimated"
 
-                # Overlap check against ball bbox:
-                # - If overlapped, we should hold still (no hunting), and we should NOT count this
-                #   as "bad estimation time".
-                # - Use measured laser if available; otherwise use the controller's current estimate.
-                half_w = max(1.0, float(ball_width) / 2.0)
-                half_h = max(1.0, float(ball_height) / 2.0)
-                if laser_valid:
-                    overlap_x, overlap_y = lx_meas, ly_meas
-                else:
-                    if self.controller._laser_est_px is not None:
-                        overlap_x, overlap_y = self.controller._laser_est_px
-                    else:
-                        overlap_x, overlap_y = (self.image_width / 2.0, self.image_height / 2.0)
-                laser_overlaps_ball = (abs(ball_center_x - overlap_x) <= half_w) and (abs(ball_center_y - overlap_y) <= half_h)
-
                 if laser_valid:
                     self._laser_estimated_steps = 0
                     self._laser_recovery_active = False
                 else:
-                    if laser_overlaps_ball:
-                        self._laser_estimated_steps = 0
-                    else:
-                        self._laser_estimated_steps += 1
+                    self._laser_estimated_steps += 1
                 
                 # Laser lost watchdog: estimation should only last a few frames.
                 # If we exceed the limit, assume the laser is in a weird place and reset.
                 estimated_steps = int(self._laser_estimated_steps)
 
-                if (not laser_overlaps_ball) and (estimated_steps >= self.laser_estimated_max_steps):
+                if estimated_steps >= self.laser_estimated_max_steps:
                     self._laser_recovery_active = True
                     self._laser_estimated_steps = 0
                     self.controller.reset_to_center()
