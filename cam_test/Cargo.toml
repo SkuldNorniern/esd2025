@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 ros_wrapper = { path = "../ros_wrapper" }
 v4l = { version = "0.14.0"}
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

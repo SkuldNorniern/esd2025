@@ -88,20 +88,27 @@ where
     
     // Spawn background task to handle publishing and node spinning
     tokio::spawn(async move {
-        let mut spin_interval = tokio::time::interval(Duration::from_millis(50));
-        
+        let spin_wait = Duration::from_millis(50);
+        let spin_once_timeout = Duration::from_millis(10);
+
         loop {
-            tokio::select! {
-                Some(msg) = rx.recv() => {
+            match tokio::time::timeout(spin_wait, rx.recv()).await {
+                Ok(Some(msg)) => {
                     // Publish message to ROS topic
                     if let Err(e) = publisher.publish(&msg) {
                         eprintln!("Failed to publish message: {:?}", e);
                     }
+
+                    // Also spin after publishing so DDS events keep flowing under high publish rates.
+                    if let Ok(mut node) = node_for_spin.lock() {
+                        node.spin_once(Duration::from_millis(0));
+                    }
                 }
-                _ = spin_interval.tick() => {
+                Ok(None) => break, // Sender dropped, exit task
+                Err(_elapsed) => {
                     // Periodically spin the node to process DDS events
                     if let Ok(mut node) = node_for_spin.lock() {
-                        node.spin_once(Duration::from_millis(10));
+                        node.spin_once(spin_once_timeout);
                     }
                 }
             }
@@ -154,23 +161,31 @@ where
     
     // Spawn background task to handle subscription and node spinning
     tokio::spawn(async move {
-        let mut spin_interval = tokio::time::interval(Duration::from_millis(50));
-        
+        let spin_wait = Duration::from_millis(50);
+        let spin_once_timeout = Duration::from_millis(10);
+
         loop {
-            tokio::select! {
-                msg_result = subscriber.next() => {
-                    if let Some(msg) = msg_result {
-                        // Send message to channel
-                        if tx.send(msg).await.is_err() {
-                            // Receiver dropped, exit task
-                            break;
-                        }
+            match tokio::time::timeout(spin_wait, subscriber.next()).await {
+                Ok(Some(msg)) => {
+                    // Send message to channel
+                    if tx.send(msg).await.is_err() {
+                        // Receiver dropped, exit task
+                        break;
+                    }
+
+                    // Also spin after forwarding so DDS events keep flowing under high receive rates.
+                    if let Ok(mut node) = node_for_spin.lock() {
+                        node.spin_once(Duration::from_millis(0));
                     }
                 }
-                _ = spin_interval.tick() => {
+                Ok(None) => {
+                    // Stream ended (e.g., context shut down)
+                    break;
+                }
+                Err(_elapsed) => {
                     // Periodically spin the node to process DDS events
                     if let Ok(mut node) = node_for_spin.lock() {
-                        node.spin_once(Duration::from_millis(10));
+                        node.spin_once(spin_once_timeout);
                     }
                 }
             }
@@ -179,4 +194,5 @@ where
     
     Ok((rx, node_arc))
 }
+
 

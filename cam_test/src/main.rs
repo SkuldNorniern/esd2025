@@ -89,9 +89,15 @@ fn extract_rgb(rgb_buffer: &[u8], width: u32, height: u32, row_stride: u32) -> V
     rgb_data
 }
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Avoid `#[tokio::main]` to keep `tokio`'s proc-macro feature out of this crate.
+    // We still need a runtime because `ros_wrapper` uses `tokio::spawn()` internally.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main())?;
+    Ok(())
+}
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main() -> Result<(), CameraError> {
     println!("Initializing camera node with V4L2...");
 
     // Create topic sender using ros_wrapper
