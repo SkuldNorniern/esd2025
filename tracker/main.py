@@ -93,8 +93,8 @@ class Controller:
     
     def __init__(self, image_width: int, image_height: int):
         # Proportional gains - higher for accurate pointing
-        self.kp_pan = 0.04  # Further reduced to prevent overcorrection and overshooting
-        self.kp_tilt = 0.04  # Further reduced to prevent overcorrection and overshooting
+        self.kp_pan = 0.12  # Increased for faster tracking
+        self.kp_tilt = 0.12  # Increased for faster tracking
         
         # Current servo positions (degrees)
         self.pan_angle = 90.0  # Start at center
@@ -111,7 +111,7 @@ class Controller:
         self.tilt_max = 180.0
         
         # Rate limiting (max change per update)
-        self.max_rate = 1.5  # Max 1.5 degrees per update to prevent large movements and overshooting
+        self.max_rate = 5.0  # Max 5 degrees per update for faster tracking
         
         self.last_update = time.time()
         
@@ -125,6 +125,11 @@ class Controller:
         # Calculate ball center
         ball_center_x = (x1 + x2) / 2.0
         ball_center_y = (y1 + y2) / 2.0
+        
+        # Calculate ball area for adaptive deadzone
+        ball_width = abs(x2 - x1)
+        ball_height = abs(y2 - y1)
+        ball_area = ball_width * ball_height
         
         # Calculate image center and error early
         image_center_x = self.image_width / 2.0
@@ -194,22 +199,26 @@ class Controller:
         # Image coordinates: (0,0) is top-left, y increases downward
         # gpiozero Servo mapping: -1.0 = 0° (up), 0.0 = 90° (center), 1.0 = 180° (down)
         # When error_y < 0 (ball above center): we want tilt up (decrease angle toward 90°) -> delta_tilt should be negative
-        # Logs show tilt is going down when ball is above, so we need to invert
-        # Inverted: delta_tilt = -kp * normalized_error_y
-        #   When error_y < 0: delta_tilt = -kp * (negative) = positive -> angle increases -> tilt down (WRONG - but matches logs)
-        # Wait, that's still wrong. The issue is that the servo might be physically mounted backwards
-        # OR the gpiozero mapping is inverted. Let's try: when error_y < 0, we want to decrease angle
-        # If direct doesn't work, the servo is mounted backwards - we need to invert
-        # Based on logs: ball above (error_y < 0) -> tilt going down (angle increasing) -> WRONG
-        # So we need: when error_y < 0, delta_tilt should be negative to decrease angle
-        # Direct: delta_tilt = kp * normalized_error_y -> when error_y < 0, delta_tilt < 0 -> correct!
-        # But logs show it's going wrong, so try inverting
-        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted - test if this fixes the direction
+        # Direct: delta_tilt = kp * normalized_error_y
+        #   When error_y < 0: normalized_error_y < 0, so delta_tilt = kp * (negative) = negative -> angle decreases -> tilt up (correct!)
+        #   When error_y > 0: normalized_error_y > 0, so delta_tilt = kp * (positive) = positive -> angle increases -> tilt down (correct!)
+        # Try direct proportional first
+        delta_tilt = self.kp_tilt * normalized_error_y * 90.0  # Direct proportional
         
-        # Add dead zone to prevent micro-movements and overshooting
-        # Larger dead zone to prevent moving past stationary ball
-        # But don't apply dead zone to left side to ensure it moves
-        dead_zone = 0.08  # 8% of image size (about 51 pixels for 640x640)
+        # Adaptive dead zone based on ball size
+        # Larger ball = larger dead zone (ball is closer, less movement needed)
+        # Smaller ball = smaller dead zone (ball is farther, more movement needed)
+        # Base dead zone: 5% of image size
+        # Scale by ball area: larger area = larger dead zone (up to 15% of image)
+        base_dead_zone = 0.05  # 5% of image size (about 32 pixels for 640x640)
+        max_dead_zone = 0.15  # 15% of image size (about 96 pixels for 640x640)
+        
+        # Normalize ball area (assume max ball area is about 20% of image = 0.2 * 640 * 640 = 81920)
+        max_ball_area = 81920.0
+        area_factor = min(ball_area / max_ball_area, 1.0)  # Clamp to 1.0
+        dead_zone = base_dead_zone + (max_dead_zone - base_dead_zone) * area_factor
+        
+        # Apply dead zone - but don't apply to left side to ensure it moves
         if abs(normalized_error_x) < dead_zone and normalized_error_x >= 0:
             # Only apply dead zone for right side or center, not left side
             delta_pan = 0.0
