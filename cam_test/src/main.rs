@@ -15,6 +15,7 @@ enum CameraError {
     Stream(String),
     Frame(String),
     Ros2(String),
+    Io(String),
 }
 
 impl std::fmt::Display for CameraError {
@@ -27,11 +28,18 @@ impl std::fmt::Display for CameraError {
             CameraError::Stream(msg) => write!(f, "Stream error: {}", msg),
             CameraError::Frame(msg) => write!(f, "Frame error: {}", msg),
             CameraError::Ros2(msg) => write!(f, "ROS2 error: {}", msg),
+            CameraError::Io(msg) => write!(f, "IO error: {}", msg),
         }
     }
 }
 
 impl std::error::Error for CameraError {}
+
+impl From<std::io::Error> for CameraError {
+    fn from(err: std::io::Error) -> Self {
+        CameraError::Io(err.to_string())
+    }
+}
 
 fn find_v4l_device() -> Result<String, CameraError> {
     // Use /dev/video1 which supports MJPEG
@@ -370,4 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Note: stream.next() automatically re-queues the buffer when called again,
         // so no manual re-queuing is needed
     }
+    
+    // Unreachable - loop runs forever
+    Ok(())
 }
