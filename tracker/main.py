@@ -93,8 +93,8 @@ class Controller:
     
     def __init__(self, image_width: int, image_height: int):
         # Proportional gains - higher for accurate pointing
-        self.kp_pan = 0.20
-        self.kp_tilt = 0.20
+        self.kp_pan = 0.06  # Reduced to prevent overcorrection
+        self.kp_tilt = 0.06  # Reduced to prevent overcorrection
         
         # Current servo positions (degrees)
         self.pan_angle = 90.0  # Start at center
@@ -111,7 +111,7 @@ class Controller:
         self.tilt_max = 180.0
         
         # Rate limiting (max change per update)
-        self.max_rate = 8.0  # Max 8 degrees per update for faster response
+        self.max_rate = 2.0  # Max 2 degrees per update to prevent large movements
         
         self.last_update = time.time()
         
@@ -181,12 +181,11 @@ class Controller:
         # error_y < 0: ball is above center -> tilt up (decrease angle toward 0°)
         # Image coordinates: (0,0) is top-left, y increases downward
         # gpiozero Servo mapping: -1.0 = 0° (up), 0.0 = 90° (center), 1.0 = 180° (down)
-        # If tilt keeps going up (angle always decreasing), the direction might be inverted
         # When error_y < 0 (ball above): we want tilt up (decrease angle) -> delta_tilt should be negative
-        # Direct: delta_tilt = kp * (-error_y) = negative -> angle decreases -> tilt up (correct!)
-        # But if it always goes up regardless, maybe we need to check if error_y is always negative
-        # Or maybe the control needs inversion. Try inverting to see if it fixes the issue
-        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted to fix "always going up" issue
+        # Direct: delta_tilt = kp * normalized_error_y
+        #   When error_y < 0: delta_tilt = kp * (negative) = negative -> angle decreases -> tilt up (correct!)
+        #   When error_y > 0: delta_tilt = kp * (positive) = positive -> angle increases -> tilt down (correct!)
+        delta_tilt = self.kp_tilt * normalized_error_y * 90.0  # Direct proportional (no inversion)
         
         # Add small dead zone only for very small errors to prevent micro-movements
         # But don't apply dead zone to left side to ensure it moves
