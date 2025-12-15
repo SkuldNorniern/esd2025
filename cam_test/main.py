@@ -75,7 +75,7 @@ class CameraNode(Node):
         self.publisher = self.create_publisher(Image, '/image', 10)
         
         # Camera settings
-        self.device_path = '/dev/video2'
+        self.device_path = '/dev/video1'
         self.width = 640
         self.height = 640
         self.fps = 30
