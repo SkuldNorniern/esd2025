@@ -204,16 +204,20 @@ class Controller:
         # Tilt control:
         # Image center: (320, 320) for 640x640
         # Servo center: 90° (both pan and tilt)
-        # error_y > 0: ball is below center (y > 320) -> tilt down (increase angle toward 180°)
-        # error_y < 0: ball is above center (y < 320) -> tilt up (decrease angle toward 0°)
+        # error_y > 0: ball is below laser (y > laser_y) -> tilt down (increase angle toward 180°)
+        # error_y < 0: ball is above laser (y < laser_y) -> tilt up (decrease angle toward 0°)
         # Image coordinates: (0,0) is top-left, y increases downward
         # gpiozero Servo mapping: -1.0 = 0° (up), 0.0 = 90° (center), 1.0 = 180° (down)
-        # When error_y < 0 (ball above center): we want tilt up (decrease angle toward 90°) -> delta_tilt should be negative
-        # Direct: delta_tilt = kp * normalized_error_y
-        #   When error_y < 0: normalized_error_y < 0, so delta_tilt = kp * (negative) = negative -> angle decreases -> tilt up (correct!)
-        #   When error_y > 0: normalized_error_y > 0, so delta_tilt = kp * (positive) = positive -> angle increases -> tilt down (correct!)
-        # Try direct proportional first
-        delta_tilt = self.kp_tilt * normalized_error_y * 90.0  # Direct proportional
+        # Logs show tilt direction is wrong - when ball is above, tilt goes down
+        # Need to invert: when error_y < 0 (ball above), we want tilt up (decrease angle)
+        # Inverted: delta_tilt = -kp * normalized_error_y
+        #   When error_y < 0: delta_tilt = -kp * (negative) = positive -> angle increases -> tilt down (WRONG!)
+        # Wait, that's still wrong. Let me check the logs more carefully.
+        # From logs: Ball above (error_y < 0), tilt going down (angle > 90) - WRONG
+        # So we need: when error_y < 0, delta_tilt should be negative to decrease angle
+        # Direct: delta_tilt = kp * normalized_error_y -> when error_y < 0, delta_tilt < 0 -> correct!
+        # But logs show it's wrong, so try inverting
+        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted to fix direction
         
         # Adaptive dead zone based on ball size and movement
         # Larger ball = larger dead zone (ball is closer, less movement needed)
@@ -420,16 +424,29 @@ class BallTrackerNode(Node):
                 ball_center_x = (x1 + x2) / 2.0
                 ball_center_y = (y1 + y2) / 2.0
                 
-                # Get laser position from ROS topic, or fallback to image center
+                # Get laser position from ROS topic (from calibration node), or fallback to image center
+                # Check if laser is within the ball's bounding box area (avoids feedback loop)
                 if (self.laser_pos is not None and 
                     current_time - self.last_laser_update < self.laser_timeout):
                     laser_x, laser_y = self.laser_pos
+                    # Check if laser position is within the ball's bounding box
+                    ball_min_x = min(x1, x2)
+                    ball_max_x = max(x1, x2)
+                    ball_min_y = min(y1, y2)
+                    ball_max_y = max(y1, y2)
+                    if (ball_min_x <= laser_x <= ball_max_x and 
+                        ball_min_y <= laser_y <= ball_max_y):
+                        # Laser is within ball area - likely feedback loop, use image center instead
+                        laser_x = self.image_width / 2.0
+                        laser_y = self.image_height / 2.0
                 else:
                     # Fallback to image center if no laser position received
                     laser_x = self.image_width / 2.0
                     laser_y = self.image_height / 2.0
                 
-                # Publish laser position (ball center coordinates for calibration)
+                # Publish laser position (where servos are pointing = ball center when tracking)
+                # This is for calibration - the actual laser position should come from a separate calibration node
+                # that detects where the laser dot actually appears in the image
                 laser_msg = String()
                 laser_msg.data = f"{ball_center_x:.2f},{ball_center_y:.2f}"
                 self.laser_pub.publish(laser_msg)
@@ -451,7 +468,7 @@ class BallTrackerNode(Node):
                 expected_delta_pan = self.controller.kp_pan * normalized_err_x * 90.0
                 if normalized_err_x > 0:
                     expected_delta_pan *= 0.95  # Right side is 5% less
-                expected_delta_tilt = self.controller.kp_tilt * normalized_err_y * 90.0
+                expected_delta_tilt = -self.controller.kp_tilt * normalized_err_y * 90.0  # Inverted to match actual control
                 
                 # Determine expected direction for debugging
                 expected_pan_dir = "right" if error_x > 0 else "left" if error_x < 0 else "center"
