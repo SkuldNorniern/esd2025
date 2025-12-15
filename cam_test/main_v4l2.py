@@ -5,9 +5,11 @@ Direct V4L2 access, no re-encoding, better MJPEG handling
 Perfect for Raspberry Pi - headless friendly
 
 Install: pip install v4l2py
+Note: v4l2py 3.0+ is a shim for linuxpy.video (both work fine)
 
 Environment variables:
-  CAM_DEVICE_PATH: Camera device path (default: /dev/video1)
+  CAM_DEVICE_PATH: Camera device path (default: 0)
+                   Can be: 0, 1, 2 or "/dev/video0", "/dev/video1", etc
   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 512x512)
   PUBLISH_EVERY_N: Publish every Nth frame (default: 3)
   JPEG_QUALITY: Not used (v4l2py uses camera's native MJPEG)
@@ -24,6 +26,11 @@ from std_msgs.msg import Header
 from sensor_msgs.msg import Image
 
 try:
+    # Note: v4l2py shows deprecation warning - it now uses linuxpy internally
+    # This is fine - the library still works, just shows a warning
+    import warnings
+    warnings.filterwarnings('ignore', message='v4l2py is no longer being maintained')
+    
     from v4l2py import Device
     try:
         from v4l2py.device import BufferType, PixelFormat
@@ -85,28 +92,38 @@ class CameraNodeV4L2(Node):
         
         # Find MJPEG format
         # Note: v4l2py 3.0 returns format info differently
+        # Format codes are integers (FourCC): 1196444237 = 'MJPG'
         mjpeg_supported = False
         available_formats = []
+        
+        def fourcc_to_string(fourcc_int):
+            """Convert FourCC integer to string (e.g., 1196444237 -> 'MJPG')"""
+            try:
+                fourcc_int = int(fourcc_int)
+                return ''.join([chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4)])
+            except:
+                return str(fourcc_int)
         
         try:
             for fmt in self.cam.info.formats:
                 # Try different attribute names (API changed in v3.0)
-                fmt_name = None
+                fmt_code = None
                 if hasattr(fmt, 'pixelformat'):
-                    fmt_name = fmt.pixelformat
+                    fmt_code = fmt.pixelformat
                 elif hasattr(fmt, 'pixel_format'):
-                    fmt_name = fmt.pixel_format
+                    fmt_code = fmt.pixel_format
                 elif hasattr(fmt, 'description'):
-                    fmt_name = fmt.description
+                    fmt_code = fmt.description
                 
-                available_formats.append(str(fmt_name))
+                # Convert to string if it's a FourCC integer
+                fmt_str = fourcc_to_string(fmt_code)
+                available_formats.append(f"{fmt_str} ({fmt_code})")
                 
-                # Check if MJPEG/JPEG
-                if fmt_name:
-                    fmt_str = str(fmt_name).upper()
-                    if 'MJPEG' in fmt_str or 'MJPG' in fmt_str or 'JPEG' in fmt_str:
-                        mjpeg_supported = True
-                        break
+                # Check if MJPEG/JPEG (1196444237 = 'MJPG')
+                if fmt_code == 1196444237 or fmt_str.upper() in ['MJPG', 'MJPEG', 'JPEG']:
+                    mjpeg_supported = True
+                    self.get_logger().info(f"Found MJPEG format: {fmt_str} (code: {fmt_code})")
+                    break
         except Exception as e:
             self.get_logger().warn(f"Error checking formats: {e}")
             # Try to continue anyway
@@ -115,10 +132,11 @@ class CameraNodeV4L2(Node):
         if not mjpeg_supported and available_formats:
             self.get_logger().error("Camera does not support MJPEG!")
             self.get_logger().error(f"Available formats: {available_formats}")
+            self.get_logger().error("Expected MJPEG code: 1196444237 ('MJPG')")
             self.get_logger().error("Try a different device or check camera capabilities")
             raise RuntimeError("MJPEG not supported")
         
-        self.get_logger().info("✓ Camera supports MJPEG (or attempting to use it)")
+        self.get_logger().info("✓ Camera supports MJPEG")
         
         # Set format - try multiple methods for v4l2py compatibility
         format_set = False
