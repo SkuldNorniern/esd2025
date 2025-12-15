@@ -197,7 +197,9 @@ impl SoftwarePwmServo {
             const ANGLE_TO_PULSE_MULTIPLIER: u64 = 1000;
             const MIN_PULSE_US: u64 = 1000;
             
-            // Cache angle and pulse width to minimize atomic reads and calculations
+            // Cache angle and pulse width to minimize calculations.
+            // Important for tracking: we still re-read the desired angle every PWM period (50Hz),
+            // so the servo reacts within ~20ms instead of hundreds of milliseconds.
             let mut cached_angle = 90u8;
             let mut cached_pulse_width_us = 1500u64; // Default to center (90°)
             let mut angle_update_counter = 0u32;
@@ -223,23 +225,18 @@ impl SoftwarePwmServo {
                     }
                 }
                 
-                // Read angle atomically - update more frequently for tilt servo responsiveness
-                // Update cached angle every 20 periods (400ms) for better responsiveness
-                // This is still safe because servo movement is slow (0.1s/60°)
-                // Balance between responsiveness and jitter reduction
-                // Tilt servo may need more frequent updates due to gravity/mechanical factors
-                angle_update_counter += 1;
-                if angle_update_counter >= 20 {
-                    let new_angle = angle_clone.load(Ordering::Relaxed);
-                    if new_angle != cached_angle {
-                        cached_angle = new_angle;
-                        // Pre-calculate pulse width when angle changes
-                        // Use integer math optimized for speed
-                        let angle = cached_angle.min(180) as u64;
-                        cached_pulse_width_us = MIN_PULSE_US + ((angle * ANGLE_TO_PULSE_MULTIPLIER) / ANGLE_TO_PULSE_DIVISOR);
-                    }
-                    angle_update_counter = 0;
+                // Read the desired angle every PWM period (50Hz). This is important for tracker-style
+                // closed-loop control, where the target angle can change every tick.
+                let new_angle = angle_clone.load(Ordering::Relaxed);
+                if new_angle != cached_angle {
+                    cached_angle = new_angle;
+                    // Pre-calculate pulse width when angle changes
+                    // Use integer math optimized for speed
+                    let angle = cached_angle.min(180) as u64;
+                    cached_pulse_width_us =
+                        MIN_PULSE_US + ((angle * ANGLE_TO_PULSE_MULTIPLIER) / ANGLE_TO_PULSE_DIVISOR);
                 }
+                angle_update_counter = angle_update_counter.wrapping_add(1);
                 
                 // Generate one PWM period with precise timing
                 // Critical: minimize time between period_start and pin.set_high()
