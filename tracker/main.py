@@ -142,11 +142,13 @@ class Controller:
             # If ball hasn't moved much AND error is small, don't update servos
             # But if error is large (ball is far from center), always update
             # Also, always allow movement if ball is on the left (error_x < 0) to fix left-side issue
+            # And always allow movement if ball is above center (error_y < 0) to fix tilt issue
             if (ball_moved_x < self.position_change_threshold and 
                 ball_moved_y < self.position_change_threshold and
                 error_magnitude < 50.0 and
-                error_x >= 0):  # Don't skip updates when ball is on left side
-                # Ball is stationary and near center on right side, keep current servo positions
+                error_x >= 0 and
+                error_y >= 0):  # Don't skip updates when ball is on left or above center
+                # Ball is stationary and near center on right/bottom side, keep current servo positions
                 return (self.pan_angle, self.tilt_angle)
         
         # Update last known ball position
@@ -177,8 +179,14 @@ class Controller:
         # Tilt control:
         # error_y > 0: ball is below center -> tilt down (increase angle toward 180°)
         # error_y < 0: ball is above center -> tilt up (decrease angle toward 0°)
-        # If tilt keeps going up regardless of ball position, we need to invert
-        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted to fix direction
+        # Image coordinates: (0,0) is top-left, y increases downward
+        # gpiozero Servo mapping: -1.0 = 0° (up), 0.0 = 90° (center), 1.0 = 180° (down)
+        # If tilt keeps going up (angle always decreasing), the direction might be inverted
+        # When error_y < 0 (ball above): we want tilt up (decrease angle) -> delta_tilt should be negative
+        # Direct: delta_tilt = kp * (-error_y) = negative -> angle decreases -> tilt up (correct!)
+        # But if it always goes up regardless, maybe we need to check if error_y is always negative
+        # Or maybe the control needs inversion. Try inverting to see if it fixes the issue
+        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted to fix "always going up" issue
         
         # Add small dead zone only for very small errors to prevent micro-movements
         # But don't apply dead zone to left side to ensure it moves
@@ -328,11 +336,15 @@ class BallTrackerNode(Node):
                 normalized_err_x = error_x / (self.image_width / 2.0)
                 normalized_err_y = error_y / (self.image_height / 2.0)
                 expected_delta_pan = self.controller.kp_pan * normalized_err_x * 90.0
+                if normalized_err_x > 0:
+                    expected_delta_pan *= 0.95  # Right side is 5% less
                 expected_delta_tilt = self.controller.kp_tilt * normalized_err_y * 90.0
                 
                 # Determine expected direction for debugging
                 expected_pan_dir = "right" if error_x > 0 else "left" if error_x < 0 else "center"
+                expected_tilt_dir = "down" if error_y > 0 else "up" if error_y < 0 else "center"
                 actual_pan_dir = "right" if pan_angle > 90 else "left" if pan_angle < 90 else "center"
+                actual_tilt_dir = "down" if tilt_angle > 90 else "up" if tilt_angle < 90 else "center"
                 
                 # Log less frequently to reduce spam
                 if not hasattr(self, '_log_counter'):
@@ -343,8 +355,8 @@ class BallTrackerNode(Node):
                     self.get_logger().info(
                         f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
                         f'err: ({error_x:.1f}, {error_y:.1f}), '
-                        f'exp Δpan: {expected_delta_pan:.2f}° ({expected_pan_dir}), '
-                        f'Pan: {pan_angle:.1f}° ({actual_pan_dir}), Tilt: {tilt_angle:.1f}°'
+                        f'exp: pan→{expected_pan_dir} (Δ{expected_delta_pan:.2f}°), tilt→{expected_tilt_dir} (Δ{expected_delta_tilt:.2f}°), '
+                        f'act: pan={pan_angle:.1f}° ({actual_pan_dir}), tilt={tilt_angle:.1f}° ({actual_tilt_dir})'
                     )
                 
                 self.last_detection_time = current_time
