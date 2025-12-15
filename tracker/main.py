@@ -364,7 +364,11 @@ class BallTrackerNode(Node):
                 ball_center_x = (x1 + x2) / 2.0
                 ball_center_y = (y1 + y2) / 2.0
                 
-                # Publish laser position (ball center coordinates)
+                # Calculate where laser should be pointing (image center = where servos point)
+                laser_x = self.image_width / 2.0
+                laser_y = self.image_height / 2.0
+                
+                # Publish laser position (ball center coordinates for calibration)
                 laser_msg = String()
                 laser_msg.data = f"{ball_center_x:.2f},{ball_center_y:.2f}"
                 self.laser_pub.publish(laser_msg)
@@ -401,6 +405,7 @@ class BallTrackerNode(Node):
                 if self._log_counter % 3 == 0:  # Log every 3rd update for better debugging
                     self.get_logger().info(
                         f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
+                        f'Laser: ({laser_x:.1f}, {laser_y:.1f}), '
                         f'err: ({error_x:.1f}, {error_y:.1f}), '
                         f'exp: pan→{expected_pan_dir} (Δ{expected_delta_pan:.2f}°), tilt→{expected_tilt_dir} (Δ{expected_delta_tilt:.2f}°), '
                         f'act: pan={pan_angle:.1f}° ({actual_pan_dir}), tilt={tilt_angle:.1f}° ({actual_tilt_dir})'
