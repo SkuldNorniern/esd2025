@@ -161,7 +161,7 @@ class Controller:
     def _ema(self, prev: Optional[Tuple[float, float]], x: float, y: float) -> Tuple[float, float]:
         if prev is None:
             return (x, y)
-        a = max(0.0, min(1.0, self.ema_alpha))
+        a = max(0.0, min(1.0, self.ball_smoothing))
         return (prev[0] * (1.0 - a) + x * a, prev[1] * (1.0 - a) + y * a)
 
     def _px_to_deg_x(self, err_px: float) -> float:
