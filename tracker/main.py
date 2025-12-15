@@ -92,9 +92,9 @@ class Controller:
     """PID controller (P-only) for ball tracking"""
     
     def __init__(self, image_width: int, image_height: int):
-        # Proportional gains
-        self.kp_pan = 0.1
-        self.kp_tilt = 0.1
+        # Proportional gains - increased for better tracking
+        self.kp_pan = 0.15
+        self.kp_tilt = 0.15
         
         # Current servo positions (degrees)
         self.pan_angle = 90.0  # Start at center
@@ -111,7 +111,7 @@ class Controller:
         self.tilt_max = 180.0
         
         # Rate limiting (max change per update)
-        self.max_rate = 5.0  # Max 5 degrees per update
+        self.max_rate = 10.0  # Max 10 degrees per update for faster response
         
         self.last_update = time.time()
     
@@ -136,8 +136,13 @@ class Controller:
         # Apply P-control
         # Positive error_x means ball is to the right, need to pan right (increase angle)
         # Positive error_y means ball is below center, need to tilt down (increase angle)
+        # Note: If servos are mounted backwards, invert the signs
         delta_pan = self.kp_pan * normalized_error_x * 90.0  # Scale to degrees
         delta_tilt = self.kp_tilt * normalized_error_y * 90.0
+        
+        # Invert pan direction if servos are mounted backwards
+        # Based on logs, pan is going wrong direction, so invert it
+        delta_pan = -delta_pan
         
         # Rate limiting
         elapsed = time.time() - self.last_update
@@ -268,10 +273,23 @@ class BallTrackerNode(Node):
                     self.servo.set_pan(pan_angle)
                     self.servo.set_tilt(tilt_angle)
                 
-                self.get_logger().info(
-                    f"Ball at ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) -> "
-                    f"Pan: {pan_angle:.1f}°, Tilt: {tilt_angle:.1f}°"
-                )
+                # Calculate ball center and error for better logging
+                ball_center_x = (x1 + x2) / 2.0
+                ball_center_y = (y1 + y2) / 2.0
+                error_x = ball_center_x - (self.image_width / 2.0)
+                error_y = ball_center_y - (self.image_height / 2.0)
+                
+                # Log less frequently to reduce spam
+                if not hasattr(self, '_log_counter'):
+                    self._log_counter = 0
+                self._log_counter += 1
+                
+                if self._log_counter % 5 == 0:  # Log every 5th update
+                    self.get_logger().info(
+                        f'Ball center: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
+                        f'error: ({error_x:.1f}, {error_y:.1f}) -> '
+                        f'Pan: {pan_angle:.1f}°, Tilt: {tilt_angle:.1f}°'
+                    )
                 
                 self.last_detection_time = current_time
             else:
