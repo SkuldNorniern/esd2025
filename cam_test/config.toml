@@ -2,6 +2,9 @@
 # This file is read at compile time by build.rs
 
 [camera]
+# Video device path - typically /dev/video0 or /dev/video1
+device_path = "/dev/video0"
+
 # Resolution - 512x512 for better performance on Pi 3
 width = 512
 height = 512

@@ -57,20 +57,30 @@ struct BallDetectApp {
 
 impl eframe::App for BallDetectApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Update texture from shared state
-        // unwrap is safe here: mutex poisoning indicates a programming error that should panic
-        let state = self.state.lock().unwrap();
-        if let Some(ref img) = state.image {
+        // Read state quickly and release lock immediately to avoid deadlock
+        // Clone only what we need while holding the lock briefly
+        let (image_opt, ball_bbox, laser_pos, frame_count) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.image.clone(),
+                state.ball_bbox,
+                state.laser_pos,
+                state.frame_count,
+            )
+        };
+        
+        // Do all expensive operations OUTSIDE the lock
+        if let Some(img) = image_opt {
             // Convert RgbImage to marked image with bounding boxes
             let mut marked_img = img.clone();
             
             // Draw ball bounding box (red)
-            if let Some((x1, y1, x2, y2)) = state.ball_bbox {
+            if let Some((x1, y1, x2, y2)) = ball_bbox {
                 draw_bbox(&mut marked_img, x1, y1, x2, y2, 3, Rgb([255, 0, 0]));
             }
             
             // Draw laser position (green circle)
-            if let Some((lx, ly)) = state.laser_pos {
+            if let Some((lx, ly)) = laser_pos {
                 let lx_u32 = lx as u32;
                 let ly_u32 = ly as u32;
                 let radius = 5u32;
@@ -103,29 +113,25 @@ impl eframe::App for BallDetectApp {
             // Update texture
             self.texture = Some(ctx.load_texture("camera_image", color_image, egui::TextureOptions::LINEAR));
         }
-        drop(state);
         
-        // Draw UI
+        // Draw UI - use the values we already read (no need to lock again)
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Ball Detection - Real-time View");
             
             if let Some(ref texture) = self.texture {
-                // unwrap is safe here: mutex poisoning indicates a programming error that should panic
-                let state = self.state.lock().unwrap();
-                ui.label(format!("Frame: {}", state.frame_count));
+                ui.label(format!("Frame: {}", frame_count));
                 
-                if let Some((x1, y1, x2, y2)) = state.ball_bbox {
+                if let Some((x1, y1, x2, y2)) = ball_bbox {
                     ui.label(format!("Ball detected at: ({:.1}, {:.1}) to ({:.1}, {:.1})", x1, y1, x2, y2));
                 } else {
                     ui.label("No ball detected");
                 }
                 
-                if let Some((lx, ly)) = state.laser_pos {
+                if let Some((lx, ly)) = laser_pos {
                     ui.label(format!("Laser detected at: ({:.1}, {:.1})", lx, ly));
                 } else {
                     ui.label("No laser detected");
                 }
-                drop(state);
                 
                 // Display image
                 ui.add(egui::Image::new(texture).fit_to_original_size(1.0));

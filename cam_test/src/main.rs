@@ -52,16 +52,18 @@ impl From<std::io::Error> for CameraError {
 }
 
 fn find_v4l_device() -> Result<String, CameraError> {
-    // Use /dev/video1 which supports MJPEG
-    let device_path = "/dev/video0";
+    // Use device path from config.toml (default: /dev/video0)
+    // Can be overridden with CAM_DEVICE_PATH environment variable
+    let device_path = std::env::var("CAM_DEVICE_PATH")
+        .unwrap_or_else(|_| CAM_DEVICE_PATH.to_string());
     
-    if std::path::Path::new(device_path).exists() {
+    if std::path::Path::new(&device_path).exists() {
         // Try to open it to verify it's a capture device
-        if let Ok(dev) = v4l::Device::with_path(device_path) {
+        if let Ok(dev) = v4l::Device::with_path(&device_path) {
             if let Ok(caps) = dev.query_caps() {
                 // Check if device supports video capture
                 if caps.capabilities.contains(v4l::capability::Flags::VIDEO_CAPTURE) {
-                    return Ok(device_path.to_string());
+                    return Ok(device_path);
                 }
             }
         }
@@ -169,6 +171,14 @@ async fn async_main() -> Result<(), CameraError> {
         actual_format.width, 
         actual_format.height,
         actual_format.fourcc);
+    
+    // Warn if camera didn't match requested resolution
+    if actual_format.width != width || actual_format.height != height {
+        eprintln!("WARNING: Camera negotiated {}x{} instead of requested {}x{}", 
+            actual_format.width, actual_format.height, width, height);
+        eprintln!("  This is normal - camera may not support exact resolution.");
+        eprintln!("  Images will be sent at {}x{}", actual_format.width, actual_format.height);
+    }
     
     // Check format - MJPEG is compressed, so stride is 0
     let stride = actual_format.stride;

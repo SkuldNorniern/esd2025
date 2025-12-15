@@ -14,6 +14,7 @@ fn main() {
     // Parse TOML manually (simple enough for our needs)
     // Look for [camera] section and parse key = value pairs
     let mut in_camera_section = false;
+    let mut device_path = String::from("/dev/video0");
     let mut width = 512u32;
     let mut height = 512u32;
     let mut buffers = 4u32;
@@ -40,9 +41,12 @@ fn main() {
         // Parse key = value pairs
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
-            let value = value.trim();
+            let value = value.trim().trim_matches('"'); // Remove quotes if present
             
             match key {
+                "device_path" => {
+                    device_path = value.to_string();
+                }
                 "width" => {
                     if let Ok(v) = value.parse::<u32>() {
                         width = v;
@@ -81,13 +85,14 @@ fn main() {
         &dest_path,
         format!(
             r#"// Auto-generated from config.toml at build time
+pub const CAM_DEVICE_PATH: &str = "{}";
 pub const CAM_WIDTH: u32 = {};
 pub const CAM_HEIGHT: u32 = {};
 pub const CAM_BUFFERS: u32 = {};
 pub const PUBLISH_EVERY_N: u64 = {};
 pub const TARGET_FPS: u32 = {};
 "#,
-            width, height, buffers, publish_every_n, target_fps
+            device_path, width, height, buffers, publish_every_n, target_fps
         ),
     )
     .expect("Failed to write config.rs");

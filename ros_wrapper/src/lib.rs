@@ -79,8 +79,9 @@ where
     let publisher = node.create_publisher::<T>(topic, qos)
         .map_err(|e| RosWrapperError::PublisherCreation(format!("{:?}", e)))?;
     
-    // Create channel
-    let (tx, mut rx) = mpsc::channel::<T>(100);
+    // Create channel with larger capacity for high-throughput topics (e.g., images)
+    // 500 frames at ~50KB each = ~25MB buffer
+    let (tx, mut rx) = mpsc::channel::<T>(500);
     
     // Share node using Arc<Mutex> for background task
     let node_arc = Arc::new(Mutex::new(node));
@@ -88,28 +89,57 @@ where
     
     // Spawn background task to handle publishing and node spinning
     tokio::spawn(async move {
-        let spin_wait = Duration::from_millis(50);
-        let spin_once_timeout = Duration::from_millis(10);
+        let spin_wait = Duration::from_millis(10); // Reduced from 50ms for faster processing
+        let spin_once_timeout = Duration::from_millis(1); // Reduced for more responsive spinning
+        let mut dropped_count = 0u64;
+        let mut published_count = 0u64;
 
         loop {
-            match tokio::time::timeout(spin_wait, rx.recv()).await {
-                Ok(Some(msg)) => {
-                    // Publish message to ROS topic
-                    if let Err(e) = publisher.publish(&msg) {
-                        eprintln!("Failed to publish message: {:?}", e);
+            // Try to drain multiple messages quickly to catch up if falling behind
+            let mut batch_count = 0;
+            let max_batch = 10; // Process up to 10 messages per iteration
+            
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        // Publish message to ROS topic
+                        if let Err(e) = publisher.publish(&msg) {
+                            eprintln!("Failed to publish message: {:?}", e);
+                        } else {
+                            published_count += 1;
+                        }
+                        batch_count += 1;
+                        
+                        // Break after max_batch to allow spinning
+                        if batch_count >= max_batch {
+                            break;
+                        }
                     }
-
-                    // Also spin after publishing so DDS events keep flowing under high publish rates.
-                    if let Ok(mut node) = node_for_spin.lock() {
-                        node.spin_once(Duration::from_millis(0));
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No more messages ready, break to spin
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        // Sender dropped, exit task
+                        return;
                     }
                 }
-                Ok(None) => break, // Sender dropped, exit task
-                Err(_elapsed) => {
-                    // Periodically spin the node to process DDS events
-                    if let Ok(mut node) = node_for_spin.lock() {
-                        node.spin_once(spin_once_timeout);
-                    }
+            }
+            
+            // Spin the node to process DDS events
+            if let Ok(mut node) = node_for_spin.lock() {
+                node.spin_once(spin_once_timeout);
+            }
+            
+            // If no messages were processed, wait a bit
+            if batch_count == 0 {
+                tokio::time::sleep(spin_wait).await;
+            }
+            
+            // Log stats periodically
+            if published_count > 0 && published_count % 100 == 0 {
+                if dropped_count > 0 {
+                    eprintln!("ROS publisher: {} published, {} dropped", published_count, dropped_count);
                 }
             }
         }
@@ -152,8 +182,8 @@ where
     let mut subscriber = node.subscribe::<T>(topic, qos)
         .map_err(|e| RosWrapperError::SubscriberCreation(format!("{:?}", e)))?;
     
-    // Create channel
-    let (tx, rx) = mpsc::channel::<T>(100);
+    // Create channel with larger capacity for high-throughput topics (e.g., images)
+    let (tx, rx) = mpsc::channel::<T>(500);
     
     // Share node using Arc<Mutex> for background task
     let node_arc = Arc::new(Mutex::new(node));
