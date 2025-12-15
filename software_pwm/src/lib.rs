@@ -7,6 +7,72 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Debug)]
+pub enum SoftwarePwmError {
+    /// GPIO subsystem isn't available (not on Raspberry Pi hardware, missing /dev nodes,
+    /// running in a container without device passthrough, etc).
+    GpioInit {
+        message: String,
+        diagnostics: String,
+    },
+    /// GPIO is available but the requested pin couldn't be configured.
+    PinInit {
+        pin: u8,
+        message: String,
+        diagnostics: String,
+    },
+}
+
+impl std::fmt::Display for SoftwarePwmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SoftwarePwmError::GpioInit { message, diagnostics } => {
+                write!(f, "GPIO init failed: {}. {}", message, diagnostics)
+            }
+            SoftwarePwmError::PinInit {
+                pin,
+                message,
+                diagnostics,
+            } => write!(
+                f,
+                "GPIO pin {} init failed: {}. {}",
+                pin, message, diagnostics
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SoftwarePwmError {}
+
+fn dev_node_exists(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
+
+fn any_gpiochip_exists() -> bool {
+    // Check a small range; on Raspberry Pi this is typically /dev/gpiochip0.
+    for i in 0..=8 {
+        let path = format!("/dev/gpiochip{i}");
+        if dev_node_exists(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+fn gpio_diagnostics() -> String {
+    // rppal uses /dev/gpiomem (Pi 0-4) or /dev/gpiomem0 (Pi 5 / RP1), and also uses /dev/gpiochipN.
+    let has_gpiomem = dev_node_exists("/dev/gpiomem");
+    let has_gpiomem0 = dev_node_exists("/dev/gpiomem0");
+    let has_mem = dev_node_exists("/dev/mem");
+    let has_gpiochip = any_gpiochip_exists();
+    format!(
+        "GPIO device nodes: /dev/gpiomem={}, /dev/gpiomem0={}, /dev/mem={}, /dev/gpiochipN={}. \
+If you're not on Raspberry Pi Linux, software PWM cannot work. If you are on Pi: \
+ensure the kernel exposes these nodes (not inside a restricted container), and try running with sudo.",
+        has_gpiomem, has_gpiomem0, has_mem, has_gpiochip
+    )
+}
+
 // Precise busy-wait function optimized for minimal jitter
 // Uses calibrated spin loops to minimize Instant::now() overhead
 // Critical: Instant::now() has overhead, so we check it less frequently
@@ -94,9 +160,21 @@ impl SoftwarePwmServo {
     /// let servo = SoftwarePwmServo::new(18)?;
     /// servo.set_angle(90)?; // Set to center position
     /// ```
-    pub fn new(pin_num: u8) -> Result<Self, rppal::gpio::Error> {
-        let gpio = Gpio::new()?;
-        let pin = gpio.get(pin_num)?.into_output();
+    pub fn new(pin_num: u8) -> Result<Self, SoftwarePwmError> {
+        let diagnostics = gpio_diagnostics();
+        let gpio = Gpio::new().map_err(|e| SoftwarePwmError::GpioInit {
+            message: format!("{:?}", e),
+            diagnostics: diagnostics.clone(),
+        })?;
+
+        let pin = gpio
+            .get(pin_num)
+            .map_err(|e| SoftwarePwmError::PinInit {
+                pin: pin_num,
+                message: format!("{:?}", e),
+                diagnostics: diagnostics.clone(),
+            })?
+            .into_output();
         
         let angle = Arc::new(AtomicU8::new(90)); // Start at center
         let running = Arc::new(AtomicBool::new(true));
@@ -237,4 +315,5 @@ impl Drop for SoftwarePwmServo {
         self.running.store(false, Ordering::Relaxed);
     }
 }
+
 

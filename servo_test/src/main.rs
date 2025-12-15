@@ -17,10 +17,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize both servos using software PWM
     let servo1 = SoftwarePwmServo::new(18)
-        .map_err(|e| format!("Failed to initialize servo on GPIO 18: {:?}", e))?;
+        .map_err(|e| format!("Failed to initialize servo on GPIO 18: {}", e))?;
     
     let servo2 = SoftwarePwmServo::new(19)
-        .map_err(|e| format!("Failed to initialize servo on GPIO 19: {:?}", e))?;
+        .map_err(|e| format!("Failed to initialize servo on GPIO 19: {}", e))?;
 
     println!("Servos initialized. Starting test sequence...");
     
