@@ -25,7 +25,17 @@ from sensor_msgs.msg import Image
 
 try:
     from v4l2py import Device
-    from v4l2py.device import BufferType, PixelFormat
+    try:
+        from v4l2py.device import BufferType, PixelFormat
+    except ImportError:
+        # v4l2py 3.0+ uses linuxpy
+        try:
+            from linuxpy.video.device import BufferType, PixelFormat
+        except ImportError:
+            # Fallback - will work without these
+            BufferType = None
+            PixelFormat = None
+            print("Warning: Could not import BufferType/PixelFormat (v4l2py API changed)")
 except ImportError:
     print("ERROR: v4l2py not installed!")
     print("Install with: pip install v4l2py")
@@ -38,7 +48,7 @@ class CameraNodeV4L2(Node):
         super().__init__("camera_node_v4l2")
         
         # Configuration
-        self.device_path = os.environ.get("CAM_DEVICE_PATH", "/dev/video1")
+        self.device_path = os.environ.get("CAM_DEVICE_PATH", "0")
         self.req_w = int(os.environ.get("CAM_WIDTH", "512"))
         self.req_h = int(os.environ.get("CAM_HEIGHT", "512"))
         self.publish_every_n = int(os.environ.get("PUBLISH_EVERY_N", "3"))
@@ -52,54 +62,113 @@ class CameraNodeV4L2(Node):
         self.pub_image = self.create_publisher(Image, "/image", 10)
         
         # Open camera
+        # v4l2py accepts: int (0, 1, 2...) or string ("/dev/video0", "/dev/video1"...)
         self.get_logger().info(f"Opening camera {self.device_path} with v4l2py...")
         try:
-            self.cam = Device.from_id(self.device_path)
+            # Try to convert to int if it's a numeric string
+            try:
+                device_id = int(self.device_path)
+            except ValueError:
+                device_id = self.device_path
+            
+            self.cam = Device.from_id(device_id)
             self.cam.open()
         except Exception as e:
             self.get_logger().error(f"Failed to open camera: {e}")
+            self.get_logger().error(f"Try a different device:")
+            self.get_logger().error(f"  export CAM_DEVICE_PATH=0   # or 1, 2, etc")
+            self.get_logger().error(f"  export CAM_DEVICE_PATH=/dev/video0")
             raise RuntimeError(f"Cannot open {self.device_path}")
         
         # Get camera info
         self.get_logger().info(f"Camera: {self.cam.info.card}")
         
         # Find MJPEG format
-        mjpeg_format = None
-        for fmt in self.cam.info.formats:
-            if fmt.pixelformat == PixelFormat.MJPEG:
-                mjpeg_format = fmt
-                break
+        # Note: v4l2py 3.0 returns format info differently
+        mjpeg_supported = False
+        available_formats = []
         
-        if not mjpeg_format:
+        try:
+            for fmt in self.cam.info.formats:
+                # Try different attribute names (API changed in v3.0)
+                fmt_name = None
+                if hasattr(fmt, 'pixelformat'):
+                    fmt_name = fmt.pixelformat
+                elif hasattr(fmt, 'pixel_format'):
+                    fmt_name = fmt.pixel_format
+                elif hasattr(fmt, 'description'):
+                    fmt_name = fmt.description
+                
+                available_formats.append(str(fmt_name))
+                
+                # Check if MJPEG/JPEG
+                if fmt_name:
+                    fmt_str = str(fmt_name).upper()
+                    if 'MJPEG' in fmt_str or 'MJPG' in fmt_str or 'JPEG' in fmt_str:
+                        mjpeg_supported = True
+                        break
+        except Exception as e:
+            self.get_logger().warn(f"Error checking formats: {e}")
+            # Try to continue anyway
+            mjpeg_supported = True
+        
+        if not mjpeg_supported and available_formats:
             self.get_logger().error("Camera does not support MJPEG!")
-            self.get_logger().error(f"Available formats: {[f.pixelformat for f in self.cam.info.formats]}")
+            self.get_logger().error(f"Available formats: {available_formats}")
+            self.get_logger().error("Try a different device or check camera capabilities")
             raise RuntimeError("MJPEG not supported")
         
-        self.get_logger().info("✓ Camera supports MJPEG")
+        self.get_logger().info("✓ Camera supports MJPEG (or attempting to use it)")
         
-        # Set format
-        try:
-            self.cam.set_format(BufferType.VIDEO_CAPTURE, self.req_w, self.req_h, PixelFormat.MJPEG)
-        except Exception as e:
-            self.get_logger().warn(f"Failed to set exact format: {e}")
+        # Set format - try multiple methods for v4l2py compatibility
+        format_set = False
+        if BufferType and PixelFormat:
+            try:
+                # Method 1: Try with PixelFormat enum
+                self.cam.set_format(BufferType.VIDEO_CAPTURE, self.req_w, self.req_h, PixelFormat.MJPEG)
+                format_set = True
+            except Exception as e1:
+                try:
+                    # Method 2: Try with string
+                    self.cam.set_format(BufferType.VIDEO_CAPTURE, self.req_w, self.req_h, "MJPEG")
+                    format_set = True
+                except Exception as e2:
+                    self.get_logger().warn(f"Could not set format explicitly: {e1}")
+        
+        if not format_set:
+            self.get_logger().warn("Using camera's default format (v4l2py API compatibility mode)")
         
         # Get actual format
-        fmt = self.cam.get_format(BufferType.VIDEO_CAPTURE)
-        self.width = fmt.width
-        self.height = fmt.height
-        self.pixelformat = fmt.pixelformat
-        
-        self.get_logger().info(f"Camera negotiated: {self.width}x{self.height} {self.pixelformat.name}")
-        
-        if self.width != self.req_w or self.height != self.req_h:
-            self.get_logger().warn(
-                f"Camera negotiated {self.width}x{self.height} instead of {self.req_w}x{self.req_h}. "
-                "This is normal - camera may not support exact resolution."
-            )
-        
-        if self.pixelformat != PixelFormat.MJPEG:
-            self.get_logger().error(f"Camera did not negotiate MJPEG (got {self.pixelformat.name})!")
-            raise RuntimeError("MJPEG required but not negotiated")
+        try:
+            if BufferType:
+                fmt = self.cam.get_format(BufferType.VIDEO_CAPTURE)
+            else:
+                # Fallback: try numeric value for VIDEO_CAPTURE
+                fmt = self.cam.get_format(1)  # BufferType.VIDEO_CAPTURE = 1
+            self.width = fmt.width
+            self.height = fmt.height
+            
+            # Try to get pixel format name
+            if hasattr(fmt, 'pixelformat'):
+                fmt_name = fmt.pixelformat
+            elif hasattr(fmt, 'pixel_format'):
+                fmt_name = fmt.pixel_format
+            else:
+                fmt_name = "UNKNOWN"
+            
+            self.get_logger().info(f"Camera negotiated: {self.width}x{self.height} {fmt_name}")
+            
+            if self.width != self.req_w or self.height != self.req_h:
+                self.get_logger().warn(
+                    f"Camera negotiated {self.width}x{self.height} instead of {self.req_w}x{self.req_h}. "
+                    "This is normal - camera may not support exact resolution."
+                )
+        except Exception as e:
+            self.get_logger().warn(f"Could not query format: {e}")
+            # Use requested dimensions as fallback
+            self.width = self.req_w
+            self.height = self.req_h
+            self.get_logger().info(f"Using requested dimensions: {self.width}x{self.height}")
         
         # Log configuration
         self.get_logger().info("")
