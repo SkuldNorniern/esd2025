@@ -43,7 +43,7 @@ impl From<std::io::Error> for CameraError {
 
 fn find_v4l_device() -> Result<String, CameraError> {
     // Use /dev/video1 which supports MJPEG
-    let device_path = "/dev/video1";
+    let device_path = "/dev/video0";
     
     if std::path::Path::new(device_path).exists() {
         // Try to open it to verify it's a capture device
