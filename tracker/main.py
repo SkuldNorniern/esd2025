@@ -189,15 +189,16 @@ class Controller:
         # Pan control:
         # Image center: (320, 320) for 640x640
         # Servo center: 90° (both pan and tilt)
-        # error_x > 0: ball is right of center (x > 320) -> pan right (increase angle toward 180°)
-        # error_x < 0: ball is left of center (x < 320) -> pan left (decrease angle toward 0°)
-        # Direct proportional control
+        # error_x > 0: ball is right of laser -> pan right (increase angle toward 180°)
+        # error_x < 0: ball is left of laser -> pan left (decrease angle toward 0°)
+        # User reports: ball on left goes right, so pan control is inverted
+        # Invert: when error_x < 0 (ball left), we need to increase angle to pan left
         if normalized_error_x > 0:
             # Ball is on the right - reduce movement by 5%
-            delta_pan = self.kp_pan * normalized_error_x * 90.0 * 0.95  # 5% less movement
+            delta_pan = -self.kp_pan * normalized_error_x * 90.0 * 0.95  # Inverted, 5% less movement
         elif normalized_error_x < 0:
-            # Ball is on the left - full movement
-            delta_pan = self.kp_pan * normalized_error_x * 90.0
+            # Ball is on the left - full movement, inverted
+            delta_pan = -self.kp_pan * normalized_error_x * 90.0
         else:
             delta_pan = 0.0
         
@@ -465,7 +466,7 @@ class BallTrackerNode(Node):
                 # Calculate what the delta should be for debugging
                 normalized_err_x = error_x / (self.image_width / 2.0)
                 normalized_err_y = error_y / (self.image_height / 2.0)
-                expected_delta_pan = self.controller.kp_pan * normalized_err_x * 90.0
+                expected_delta_pan = -self.controller.kp_pan * normalized_err_x * 90.0  # Inverted to match actual control
                 if normalized_err_x > 0:
                     expected_delta_pan *= 0.95  # Right side is 5% less
                 expected_delta_tilt = -self.controller.kp_tilt * normalized_err_y * 90.0  # Inverted to match actual control

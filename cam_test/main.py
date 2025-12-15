@@ -9,6 +9,11 @@ Requirements:
 - opencv-python: pip install opencv-python
 """
 
+import sys
+import time
+import signal
+import os
+
 try:
     import rclpy
     from rclpy.node import Node
@@ -28,17 +33,17 @@ except ImportError as e:
 
 try:
     import cv2
+    import numpy as np
     CV2_AVAILABLE = True
+    # Suppress OpenCV warnings about corrupt JPEG data
+    # These warnings come from incomplete MJPEG frames which we handle gracefully
+    os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+    cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
 except ImportError:
     CV2_AVAILABLE = False
     print("Error: opencv-python not available")
     print("  Install with: pip install opencv-python")
     sys.exit(1)
-
-import time
-import sys
-import signal
-import os
 
 
 class CameraNode(Node):
@@ -115,6 +120,7 @@ class CameraNode(Node):
         
         # Create timer for frame capture (30 FPS = ~33ms)
         self.frame_count = 0
+        self.corrupted_frame_count = 0
         self.timer = self.create_timer(1.0 / self.fps, self.capture_and_publish)
         
         # Setup signal handler for graceful shutdown
@@ -129,13 +135,53 @@ class CameraNode(Node):
         rclpy.shutdown()
         sys.exit(0)
     
+    def validate_frame(self, frame):
+        """Validate that frame is not corrupted and has correct dimensions"""
+        if frame is None:
+            return False
+        if not isinstance(frame, np.ndarray):
+            return False
+        if frame.size == 0:
+            return False
+        if len(frame.shape) < 2:
+            return False
+        # Check dimensions match expected size (allow small tolerance)
+        height, width = frame.shape[:2]
+        if abs(height - self.height) > 2 or abs(width - self.width) > 2:
+            return False
+        # Check for all-zero or all-same-value frames (likely corrupted)
+        if np.all(frame == 0) or (len(np.unique(frame)) == 1 and frame.size > 100):
+            return False
+        return True
+    
     def capture_and_publish(self):
         """Capture frame and publish to ROS topic"""
-        ret, frame = self.cap.read()
+        max_retries = 3
+        frame = None
         
-        if not ret:
-            self.get_logger().warn('Failed to capture frame')
-            return
+        # Try to capture a valid frame with retries
+        for attempt in range(max_retries):
+            ret, frame = self.cap.read()
+            
+            if not ret:
+                if attempt < max_retries - 1:
+                    continue
+                self.get_logger().warn('Failed to capture frame after retries')
+                return
+            
+            # Validate frame
+            if self.validate_frame(frame):
+                break
+            
+            # Frame is corrupted, try again
+            self.corrupted_frame_count += 1
+            if attempt < max_retries - 1:
+                continue
+            else:
+                # Log only occasionally to avoid spam
+                if self.corrupted_frame_count % 30 == 0:
+                    self.get_logger().warn(f'Skipped corrupted frame (total skipped: {self.corrupted_frame_count})')
+                return
         
         self.frame_count += 1
         
@@ -152,6 +198,11 @@ class CameraNode(Node):
             
             if not result:
                 self.get_logger().error('Failed to encode frame to JPEG')
+                return
+            
+            # Validate encoded JPEG data
+            if jpeg_data is None or len(jpeg_data) == 0:
+                self.get_logger().warn('Encoded JPEG data is empty')
                 return
             
             # Create ROS Image message with JPEG data
