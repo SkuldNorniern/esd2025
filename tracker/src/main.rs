@@ -1,7 +1,7 @@
 use ros_wrapper::{create_topic_receiver, QosProfile, std_msgs::msg::String as StringMsg};
 use software_pwm::SoftwarePwmServo;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 // Error type for tracker operations
 #[derive(Debug)]
@@ -24,6 +24,38 @@ impl std::fmt::Display for TrackerError {
 }
 
 impl std::error::Error for TrackerError {}
+
+#[derive(Clone, Copy, Debug)]
+struct Detection {
+    coords: Option<(f32, f32, f32, f32)>,
+    received_at: Instant,
+}
+
+struct Ema {
+    alpha: f64,
+    value: Option<f64>,
+}
+
+impl Ema {
+    fn new(alpha: f64) -> Self {
+        let alpha = alpha.clamp(0.0, 1.0);
+        Self { alpha, value: None }
+    }
+
+    fn update(&mut self, x: f64) -> f64 {
+        match self.value {
+            Some(prev) => {
+                let v = (self.alpha * x) + ((1.0 - self.alpha) * prev);
+                self.value = Some(v);
+                v
+            }
+            None => {
+                self.value = Some(x);
+                x
+            }
+        }
+    }
+}
 
 // Servo control using software PWM
 // GPIO18: Pan (Left-Right)
@@ -82,110 +114,215 @@ impl Drop for ServoController {
     }
 }
 
-// PID controller (starting with P-only as per README)
-struct Controller {
-    // Proportional gains
-    kp_pan: f64,
-    kp_tilt: f64,
-    // Current servo positions (degrees)
-    pan_angle: f64,
-    tilt_angle: f64,
-    // Image dimensions (for coordinate conversion)
+struct TrackingConfig {
     image_width: u32,
     image_height: u32,
+    // Camera field-of-view in degrees (used for px -> angle conversion)
+    hfov_deg: f64,
+    vfov_deg: f64,
+    // Control
+    kp_pan: f64,
+    kp_tilt: f64,
+    kd_pan: f64,
+    kd_tilt: f64,
+    // Max servo speed (deg/sec)
+    max_speed_deg_s: f64,
+    // Deadband (degrees). If angular error is smaller than this, don't move.
+    deadband_deg: f64,
+    // EMA smoothing for angular error (0 = no smoothing, 1 = heavy smoothing)
+    ema_alpha: f64,
     // Servo limits (degrees)
     pan_min: f64,
     pan_max: f64,
     tilt_min: f64,
     tilt_max: f64,
-    // Rate limiting (max change per update)
-    max_rate: f64,
-    last_update: Instant,
     // Direction inversion flags (if servos are mounted backwards)
     invert_pan: bool,
     invert_tilt: bool,
 }
 
-impl Controller {
-    fn new(image_width: u32, image_height: u32) -> Self {
+fn env_f64(name: &str) -> Option<f64> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    match std::env::var(name).ok()?.as_str() {
+        "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes" => Some(true),
+        "0" | "false" | "FALSE" | "False" | "no" | "NO" | "No" => Some(false),
+        _ => None,
+    }
+}
+
+impl TrackingConfig {
+    fn from_env() -> Self {
+        // Defaults assume a typical webcam; override on the Pi for best accuracy.
+        let image_width = env_u32("TRACKER_IMAGE_WIDTH").unwrap_or(640);
+        let image_height = env_u32("TRACKER_IMAGE_HEIGHT").unwrap_or(640);
+
+        let hfov_deg = env_f64("TRACKER_HFOV_DEG").unwrap_or(70.0);
+        let vfov_deg = env_f64("TRACKER_VFOV_DEG").unwrap_or(55.0);
+
+        // If you want "move the full error angle each tick", set KP=1.0.
+        let kp_pan = env_f64("TRACKER_KP_PAN").unwrap_or(0.8);
+        let kp_tilt = env_f64("TRACKER_KP_TILT").unwrap_or(0.8);
+
+        let kd_pan = env_f64("TRACKER_KD_PAN").unwrap_or(0.0);
+        let kd_tilt = env_f64("TRACKER_KD_TILT").unwrap_or(0.0);
+
+        let max_speed_deg_s = env_f64("TRACKER_MAX_SPEED_DEG_S").unwrap_or(120.0);
+        let deadband_deg = env_f64("TRACKER_DEADBAND_DEG").unwrap_or(0.4);
+        let ema_alpha = env_f64("TRACKER_EMA_ALPHA").unwrap_or(0.4);
+
+        let pan_min = env_f64("TRACKER_PAN_MIN").unwrap_or(0.0);
+        let pan_max = env_f64("TRACKER_PAN_MAX").unwrap_or(180.0);
+        let tilt_min = env_f64("TRACKER_TILT_MIN").unwrap_or(0.0);
+        let tilt_max = env_f64("TRACKER_TILT_MAX").unwrap_or(180.0);
+
+        let invert_pan = env_bool("TRACKER_INVERT_PAN").unwrap_or(false);
+        let invert_tilt = env_bool("TRACKER_INVERT_TILT").unwrap_or(false);
+
         Self {
-            kp_pan: 0.15,  // Higher gain for accurate tracking
-            kp_tilt: 0.15,
-            pan_angle: 90.0,  // Start at center
-            tilt_angle: 90.0,
             image_width,
             image_height,
-            pan_min: 0.0,
-            pan_max: 180.0,
-            tilt_min: 0.0,
-            tilt_max: 180.0,
-            max_rate: 10.0,  // Higher rate for faster response
-            last_update: Instant::now(),
-            // Set to true if servos are mounted in reverse
-            // If tracker drifts right when ball is left, set invert_pan: true
-            invert_pan: true,  // Try inverting if drifting wrong direction
-            invert_tilt: false,
+            hfov_deg,
+            vfov_deg,
+            kp_pan,
+            kp_tilt,
+            kd_pan,
+            kd_tilt,
+            max_speed_deg_s,
+            deadband_deg,
+            ema_alpha,
+            pan_min,
+            pan_max,
+            tilt_min,
+            tilt_max,
+            invert_pan,
+            invert_tilt,
         }
+    }
+}
+
+// PID controller (starting with P-only as per README)
+struct Controller {
+    // Current servo positions (degrees)
+    pan_angle: f64,
+    tilt_angle: f64,
+    last_update: Instant,
+
+    // Camera model (focal length in pixels)
+    fx: f64,
+    fy: f64,
+
+    // Config
+    cfg: TrackingConfig,
+
+    // Optional smoothing + derivative
+    err_pan_ema: Ema,
+    err_tilt_ema: Ema,
+    last_err_pan_deg: f64,
+    last_err_tilt_deg: f64,
+}
+
+impl Controller {
+    fn new(cfg: TrackingConfig) -> Self {
+        let w = cfg.image_width as f64;
+        let h = cfg.image_height as f64;
+
+        // Projective model:
+        // fx = (w/2) / tan(hfov/2), fy = (h/2) / tan(vfov/2)
+        let hfov_rad = cfg.hfov_deg.to_radians();
+        let vfov_rad = cfg.vfov_deg.to_radians();
+        let fx = (w / 2.0) / (hfov_rad / 2.0).tan();
+        let fy = (h / 2.0) / (vfov_rad / 2.0).tan();
+
+        Self {
+            pan_angle: 90.0,  // Start at center
+            tilt_angle: 90.0,
+            last_update: Instant::now(),
+            fx,
+            fy,
+            err_pan_ema: Ema::new(cfg.ema_alpha),
+            err_tilt_ema: Ema::new(cfg.ema_alpha),
+            last_err_pan_deg: 0.0,
+            last_err_tilt_deg: 0.0,
+            cfg,
+        }
+    }
+
+    fn pixel_error_to_angle_deg(&self, ball_center_x: f64, ball_center_y: f64) -> (f64, f64) {
+        let center_x = (self.cfg.image_width as f64) / 2.0;
+        let center_y = (self.cfg.image_height as f64) / 2.0;
+
+        let dx = ball_center_x - center_x;
+        let dy = ball_center_y - center_y;
+
+        // Positive dx => ball to the right => positive pan error
+        // Positive dy => ball below center (image y down) => positive tilt error
+        let err_pan_rad = (dx / self.fx).atan();
+        let err_tilt_rad = (dy / self.fy).atan();
+
+        (err_pan_rad.to_degrees(), err_tilt_rad.to_degrees())
     }
 
     // Update servo positions based on ball detection
     // Input: bounding box (x1, y1, x2, y2) in image coordinates
     fn update(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) -> (f64, f64) {
         // Calculate ball center
-        let ball_center_x = (x1 + x2) / 2.0;
-        let ball_center_y = (y1 + y2) / 2.0;
+        let ball_center_x = ((x1 + x2) as f64) / 2.0;
+        let ball_center_y = ((y1 + y2) as f64) / 2.0;
 
-        // Calculate image center
-        let image_center_x = self.image_width as f32 / 2.0;
-        let image_center_y = self.image_height as f32 / 2.0;
+        // Convert pixel offset to angular error using camera FOV.
+        // This is the key to "accurately point at the ball".
+        let (mut err_pan_deg, mut err_tilt_deg) = self.pixel_error_to_angle_deg(ball_center_x, ball_center_y);
 
-        // Calculate error (pixels from center)
-        let error_x = ball_center_x - image_center_x;
-        let error_y = ball_center_y - image_center_y;
-
-        // Normalize error to -1.0 to 1.0 range
-        let normalized_error_x = error_x / image_center_x;
-        let normalized_error_y = error_y / image_center_y;
-
-        // Apply P-control - focus on accuracy, not smoothness
-        // Image coordinates: (0,0) is top-left, x increases right, y increases down
-        // Servo convention: 0° = left/up, 90° = center, 180° = right/down
-        // 
-        // If ball is to the RIGHT of center (positive error_x):
-        //   - We need to pan RIGHT to follow it
-        //   - Pan RIGHT means INCREASE angle (toward 180°)
-        //   - So delta_pan should be POSITIVE when error_x is POSITIVE
-        //
-        // If ball is BELOW center (positive error_y):
-        //   - We need to tilt DOWN to follow it
-        //   - Tilt DOWN means INCREASE angle (toward 180°)
-        //   - So delta_tilt should be POSITIVE when error_y is POSITIVE
-        let mut delta_pan = self.kp_pan * normalized_error_x as f64 * 90.0; // Scale to degrees
-        let mut delta_tilt = self.kp_tilt * normalized_error_y as f64 * 90.0;
-        
-        // Apply direction inversion if servos are mounted backwards
-        if self.invert_pan {
-            delta_pan = -delta_pan;
+        if self.cfg.invert_pan {
+            err_pan_deg = -err_pan_deg;
         }
-        if self.invert_tilt {
-            delta_tilt = -delta_tilt;
+        if self.cfg.invert_tilt {
+            err_tilt_deg = -err_tilt_deg;
         }
 
-        // Rate limiting
+        // Smooth noisy detections a bit (bounding box jitter).
+        let err_pan_deg = self.err_pan_ema.update(err_pan_deg);
+        let err_tilt_deg = self.err_tilt_ema.update(err_tilt_deg);
+
         let elapsed = self.last_update.elapsed().as_secs_f64();
-        let max_delta = self.max_rate * elapsed.max(0.01); // Cap at reasonable rate
-        
-        let delta_pan = delta_pan.max(-max_delta).min(max_delta);
-        let delta_tilt = delta_tilt.max(-max_delta).min(max_delta);
+        let dt = elapsed.max(0.01);
+
+        // Deadband to prevent servo buzz when nearly centered.
+        let mut delta_pan = 0.0;
+        let mut delta_tilt = 0.0;
+
+        if err_pan_deg.abs() >= self.cfg.deadband_deg {
+            let derr = (err_pan_deg - self.last_err_pan_deg) / dt;
+            delta_pan = (self.cfg.kp_pan * err_pan_deg) + (self.cfg.kd_pan * derr);
+        }
+
+        if err_tilt_deg.abs() >= self.cfg.deadband_deg {
+            let derr = (err_tilt_deg - self.last_err_tilt_deg) / dt;
+            delta_tilt = (self.cfg.kp_tilt * err_tilt_deg) + (self.cfg.kd_tilt * derr);
+        }
+
+        // Rate limiting (deg/sec)
+        let max_delta = self.cfg.max_speed_deg_s * dt;
+        delta_pan = delta_pan.clamp(-max_delta, max_delta);
+        delta_tilt = delta_tilt.clamp(-max_delta, max_delta);
 
         // Update angles
         self.pan_angle += delta_pan;
         self.tilt_angle += delta_tilt;
 
         // Clamp to limits
-        self.pan_angle = self.pan_angle.max(self.pan_min).min(self.pan_max);
-        self.tilt_angle = self.tilt_angle.max(self.tilt_min).min(self.tilt_max);
+        self.pan_angle = self.pan_angle.max(self.cfg.pan_min).min(self.cfg.pan_max);
+        self.tilt_angle = self.tilt_angle.max(self.cfg.tilt_min).min(self.cfg.tilt_max);
 
+        self.last_err_pan_deg = err_pan_deg;
+        self.last_err_tilt_deg = err_tilt_deg;
         self.last_update = Instant::now();
 
         (self.pan_angle, self.tilt_angle)
@@ -198,55 +335,31 @@ impl Controller {
     }
 }
 
-// Ball detection coordinates (latest values)
-struct BallCoordinates {
-    coords: Arc<Mutex<Option<(f32, f32, f32, f32)>>>,
-    last_update: Arc<Mutex<Instant>>,
-}
-
-impl BallCoordinates {
-    fn new() -> Self {
-        Self {
-            coords: Arc::new(Mutex::new(None)),
-            last_update: Arc::new(Mutex::new(Instant::now())),
-        }
-    }
-
-    fn get_coordinates(&self) -> Option<(f32, f32, f32, f32)> {
-        *self.coords.lock().unwrap()
-    }
-
-    fn set_coordinates(&self, coords: Option<(f32, f32, f32, f32)>) {
-        *self.coords.lock().unwrap() = coords;
-        *self.last_update.lock().unwrap() = Instant::now();
-    }
-
-    fn is_stale(&self, timeout: Duration) -> bool {
-        self.last_update.lock().unwrap().elapsed() > timeout
-    }
-}
-
 // Parse coordinates string: "x1,y1,x2,y2" or "none"
 fn parse_coordinates(s: &str) -> Option<(f32, f32, f32, f32)> {
     if s == "none" {
         return None;
     }
-    
-    let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 4 {
+
+    let mut it = s.split(',');
+    let x1 = it.next()?.parse().ok()?;
+    let y1 = it.next()?.parse().ok()?;
+    let x2 = it.next()?.parse().ok()?;
+    let y2 = it.next()?.parse().ok()?;
+    if it.next().is_some() {
         return None;
     }
-    
-    let x1 = parts[0].parse().ok()?;
-    let y1 = parts[1].parse().ok()?;
-    let x2 = parts[2].parse().ok()?;
-    let y2 = parts[3].parse().ok()?;
-    
     Some((x1, y1, x2, y2))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Avoid `#[tokio::main]` to keep tokio's proc-macro feature out of this crate.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main())?;
+    Ok(())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing tracker node...");
     println!("GPIO18: Pan servo (Left-Right)");
     println!("GPIO19: Tilt servo (Up-Down)");
@@ -267,8 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create subscriber for ball detection coordinates
     println!("Subscribing to ball detection topic...");
-    let coords = BallCoordinates::new();
-    
+
     // Subscribe to /ball_coords topic (single topic with string format: "x1,y1,x2,y2" or "none")
     let (mut rx_coords, _node_coords) = create_topic_receiver::<StringMsg>(
         "tracker_node",
@@ -296,21 +408,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("(Press Ctrl+C to stop)");
     println!();
 
-    // Image dimensions (should match camera resolution: 640x640)
-    let image_width = 640;
-    let image_height = 640;
-    let mut controller = Controller::new(image_width, image_height);
+    let cfg = TrackingConfig::from_env();
+    println!(
+        "Tracking config: {}x{}, HFOV {:.1}°, VFOV {:.1}°, KP(pan/tilt) {:.3}/{:.3}, KD(pan/tilt) {:.3}/{:.3}, max_speed {:.1}°/s, deadband {:.2}°, ema_alpha {:.2}, invert_pan {}, invert_tilt {}",
+        cfg.image_width,
+        cfg.image_height,
+        cfg.hfov_deg,
+        cfg.vfov_deg,
+        cfg.kp_pan,
+        cfg.kp_tilt,
+        cfg.kd_pan,
+        cfg.kd_tilt,
+        cfg.max_speed_deg_s,
+        cfg.deadband_deg,
+        cfg.ema_alpha,
+        cfg.invert_pan,
+        cfg.invert_tilt
+    );
 
-    // Spawn task to receive coordinates from single topic
-    let coords_clone = BallCoordinates {
-        coords: Arc::clone(&coords.coords),
-        last_update: Arc::clone(&coords.last_update),
-    };
+    let mut controller = Controller::new(cfg);
+
+    let (det_tx, det_rx) = watch::channel(Detection {
+        coords: None,
+        received_at: Instant::now(),
+    });
 
     tokio::spawn(async move {
         while let Some(msg) = rx_coords.recv().await {
             let parsed = parse_coordinates(&msg.data);
-            coords_clone.set_coordinates(parsed);
+            let _ = det_tx.send(Detection {
+                coords: parsed,
+                received_at: Instant::now(),
+            });
         }
     });
 
@@ -327,58 +456,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_count += 1;
 
         // Check for ball detection coordinates
-        if let Some((x1, y1, x2, y2)) = coords.get_coordinates() {
-            // Check if coordinates are stale
-            if !coords.is_stale(timeout) {
+        let det = *det_rx.borrow();
+        if det.received_at.elapsed() <= timeout {
+            if let Some((x1, y1, x2, y2)) = det.coords {
                 let (pan_angle, tilt_angle) = controller.update(x1, y1, x2, y2);
                 servo.set_pan(pan_angle)?;
                 servo.set_tilt(tilt_angle)?;
 
-                // Calculate ball center for logging
                 let ball_center_x = (x1 + x2) / 2.0;
                 let ball_center_y = (y1 + y2) / 2.0;
-                let image_center_x = 640.0 / 2.0;
-                let image_center_y = 640.0 / 2.0;
-                let error_x = ball_center_x - image_center_x;
-                let error_y = ball_center_y - image_center_y;
-                
-                // Log more frequently to debug direction issues
+
+                // Log periodically with pixel error and current servo angles.
                 let pan_diff = (pan_angle - last_logged_pan).abs();
                 let tilt_diff = (tilt_angle - last_logged_tilt).abs();
                 if pan_diff > 0.5 || tilt_diff > 0.5 || frame_count % 20 == 0 {
-                    // Show normalized errors and direction
-                    let norm_error_x = error_x / image_center_x;
-                    let norm_error_y = error_y / image_center_y;
-                    println!("Ball: ({:.1}, {:.1}), err: ({:.1}, {:.1}) norm: ({:.3}, {:.3}) -> Pan: {:.1}° (Δ{:.1}°), Tilt: {:.1}° (Δ{:.1}°)",
-                        ball_center_x, ball_center_y, error_x, error_y, norm_error_x, norm_error_y,
-                        pan_angle, pan_diff, tilt_angle, tilt_diff);
+                    let image_center_x = controller.cfg.image_width as f32 / 2.0;
+                    let image_center_y = controller.cfg.image_height as f32 / 2.0;
+                    let error_x = ball_center_x - image_center_x;
+                    let error_y = ball_center_y - image_center_y;
+                    println!(
+                        "Ball: ({:.1},{:.1}) px_err: ({:.1},{:.1}) -> Pan {:.1}° (Δ{:.1}°) Tilt {:.1}° (Δ{:.1}°)",
+                        ball_center_x,
+                        ball_center_y,
+                        error_x,
+                        error_y,
+                        pan_angle,
+                        pan_diff,
+                        tilt_angle,
+                        tilt_diff
+                    );
                     last_logged_pan = pan_angle;
                     last_logged_tilt = tilt_angle;
                 }
 
                 last_detection_time = Instant::now();
-            } else {
-                // Coordinates are stale, reset to center
-                if last_detection_time.elapsed() > timeout {
-                    controller.reset_to_center();
-                    servo.set_pan(90.0)?;
-                    servo.set_tilt(90.0)?;
-                    println!("No detection for {}s, resetting to center", timeout.as_secs());
-                    last_detection_time = Instant::now();
-                }
             }
-        } else {
-            // No coordinates available, check if we should reset
-            if last_detection_time.elapsed() > timeout {
-                controller.reset_to_center();
-                servo.set_pan(90.0)?;
-                servo.set_tilt(90.0)?;
-                if last_detection_time.elapsed() > timeout + Duration::from_secs(1) {
-                    // Only log once per timeout period
-                    println!("No detection for {}s, resetting to center", timeout.as_secs());
-                    last_detection_time = Instant::now();
-                }
-            }
+        } else if last_detection_time.elapsed() > timeout {
+            controller.reset_to_center();
+            servo.set_pan(90.0)?;
+            servo.set_tilt(90.0)?;
+            println!("No detection for {}s, resetting to center", timeout.as_secs());
+            last_detection_time = Instant::now();
         }
     }
 }
+
