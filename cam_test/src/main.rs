@@ -102,9 +102,12 @@ fn extract_rgb(rgb_buffer: &[u8], width: u32, height: u32, row_stride: u32) -> V
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Avoid `#[tokio::main]` to keep `tokio`'s proc-macro feature out of this crate.
-    // We still need a runtime because `ros_wrapper` uses `tokio::spawn()` internally.
-    let rt = tokio::runtime::Runtime::new()?;
+    // Create a multi-threaded runtime to allow blocking operations
+    // This is needed because V4L2 stream.next() is blocking
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)  // Enough threads for camera + ROS tasks
+        .enable_all()
+        .build()?;
     rt.block_on(async_main())?;
     Ok(())
 }
@@ -239,11 +242,18 @@ async fn async_main() -> Result<(), CameraError> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(PUBLISH_EVERY_N);
     println!("Publishing every {} frame(s) (from config.toml, use PUBLISH_EVERY_N env var to override)", publish_every_n);
+    println!("Starting capture loop, waiting for first frame from camera...");
     
     loop {
         // Dequeue a buffer (wait for frame)
-        // stream.next() is blocking - use block_in_place to avoid stalling async runtime
+        // stream.next() is blocking - wrap in block_in_place to tell tokio this is a blocking op
         let frame_start = std::time::Instant::now();
+        
+        if frame_count == 0 {
+            println!("DEBUG: Calling stream.next() for first frame (this may take a moment)...");
+        }
+        
+        // Use block_in_place to run blocking code without blocking the executor
         let result = tokio::task::block_in_place(|| {
             stream.next()
         });
