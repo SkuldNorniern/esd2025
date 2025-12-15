@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # Optimized for Raspberry Pi 3 - reduced resolution, FPS, and frame skipping
 # Configuration matches config.toml defaults used by Rust version
+# Publishes to /image topic with sensor_msgs/Image (encoding="jpeg")
 # Environment variables for tuning:
 #   CAM_DEVICE_PATH: Camera device path (default: /dev/video0)
 #   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 512x512 to match config.toml)
 #   CAM_FPS: Target FPS (default: 15)
 #   JPEG_QUALITY: JPEG compression quality 1-100 (default: 65)
 #   PUBLISH_EVERY_N: Publish every Nth frame (default: 3 to match config.toml)
-#   PUBLISH_RAW: Set to "1" to enable raw RGB8 publishing (default: "0")
 #   CAM_WARMUP: Number of frames to discard on startup (default: 10)
+#   SHOW_TRACKING_VIEW: Set to "1" to enable real-time tracking visualization (default: "0")
 import os, sys, time, signal, warnings
+from typing import Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Header
-from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import Header, String
+from sensor_msgs.msg import Image
 
 import cv2
 import numpy as np
@@ -32,14 +34,39 @@ class StderrFilter:
     def __getattr__(self, name):
         return getattr(self.original_stderr, name)
 
+def parse_ball_coords(s: str) -> Optional[Tuple[float, float, float, float]]:
+    """Parse ball coordinates string: 'x1,y1,x2,y2' or 'none'"""
+    if s == "none":
+        return None
+    parts = s.split(',')
+    if len(parts) != 4:
+        return None
+    try:
+        return (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+    except ValueError:
+        return None
+
+
+def parse_laser_pos(s: str) -> Optional[Tuple[float, float]]:
+    """Parse laser position string: 'x,y' or 'none'"""
+    if s == "none":
+        return None
+    parts = s.split(',')
+    if len(parts) != 2:
+        return None
+    try:
+        return (float(parts[0]), float(parts[1]))
+    except ValueError:
+        return None
+
+
 class CameraNode(Node):
     def __init__(self):
         super().__init__("camera_node")
 
-        # Keep original /image publisher (raw)
-        self.pub_raw = self.create_publisher(Image, "/image", 10)
-        # Add proper compressed stream (JPEG)
-        self.pub_jpeg = self.create_publisher(CompressedImage, "/image/compressed", 10)
+        # Publisher for /image topic - matches Rust version behavior
+        # Publishes sensor_msgs/Image with encoding="jpeg" (MJPEG from camera)
+        self.pub_image = self.create_publisher(Image, "/image", 10)
 
         # Match config.toml defaults - device_path can be overridden with CAM_DEVICE_PATH
         self.device_path = os.environ.get("CAM_DEVICE_PATH", "/dev/video0")
@@ -50,8 +77,13 @@ class CameraNode(Node):
         # Lower JPEG quality for smaller file sizes - can be overridden with JPEG_QUALITY env var
         self.jpeg_quality = int(os.environ.get("JPEG_QUALITY", "65"))
 
-        # Disable raw by default for Pi 3 - set PUBLISH_RAW=1 to enable
-        self.publish_raw = os.environ.get("PUBLISH_RAW", "0") != "0"
+        # Enable tracking view with SHOW_TRACKING_VIEW=1
+        self.show_tracking = os.environ.get("SHOW_TRACKING_VIEW", "0") != "0"
+        
+        # Tracking state (latest detections)
+        self.ball_bbox: Optional[Tuple[float, float, float, float]] = None
+        self.laser_pos: Optional[Tuple[float, float]] = None
+        self.last_frame_for_display: Optional[np.ndarray] = None
 
         # Filter stderr spam (optional)
         self._orig_stderr = sys.stderr
@@ -105,6 +137,27 @@ class CameraNode(Node):
 
         period = 1.0 / max(1.0, self.req_fps)
         self.timer = self.create_timer(period, self.capture_and_publish)
+        
+        # Subscribe to detection topics if tracking view is enabled
+        if self.show_tracking:
+            self.get_logger().info("Tracking view enabled - subscribing to detection topics...")
+            self.ball_sub = self.create_subscription(
+                String,
+                '/ball_coords',
+                self.ball_coords_callback,
+                10
+            )
+            self.laser_sub = self.create_subscription(
+                String,
+                '/laser_pos',
+                self.laser_pos_callback,
+                10
+            )
+            # Create display window
+            cv2.namedWindow("Camera Tracking View", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Camera Tracking View", 640, 640)
+            # Create timer for display update (30 Hz)
+            self.display_timer = self.create_timer(1.0/30.0, self.update_display)
 
         signal.signal(signal.SIGINT, self._sig)
         signal.signal(signal.SIGTERM, self._sig)
@@ -120,19 +173,99 @@ class CameraNode(Node):
         self.get_logger().info(f"  Format: {fourcc_str}")
         self.get_logger().info(f"  Publish every Nth frame: {self.publish_every_n}")
         self.get_logger().info(f"  JPEG quality: {self.jpeg_quality}")
-        self.get_logger().info(f"  Publish raw RGB8: {self.publish_raw}")
+        self.get_logger().info(f"  Tracking view: {self.show_tracking}")
         self.get_logger().info("")
         self.get_logger().info("Publishing:")
-        self.get_logger().info("  /image            (sensor_msgs/Image, rgb8)  [if PUBLISH_RAW=1]")
-        self.get_logger().info("  /image/compressed (sensor_msgs/CompressedImage, jpeg)")
+        self.get_logger().info("  /image (sensor_msgs/Image, encoding='jpeg', MJPEG compressed)")
+        if self.show_tracking:
+            self.get_logger().info("")
+            self.get_logger().info("Tracking view enabled:")
+            self.get_logger().info("  Subscribing to /ball_coords and /laser_pos")
+            self.get_logger().info("  Real-time visualization in OpenCV window")
         self.get_logger().info("")
         self.get_logger().info("Press Ctrl+C to stop.")
+    
+    def ball_coords_callback(self, msg: String) -> None:
+        """Callback for ball coordinates"""
+        self.ball_bbox = parse_ball_coords(msg.data)
+    
+    def laser_pos_callback(self, msg: String) -> None:
+        """Callback for laser position"""
+        self.laser_pos = parse_laser_pos(msg.data)
+    
+    def update_display(self) -> None:
+        """Update the tracking visualization window"""
+        if self.last_frame_for_display is None:
+            return
+        
+        # Create a copy to draw on
+        display_frame = self.last_frame_for_display.copy()
+        
+        # Draw ball bounding box (red)
+        if self.ball_bbox is not None:
+            x1, y1, x2, y2 = self.ball_bbox
+            cv2.rectangle(
+                display_frame,
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (0, 0, 255),  # Red in BGR
+                2
+            )
+            # Draw center point
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            cv2.circle(display_frame, (int(cx), int(cy)), 3, (0, 0, 255), -1)
+            # Label
+            cv2.putText(
+                display_frame,
+                "Ball",
+                (int(x1), int(y1) - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                2
+            )
+        
+        # Draw laser position (green circle)
+        if self.laser_pos is not None:
+            lx, ly = self.laser_pos
+            cv2.circle(display_frame, (int(lx), int(ly)), 8, (0, 255, 0), -1)  # Green in BGR
+            # Draw crosshair
+            cv2.line(display_frame, (int(lx) - 12, int(ly)), (int(lx) + 12, int(ly)), (0, 255, 0), 2)
+            cv2.line(display_frame, (int(lx), int(ly) - 12), (int(lx), int(ly) + 12), (0, 255, 0), 2)
+            # Label
+            cv2.putText(
+                display_frame,
+                "Laser",
+                (int(lx) + 15, int(ly) - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                2
+            )
+        
+        # Show FPS and frame count
+        info_text = f"Frame: {self.frame_count} | FPS: {self.fps:.1f}"
+        cv2.putText(
+            display_frame,
+            info_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+        
+        # Display the frame
+        cv2.imshow("Camera Tracking View", display_frame)
+        cv2.waitKey(1)
 
     def _sig(self, *_):
         self.get_logger().info("Shutting down...")
         try:
             if self.cap.isOpened():
                 self.cap.release()
+            if self.show_tracking:
+                cv2.destroyAllWindows()
         finally:
             sys.stderr = self._orig_stderr
             rclpy.shutdown()
@@ -156,27 +289,16 @@ class CameraNode(Node):
 
         stamp = self.get_clock().now().to_msg()
 
+        # Save frame for tracking display (if enabled)
+        if self.show_tracking:
+            self.last_frame_for_display = frame.copy()
+        
         # Publish throttling (reduce network overhead)
         self.frame_count += 1
         if self.frame_count % self.publish_every_n != 0:
             return
 
-        # 1) Publish raw /image (RGB8) for compatibility with your existing pipeline
-        if self.publish_raw:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            msg = Image()
-            msg.header = Header()
-            msg.header.stamp = stamp
-            msg.header.frame_id = "camera_frame"
-            msg.height = h
-            msg.width = w
-            msg.encoding = "rgb8"
-            msg.is_bigendian = 0
-            msg.step = w * 3
-            msg.data = rgb.tobytes()
-            self.pub_raw.publish(msg)
-
-        # 2) Publish compressed JPEG on /image/compressed
+        # Encode frame as JPEG
         # Note: If camera provides MJPEG directly, we could use it without re-encoding
         # But OpenCV doesn't expose raw MJPEG easily, so we re-encode
         # For better performance, use the Rust version which uses raw MJPEG from camera
@@ -185,18 +307,24 @@ class CameraNode(Node):
             self.bad_count += 1
             return
 
-        cmsg = CompressedImage()
-        cmsg.header = Header()
-        cmsg.header.stamp = stamp
-        cmsg.header.frame_id = "camera_frame"
-        cmsg.format = "jpeg"
-        cmsg.data = jpeg.tobytes()
-        self.pub_jpeg.publish(cmsg)
+        # Publish to /image topic as sensor_msgs/Image with encoding="jpeg"
+        # This matches the Rust version behavior
+        msg = Image()
+        msg.header = Header()
+        msg.header.stamp = stamp
+        msg.header.frame_id = "camera_frame"
+        msg.height = h
+        msg.width = w
+        msg.encoding = "jpeg"  # JPEG compressed data
+        msg.is_bigendian = 0
+        msg.step = 0  # Step is 0 for compressed formats
+        msg.data = jpeg.tobytes()
+        self.pub_image.publish(msg)
         
         # Log first few frames and then periodically
         if self.frame_count <= 5 or self.frame_count % 60 == 0:
             self.get_logger().info(
-                f"Published frame #{self.frame_count}: {w}x{h} MJPEG ({len(cmsg.data)} bytes compressed, "
+                f"Published frame #{self.frame_count}: {w}x{h} MJPEG ({len(msg.data)} bytes compressed, "
                 f"skip={self.publish_every_n}, bad={self.bad_count})"
             )
 
