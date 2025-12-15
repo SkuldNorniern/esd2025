@@ -13,6 +13,7 @@ import sys
 import time
 import signal
 import os
+import warnings
 
 try:
     import rclpy
@@ -37,13 +38,33 @@ try:
     CV2_AVAILABLE = True
     # Suppress OpenCV warnings about corrupt JPEG data
     # These warnings come from incomplete MJPEG frames which we handle gracefully
+    warnings.filterwarnings('ignore', category=UserWarning)
+    # Set environment variable (may work for some OpenCV builds)
     os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
-    cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
 except ImportError:
     CV2_AVAILABLE = False
     print("Error: opencv-python not available")
     print("  Install with: pip install opencv-python")
     sys.exit(1)
+
+
+class StderrFilter:
+    """Filter stderr to suppress OpenCV JPEG corruption warnings"""
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+    
+    def write(self, message):
+        # Filter out OpenCV JPEG corruption warnings
+        if 'Corrupt JPEG data' in message or 'premature end of data segment' in message:
+            return
+        # Pass through all other messages
+        self.original_stderr.write(message)
+    
+    def flush(self):
+        self.original_stderr.flush()
+    
+    def __getattr__(self, name):
+        return getattr(self.original_stderr, name)
 
 
 class CameraNode(Node):
@@ -58,6 +79,10 @@ class CameraNode(Node):
         self.width = 640
         self.height = 640
         self.fps = 30
+        
+        # Install stderr filter to suppress OpenCV JPEG corruption warnings
+        self.original_stderr = sys.stderr
+        sys.stderr = StderrFilter(self.original_stderr)
         
         # Initialize camera
         self.get_logger().info('Initializing camera node with V4L2...')
@@ -130,6 +155,9 @@ class CameraNode(Node):
     def signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         self.get_logger().info('Shutting down...')
+        # Restore original stderr
+        if hasattr(self, 'original_stderr'):
+            sys.stderr = self.original_stderr
         if self.cap.isOpened():
             self.cap.release()
         rclpy.shutdown()
@@ -252,8 +280,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if 'node' in locals() and node.cap.isOpened():
-            node.cap.release()
+        if 'node' in locals():
+            # Restore original stderr
+            if hasattr(node, 'original_stderr'):
+                sys.stderr = node.original_stderr
+            if node.cap.isOpened():
+                node.cap.release()
         rclpy.shutdown()
 
 
