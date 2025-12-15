@@ -93,8 +93,8 @@ class Controller:
     
     def __init__(self, image_width: int, image_height: int):
         # Proportional gains - higher for accurate pointing
-        self.kp_pan = 0.06  # Reduced to prevent overcorrection
-        self.kp_tilt = 0.06  # Reduced to prevent overcorrection
+        self.kp_pan = 0.04  # Further reduced to prevent overcorrection and overshooting
+        self.kp_tilt = 0.04  # Further reduced to prevent overcorrection and overshooting
         
         # Current servo positions (degrees)
         self.pan_angle = 90.0  # Start at center
@@ -111,14 +111,14 @@ class Controller:
         self.tilt_max = 180.0
         
         # Rate limiting (max change per update)
-        self.max_rate = 2.0  # Max 2 degrees per update to prevent large movements
+        self.max_rate = 1.5  # Max 1.5 degrees per update to prevent large movements and overshooting
         
         self.last_update = time.time()
         
         # Track previous ball position to detect if ball is actually moving
         self.last_ball_center_x: Optional[float] = None
         self.last_ball_center_y: Optional[float] = None
-        self.position_change_threshold = 3.0  # Pixels - only move if ball moved more than this (reduced for accuracy)
+        self.position_change_threshold = 5.0  # Pixels - if ball moves less than this, consider it stationary (increased to prevent overshooting)
     
     def update(self, x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float]:
         """Update servo positions based on ball detection"""
@@ -139,16 +139,12 @@ class Controller:
             ball_moved_x = abs(ball_center_x - self.last_ball_center_x)
             ball_moved_y = abs(ball_center_y - self.last_ball_center_y)
             
-            # If ball hasn't moved much AND error is small, don't update servos
-            # But if error is large (ball is far from center), always update
-            # Also, always allow movement if ball is on the left (error_x < 0) to fix left-side issue
-            # And always allow movement if ball is above center (error_y < 0) to fix tilt issue
+            # If ball hasn't moved much AND error is small, don't update servos to prevent overshooting
+            # This helps when the ball is stationary and we're already close to it
             if (ball_moved_x < self.position_change_threshold and 
                 ball_moved_y < self.position_change_threshold and
-                error_magnitude < 50.0 and
-                error_x >= 0 and
-                error_y >= 0):  # Don't skip updates when ball is on left or above center
-                # Ball is stationary and near center on right/bottom side, keep current servo positions
+                error_magnitude < 30.0):  # Reduced threshold to prevent overshooting
+                # Ball is stationary and we're close to center, keep current servo positions
                 return (self.pan_angle, self.tilt_angle)
         
         # Update last known ball position
@@ -164,34 +160,44 @@ class Controller:
         # For accurate pointing, we want direct proportional control
         
         # Pan control:
-        # error_x > 0: ball is right of center -> pan right (increase angle toward 180°)
-        # error_x < 0: ball is left of center -> pan left (decrease angle toward 0°)
+        # Image center: (320, 320) for 640x640
+        # Servo center: 90° (both pan and tilt)
+        # error_x > 0: ball is right of center (x > 320) -> pan right (increase angle toward 180°)
+        # error_x < 0: ball is left of center (x < 320) -> pan left (decrease angle toward 0°)
         # Apply different gains for left vs right to compensate for asymmetry
         if normalized_error_x > 0:
             # Ball is on the right - reduce movement by 5%
             delta_pan = self.kp_pan * normalized_error_x * 90.0 * 0.95  # 5% less movement
         elif normalized_error_x < 0:
-            # Ball is on the left - ensure it moves (no dead zone for left side)
+            # Ball is on the left - full movement
             delta_pan = self.kp_pan * normalized_error_x * 90.0
         else:
             delta_pan = 0.0
         
         # Tilt control:
-        # error_y > 0: ball is below center -> tilt down (increase angle toward 180°)
-        # error_y < 0: ball is above center -> tilt up (decrease angle toward 0°)
+        # Image center: (320, 320) for 640x640
+        # Servo center: 90° (both pan and tilt)
+        # error_y > 0: ball is below center (y > 320) -> tilt down (increase angle toward 180°)
+        # error_y < 0: ball is above center (y < 320) -> tilt up (decrease angle toward 0°)
         # Image coordinates: (0,0) is top-left, y increases downward
         # gpiozero Servo mapping: -1.0 = 0° (up), 0.0 = 90° (center), 1.0 = 180° (down)
-        # When error_y < 0 (ball above): we want tilt up (decrease angle) -> delta_tilt should be negative
-        # Direct: delta_tilt = kp * normalized_error_y
-        #   When error_y < 0: delta_tilt = kp * (negative) = negative -> angle decreases -> tilt up (correct!)
-        #   When error_y > 0: delta_tilt = kp * (positive) = positive -> angle increases -> tilt down (correct!)
-        delta_tilt = self.kp_tilt * normalized_error_y * 90.0  # Direct proportional (no inversion)
+        # When error_y < 0 (ball above center): we want tilt up (decrease angle toward 90°) -> delta_tilt should be negative
+        # Logs show tilt is going down when ball is above, so we need to invert
+        # Inverted: delta_tilt = -kp * normalized_error_y
+        #   When error_y < 0: delta_tilt = -kp * (negative) = positive -> angle increases -> tilt down (WRONG - but matches logs)
+        # Wait, that's still wrong. The issue is that the servo might be physically mounted backwards
+        # OR the gpiozero mapping is inverted. Let's try: when error_y < 0, we want to decrease angle
+        # If direct doesn't work, the servo is mounted backwards - we need to invert
+        # Based on logs: ball above (error_y < 0) -> tilt going down (angle increasing) -> WRONG
+        # So we need: when error_y < 0, delta_tilt should be negative to decrease angle
+        # Direct: delta_tilt = kp * normalized_error_y -> when error_y < 0, delta_tilt < 0 -> correct!
+        # But logs show it's going wrong, so try inverting
+        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted - test if this fixes the direction
         
-        # Add small dead zone only for very small errors to prevent micro-movements
-        # But don't apply dead zone to left side to ensure it moves
-        dead_zone = 0.05  # 5% of image size (about 32 pixels for 640x640)
-        if abs(normalized_error_x) < dead_zone and normalized_error_x >= 0:
-            # Only apply dead zone for right side or center
+        # Add dead zone to prevent micro-movements and overshooting
+        # Larger dead zone to prevent moving past stationary ball
+        dead_zone = 0.08  # 8% of image size (about 51 pixels for 640x640)
+        if abs(normalized_error_x) < dead_zone:
             delta_pan = 0.0
         if abs(normalized_error_y) < dead_zone:
             delta_tilt = 0.0
