@@ -114,11 +114,12 @@ class Controller:
         self.cy_px = self._env_float("TRACKER_CY_PX", self.image_height / 2.0)
 
         # Control gains (units: degrees of servo change per degree of angular error).
-        # Tuned for real-world ball tracking with RoboFlow detections
-        self.kp_pan = self._env_float("TRACKER_KP_PAN", 1.0)
-        self.kp_tilt = self._env_float("TRACKER_KP_TILT", 1.0)
-        self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.08)
-        self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.08)
+        # REDUCED for slow, smooth tracking that camera can follow
+        # Lower Kp = gentler response, less overshoot, easier for camera to track
+        self.kp_pan = self._env_float("TRACKER_KP_PAN", 0.5)
+        self.kp_tilt = self._env_float("TRACKER_KP_TILT", 0.5)
+        self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.05)
+        self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.05)
 
         # Physical servo-to-laser mapping (verified from measurements):
         #   Pan INCREASE = Laser moves RIGHT (X increases)
@@ -148,8 +149,9 @@ class Controller:
         self.tilt_min = 0.0
         self.tilt_max = 180.0
 
-        # Servo speed limit (deg/sec) - balanced for smooth tracking
-        self.max_speed_deg_s = self._env_float("TRACKER_MAX_SPEED_DEG_S", 150.0)
+        # Servo speed limit (deg/sec) - SLOW for camera to track laser
+        # At 30Hz control rate, 30°/s = 1° per frame, 60°/s = 2° per frame
+        self.max_speed_deg_s = self._env_float("TRACKER_MAX_SPEED_DEG_S", 30.0)
 
         # Safety clamps:
         # - If the control loop is delayed (ROS callback scheduling, pigpio latency, CPU load),
@@ -158,15 +160,17 @@ class Controller:
         #   "aggressive". Clamp the effective dt used for rate limiting and the D-term.
         self.max_dt_s = self._env_float("TRACKER_MAX_DT_S", 0.08)
         # - Additionally clamp the *per tick* movement (degrees), independent of dt.
-        # Balanced for smooth yet responsive tracking
-        self.max_step_deg = self._env_float("TRACKER_MAX_STEP_DEG", 6.0)
+        # CRITICAL: Must be small enough for camera to track laser between frames
+        # At 30Hz, max_step=2.0° means laser moves ~20-40px per frame (trackable)
+        self.max_step_deg = self._env_float("TRACKER_MAX_STEP_DEG", 2.0)
 
         # Small deadband in angular domain to prevent buzzing
         self.deadband_deg = self._env_float("TRACKER_DEADBAND_DEG", 0.3)
 
         # Optional EMA smoothing of input points (0..1)
-        # Higher alpha = more responsive but jittery, lower = smoother but laggy
-        self.ema_alpha = self._env_float("TRACKER_EMA_ALPHA", 0.5)
+        # Lower alpha = heavier smoothing, reduces jitter, helps camera track laser
+        # Higher alpha = more responsive but jittery
+        self.ema_alpha = self._env_float("TRACKER_EMA_ALPHA", 0.3)
 
         self.last_update = time.time()
         self.last_err_pan_deg = 0.0
@@ -182,8 +186,9 @@ class Controller:
         self._error_history: list = []
         self._stuck_counter = 0
         
-        # Adaptive tuning state
-        self._adaptive_enabled = self._env_bool("TRACKER_ADAPTIVE", True)
+        # Adaptive tuning state - DISABLED by default for slow tracking mode
+        # Enable with: export TRACKER_ADAPTIVE=1
+        self._adaptive_enabled = self._env_bool("TRACKER_ADAPTIVE", False)
         self._kp_pan_adaptive = self.kp_pan
         self._kp_tilt_adaptive = self.kp_tilt
         self._kd_pan_adaptive = self.kd_pan
@@ -702,12 +707,12 @@ class BallTrackerNode(Node):
         print()
         
         # Create timer for control loop.
-        # Higher rates reduce lag, but if your servos buzz or overshoot, reduce TRACKER_CONTROL_HZ.
-        # Increased default to 30Hz for better responsiveness
+        # Lower rate (15Hz) gives camera time to detect laser position changes.
+        # If servos move too fast, the laser detector can't track it between frames.
         try:
-            control_hz = float(os.environ.get("TRACKER_CONTROL_HZ", "30.0"))
+            control_hz = float(os.environ.get("TRACKER_CONTROL_HZ", "15.0"))
         except ValueError:
-            control_hz = 30.0
+            control_hz = 15.0
         control_hz = max(2.0, min(60.0, control_hz))
         self.control_period_s = 1.0 / control_hz
         self.timer = self.create_timer(self.control_period_s, self.control_loop)
@@ -720,7 +725,10 @@ class BallTrackerNode(Node):
         # Log effective config for easier tuning
         print()
         print("=" * 60)
-        print("TRACKER CONFIGURATION (Adaptive PID with Laser Feedback)")
+        print("TRACKER CONFIGURATION (SLOW MODE for Camera Tracking)")
+        print("=" * 60)
+        print("NOTE: Servos move SLOWLY so camera can track laser position")
+        print("      between frames. Fast movements cause tracking loss.")
         print("=" * 60)
         print(f"Control Loop:")
         print(f"  Rate: {1.0 / self.control_period_s:.1f} Hz")

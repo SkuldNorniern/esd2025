@@ -2,6 +2,9 @@
 # Optimized for Raspberry Pi 3 - reduced resolution, FPS, and frame skipping
 # Configuration matches config.toml defaults used by Rust version
 # Publishes to /image topic with sensor_msgs/Image (encoding="jpeg")
+# 
+# NOTE: This Python version has optional GUI tracking view
+#       The Rust version (src/main.rs) is HEADLESS ONLY (no GUI, better for Pi)
 # Environment variables for tuning:
 #   CAM_DEVICE_PATH: Camera device path (default: /dev/video1, must support MJPEG)
 #   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 512x512 to match config.toml)
@@ -9,12 +12,9 @@
 #   JPEG_QUALITY: JPEG compression quality 1-100 (default: 65)
 #   PUBLISH_EVERY_N: Publish every Nth frame (default: 3 to match config.toml)
 #   CAM_WARMUP: Number of frames to discard on startup (default: 10)
-#   SHOW_TRACKING_VIEW: Set to "0" to disable real-time tracking visualization (enabled by default)
+#   SHOW_TRACKING_VIEW: Set to "0" to disable real-time tracking visualization (enabled by default, requires X11 display)
 import os, sys, time, signal, warnings
 from typing import Optional, Tuple
-
-# Set OpenCV backend before importing cv2 to avoid Qt/Wayland issues
-os.environ['QT_QPA_PLATFORM'] = 'xcb'  # Use X11 instead of Wayland
 
 import rclpy
 from rclpy.node import Node
@@ -157,6 +157,8 @@ class CameraNode(Node):
         # Subscribe to detection topics if tracking view is enabled
         if self.show_tracking:
             self.get_logger().info("Tracking view enabled - subscribing to detection topics...")
+            
+            # Subscribe to detection topics
             self.ball_sub = self.create_subscription(
                 String,
                 '/ball_coords',
@@ -169,17 +171,31 @@ class CameraNode(Node):
                 self.laser_pos_callback,
                 10
             )
-            # Start window thread for better responsiveness
-            cv2.startWindowThread()
-            # Create display window with proper flags for responsiveness
-            cv2.namedWindow("Camera Tracking View", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
-            cv2.resizeWindow("Camera Tracking View", 640, 640)
-            # Allow window to process events
-            cv2.waitKey(10)
-            # Create timer for display update (30 Hz)
-            self.display_timer = self.create_timer(1.0/30.0, self.update_display)
-            # Create timer to keep window responsive (call cv2.waitKey regularly)
-            self.cv_keepalive_timer = self.create_timer(0.033, self.opencv_keepalive)
+            
+            # Try to create GUI window (will fail on headless systems)
+            try:
+                # Check if DISPLAY is set (X11)
+                if 'DISPLAY' not in os.environ:
+                    raise RuntimeError("No DISPLAY environment variable (headless system)")
+                
+                # Start window thread for better responsiveness
+                cv2.startWindowThread()
+                # Create display window with proper flags for responsiveness
+                cv2.namedWindow("Camera Tracking View", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
+                cv2.resizeWindow("Camera Tracking View", 640, 640)
+                # Allow window to process events
+                cv2.waitKey(10)
+                # Create timer for display update (30 Hz)
+                self.display_timer = self.create_timer(1.0/30.0, self.update_display)
+                # Create timer to keep window responsive (call cv2.waitKey regularly)
+                self.cv_keepalive_timer = self.create_timer(0.033, self.opencv_keepalive)
+                
+                self.get_logger().info("OpenCV tracking window created successfully")
+            except (cv2.error, RuntimeError, Exception) as e:
+                self.get_logger().warn(f"Cannot create GUI window: {e}")
+                self.get_logger().warn("Running in HEADLESS mode (no display)")
+                self.get_logger().warn("  To suppress this warning: export SHOW_TRACKING_VIEW=0")
+                self.show_tracking = False
 
         signal.signal(signal.SIGINT, self._sig)
         signal.signal(signal.SIGTERM, self._sig)
