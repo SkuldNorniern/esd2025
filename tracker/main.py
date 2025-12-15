@@ -92,9 +92,9 @@ class Controller:
     """PID controller (P-only) for ball tracking"""
     
     def __init__(self, image_width: int, image_height: int):
-        # Proportional gains - increased for better tracking
-        self.kp_pan = 0.15
-        self.kp_tilt = 0.15
+        # Proportional gains - balanced for stable tracking
+        self.kp_pan = 0.12
+        self.kp_tilt = 0.12
         
         # Current servo positions (degrees)
         self.pan_angle = 90.0  # Start at center
@@ -111,15 +111,34 @@ class Controller:
         self.tilt_max = 180.0
         
         # Rate limiting (max change per update)
-        self.max_rate = 10.0  # Max 10 degrees per update for faster response
+        self.max_rate = 5.0  # Max 5 degrees per update to prevent overshoot
         
         self.last_update = time.time()
+        
+        # Track previous ball position to detect if ball is actually moving
+        self.last_ball_center_x: Optional[float] = None
+        self.last_ball_center_y: Optional[float] = None
+        self.position_change_threshold = 5.0  # Pixels - only move if ball moved more than this
     
     def update(self, x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float]:
         """Update servo positions based on ball detection"""
         # Calculate ball center
         ball_center_x = (x1 + x2) / 2.0
         ball_center_y = (y1 + y2) / 2.0
+        
+        # Check if ball position actually changed significantly
+        if self.last_ball_center_x is not None and self.last_ball_center_y is not None:
+            ball_moved_x = abs(ball_center_x - self.last_ball_center_x)
+            ball_moved_y = abs(ball_center_y - self.last_ball_center_y)
+            
+            # If ball hasn't moved much, don't update servos (prevents drift when ball is stationary)
+            if ball_moved_x < self.position_change_threshold and ball_moved_y < self.position_change_threshold:
+                # Ball is stationary, keep current servo positions
+                return (self.pan_angle, self.tilt_angle)
+        
+        # Update last known ball position
+        self.last_ball_center_x = ball_center_x
+        self.last_ball_center_y = ball_center_y
         
         # Calculate image center
         image_center_x = self.image_width / 2.0
@@ -133,16 +152,25 @@ class Controller:
         normalized_error_x = error_x / image_center_x
         normalized_error_y = error_y / image_center_y
         
-        # Apply P-control
-        # Positive error_x means ball is to the right, need to pan right (increase angle)
-        # Positive error_y means ball is below center, need to tilt down (increase angle)
-        # Note: If servos are mounted backwards, invert the signs
-        delta_pan = self.kp_pan * normalized_error_x * 90.0  # Scale to degrees
-        delta_tilt = self.kp_tilt * normalized_error_y * 90.0
+        # Add dead zone - don't move if error is very small (prevents jitter when ball is near center)
+        dead_zone = 0.10  # 10% of image size (about 64 pixels for 640x640)
+        if abs(normalized_error_x) < dead_zone:
+            # Ball is very close to center horizontally, don't move pan
+            delta_pan = 0.0
+        else:
+            # Apply P-control only if outside dead zone
+            # Positive error_x means ball is to the right, need to pan right (increase angle)
+            # Negative error_x means ball is to the left, need to pan left (decrease angle)
+            # Since pan always moves right regardless of ball position, we need to invert
+            delta_pan = -self.kp_pan * normalized_error_x * 90.0  # Scale to degrees, INVERTED
         
-        # Invert pan direction if servos are mounted backwards
-        # Based on logs, pan is going wrong direction, so invert it
-        delta_pan = -delta_pan
+        if abs(normalized_error_y) < dead_zone:
+            # Ball is very close to center vertically, don't move tilt
+            delta_tilt = 0.0
+        else:
+            # Apply P-control only if outside dead zone
+            # Positive error_y means ball is below center, need to tilt down (increase angle)
+            delta_tilt = self.kp_tilt * normalized_error_y * 90.0
         
         # Rate limiting
         elapsed = time.time() - self.last_update
@@ -279,6 +307,10 @@ class BallTrackerNode(Node):
                 error_x = ball_center_x - (self.image_width / 2.0)
                 error_y = ball_center_y - (self.image_height / 2.0)
                 
+                # Determine expected direction for debugging
+                expected_pan_dir = "right" if error_x > 0 else "left" if error_x < 0 else "center"
+                actual_pan_dir = "right" if pan_angle > 90 else "left" if pan_angle < 90 else "center"
+                
                 # Log less frequently to reduce spam
                 if not hasattr(self, '_log_counter'):
                     self._log_counter = 0
@@ -287,7 +319,8 @@ class BallTrackerNode(Node):
                 if self._log_counter % 5 == 0:  # Log every 5th update
                     self.get_logger().info(
                         f'Ball center: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
-                        f'error: ({error_x:.1f}, {error_y:.1f}) -> '
+                        f'error: ({error_x:.1f}, {error_y:.1f}), '
+                        f'expected pan: {expected_pan_dir}, actual pan: {actual_pan_dir} -> '
                         f'Pan: {pan_angle:.1f}°, Tilt: {tilt_angle:.1f}°'
                     )
                 
