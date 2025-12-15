@@ -34,7 +34,7 @@ impl std::fmt::Display for CameraError {
 impl std::error::Error for CameraError {}
 
 fn find_v4l_device() -> Result<String, CameraError> {
-    // Use /dev/video2 specifically as requested
+    // Use /dev/video1 which supports MJPEG
     let device_path = "/dev/video1";
     
     if std::path::Path::new(device_path).exists() {
@@ -123,13 +123,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Driver: {}", caps.driver);
 
     // Set format: 640x640 MJPEG (Motion JPEG, compressed format)
-    // MJPEG is more commonly supported by webcams and uses less bandwidth
+    // /dev/video1 supports MJPEG which is more efficient than raw formats
     let width = 640;
     let height = 640;
     
     let format = Format::new(width, height, v4l::FourCC::new(b"MJPG"));
     dev.set_format(&format)
-        .map_err(|e| CameraError::Format(format!("Failed to set format: {:?}", e)))?;
+        .map_err(|e| CameraError::Format(format!("Failed to set MJPEG format: {:?}", e)))?;
 
     // Verify the format was set correctly
     let actual_format = dev.format()
@@ -143,20 +143,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stride = actual_format.stride;
     let is_mjpeg = actual_format.fourcc.to_string() == "MJPG";
     
-    if is_mjpeg {
-        println!("Format: MJPEG (compressed JPEG, stride is 0 for compressed formats)");
-    } else {
-        println!("Stride (bytes per line): {} (expected: {})", 
-            stride, 
-            actual_format.width * 3);
-        if stride != actual_format.width * 3 && stride != 0 {
-            eprintln!("Warning: Stride mismatch! This may cause image corruption.");
-            eprintln!("  Using stride {} instead of expected {}", stride, actual_format.width * 3);
-        }
+    if !is_mjpeg {
+        return Err(CameraError::Format(format!(
+            "Failed to set MJPEG format. Camera returned format: {:?}",
+            actual_format.fourcc
+        )));
     }
     
-    // Store is_mjpeg for use in the capture loop
-    let format_is_mjpeg = is_mjpeg;
+    println!("Format: MJPEG (compressed JPEG, stride is 0 for compressed formats)");
+    
+    // MJPEG is required and verified above
+    let format_is_mjpeg = true;
 
     // Create capture stream with 4 buffers
     let mut stream = Stream::with_buffers(&mut dev, v4l::buffer::Type::VideoCapture, 4)
@@ -177,11 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!();
-    if format_is_mjpeg {
-        println!("Publishing MJPEG (compressed JPEG) images to /image topic (press Ctrl+C to stop)");
-    } else {
-        println!("Publishing RGB3/rgb24 (24-bit RGB 8-8-8) raw images to /image topic (press Ctrl+C to stop)");
-    }
+    println!("Publishing MJPEG (compressed JPEG) images to /image topic (press Ctrl+C to stop)");
 
     // Main capture loop
     // Note: stream.next() is a blocking call, but for camera frames it should return quickly (~33ms)

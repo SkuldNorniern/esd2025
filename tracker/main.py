@@ -132,14 +132,13 @@ class Controller:
         ball_height = abs(y2 - y1)
         ball_area = ball_width * ball_height
         
-        # Use provided laser position or fallback to image center
+        # Use provided laser position - if None, return current position (no movement)
         if laser_x is not None and laser_y is not None:
             target_x = laser_x
             target_y = laser_y
         else:
-            # Fallback to image center
-            target_x = self.image_width / 2.0
-            target_y = self.image_height / 2.0
+            # No laser position - return current position without movement
+            return (self.pan_angle, self.tilt_angle)
         
         # Calculate error relative to laser position
         error_x = ball_center_x - target_x
@@ -438,9 +437,13 @@ class BallTrackerNode(Node):
                     ball_max_y = max(y1, y2)
                     if (ball_min_x <= laser_x <= ball_max_x and 
                         ball_min_y <= laser_y <= ball_max_y):
-                        # Laser is within ball area - likely feedback loop, use image center instead
-                        laser_x = self.image_width / 2.0
-                        laser_y = self.image_height / 2.0
+                        # Laser is within ball area - likely feedback loop, reset servos to center
+                        if self.servo is not None:
+                            self.servo.set_pan(90.0)
+                            self.servo.set_tilt(90.0)
+                        # Reset controller to center position
+                        self.controller.reset_to_center()
+                        return  # Skip tracking when laser is in ball area (feedback loop)
                 else:
                     # No laser position available ("none") - reset servos to center
                     if self.servo is not None:
