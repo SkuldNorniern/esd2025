@@ -17,6 +17,7 @@ import sys
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from std_msgs.msg import String
     RCLPY_AVAILABLE = True
 except ImportError as e:
@@ -116,7 +117,9 @@ class Controller:
         self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.0)
         self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.0)
 
-        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", False)
+        # Default to inverted pan because the common physical pan linkage in this project
+        # makes "increase angle" move the laser left. Override with TRACKER_INVERT_PAN=0 if needed.
+        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", True)
         self.invert_tilt = self._env_bool("TRACKER_INVERT_TILT", False)
 
         self.pan_center = self._env_float("TRACKER_PAN_CENTER_DEG", 90.0)
@@ -146,6 +149,10 @@ class Controller:
         self.last_err_tilt_deg = 0.0
         self._ball_ema: Optional[Tuple[float, float]] = None
         self._laser_ema: Optional[Tuple[float, float]] = None
+        # Internal estimate of laser dot position in pixels.
+        # If `/laser_pos` is not available, we keep the last estimate and update it
+        # based on the commanded servo angles (open-loop).
+        self._laser_est_px: Optional[Tuple[float, float]] = None
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -178,23 +185,70 @@ class Controller:
             return math.degrees(math.atan(err_px / self.fy_px))
         return err_px * (self.vfov_deg / self.image_height)
 
+    def _deg_to_px_x(self, deg: float) -> float:
+        if self.fx_px > 0.0:
+            return math.tan(math.radians(deg)) * self.fx_px
+        return deg * (self.image_width / self.hfov_deg)
+
+    def _deg_to_px_y(self, deg: float) -> float:
+        if self.fy_px > 0.0:
+            return math.tan(math.radians(deg)) * self.fy_px
+        return deg * (self.image_height / self.vfov_deg)
+
+    def _laser_estimate_from_servo_angles(self) -> Tuple[float, float]:
+        """
+        Predict laser pixel position from current servo angles (open-loop).
+
+        Sign convention:
+        - If `invert_pan` is True, increasing pan angle moves the laser LEFT (negative x),
+          so x displacement uses a negative sign.
+        - If `invert_tilt` is True, increasing tilt angle moves the laser UP (negative y),
+          so y displacement uses a negative sign.
+        """
+        sign_pan = -1.0 if self.invert_pan else 1.0
+        sign_tilt = -1.0 if self.invert_tilt else 1.0
+
+        pan_delta_deg = self.pan_angle - self.pan_center
+        tilt_delta_deg = self.tilt_angle - self.tilt_center
+
+        x = self.cx_px + sign_pan * self._deg_to_px_x(pan_delta_deg)
+        y = self.cy_px + sign_tilt * self._deg_to_px_y(tilt_delta_deg)
+
+        # Clamp to image bounds
+        x = max(0.0, min(self.image_width - 1.0, x))
+        y = max(0.0, min(self.image_height - 1.0, y))
+        return (x, y)
+
     def update(
         self,
         ball_center_x: float,
         ball_center_y: float,
         ball_width: float,
         ball_height: float,
-        laser_x: float,
-        laser_y: float,
+        laser_x: Optional[float],
+        laser_y: Optional[float],
         now_s: float,
     ) -> Tuple[float, float]:
         """Update servo positions based on ball and laser positions in pixels."""
 
         # Smooth inputs (helps noisy detections / laser dot jitter).
         self._ball_ema = self._ema(self._ball_ema, ball_center_x, ball_center_y)
-        self._laser_ema = self._ema(self._laser_ema, laser_x, laser_y)
         ball_center_x, ball_center_y = self._ball_ema
-        laser_x, laser_y = self._laser_ema
+
+        # Laser position:
+        # - If a measurement is provided, use it (smoothed) and update our estimate.
+        # - If no measurement is provided, keep an estimate based on servo angles (open-loop).
+        if laser_x is not None and laser_y is not None:
+            self._laser_ema = self._ema(self._laser_ema, laser_x, laser_y)
+            laser_x, laser_y = self._laser_ema
+            self._laser_est_px = (laser_x, laser_y)
+        else:
+            if self._laser_est_px is None:
+                # Initialize estimate to center on first use.
+                self._laser_est_px = (self.cx_px, self.cy_px)
+            # Update estimate from the angles we are commanding.
+            laser_x, laser_y = self._laser_estimate_from_servo_angles()
+            self._laser_est_px = (laser_x, laser_y)
 
         # If laser is already within the ball bbox, hold position (no hunting).
         if abs(ball_center_x - laser_x) <= (ball_width / 2.0) and abs(ball_center_y - laser_y) <= (ball_height / 2.0):
@@ -293,6 +347,24 @@ class BallTrackerNode(Node):
             raise RuntimeError("rclpy not available")
         super().__init__('tracker_node')
         
+        # Print ROS environment that commonly breaks discovery (especially cross-device).
+        ros_domain_id = os.environ.get("ROS_DOMAIN_ID", "0")
+        ros_localhost_only = os.environ.get("ROS_LOCALHOST_ONLY", "0")
+        ros_auto_discovery_range = os.environ.get("ROS_AUTOMATIC_DISCOVERY_RANGE", "SUBNET")
+        rmw_impl = os.environ.get("RMW_IMPLEMENTATION", "(default)")
+        print("ROS environment:")
+        print(f"  ROS_DOMAIN_ID: {ros_domain_id}")
+        print(f"  ROS_LOCALHOST_ONLY: {ros_localhost_only}")
+        print(f"  ROS_AUTOMATIC_DISCOVERY_RANGE: {ros_auto_discovery_range}")
+        print(f"  RMW_IMPLEMENTATION: {rmw_impl}")
+        if ros_localhost_only not in ("0", "", "false", "False", "no", "NO"):
+            print("WARNING: ROS_LOCALHOST_ONLY is set. This blocks cross-device discovery.")
+            print("  Fix: `unset ROS_LOCALHOST_ONLY` or `export ROS_LOCALHOST_ONLY=0`")
+        if ros_auto_discovery_range in ("LOCALHOST", "OFF"):
+            print(f"WARNING: ROS_AUTOMATIC_DISCOVERY_RANGE={ros_auto_discovery_range} may block discovery.")
+            print("  Fix: `export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET`")
+        print()
+
         print("Initializing tracker node...")
         print("GPIO18: Pan servo (Left-Right)")
         print("GPIO19: Tilt servo (Up-Down)")
@@ -339,13 +411,22 @@ class BallTrackerNode(Node):
         self.timeout = 2.0
         self.last_detection_time = time.time()
         
+        # Use explicit QoS to avoid silent QoS incompatibilities.
+        # ball_detect publishes with r2r defaults (typically RELIABLE/VOLATILE).
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
         # Create subscriber for ball coordinates
         print("Subscribing to ball detection topic...")
         self.subscription = self.create_subscription(
             String,
             '/ball_coords',
             self.coords_callback,
-            10
+            qos
         )
         
         print("Subscriber created successfully")
@@ -361,7 +442,7 @@ class BallTrackerNode(Node):
             String,
             '/laser_pos',
             self.laser_callback,
-            10
+            qos
         )
         
         print("Laser position subscriber created")
@@ -459,9 +540,9 @@ class BallTrackerNode(Node):
                     laser_x, laser_y = self.laser_pos
                     laser_source = "measured"
                 else:
-                    laser_x = self.image_width / 2.0
-                    laser_y = self.image_height / 2.0
-                    laser_source = "assumed_center"
+                    # No laser measurement: let the controller use its internal estimate based on servo motion.
+                    laser_x, laser_y = None, None
+                    laser_source = "estimated"
                 
                 pan_angle, tilt_angle = self.controller.update(
                     ball_center_x=ball_center_x,
@@ -478,8 +559,13 @@ class BallTrackerNode(Node):
                     self.servo.set_tilt(tilt_angle)
                 
                 # Calculate error relative to actual laser position
-                error_x = ball_center_x - laser_x
-                error_y = ball_center_y - laser_y
+                # Use controller's current internal estimate for logging error.
+                if self.controller._laser_est_px is not None:
+                    lx, ly = self.controller._laser_est_px
+                else:
+                    lx, ly = (self.image_width / 2.0, self.image_height / 2.0)
+                error_x = ball_center_x - lx
+                error_y = ball_center_y - ly
                 
                 # Log less frequently to reduce spam
                 if not hasattr(self, '_log_counter'):
@@ -489,7 +575,7 @@ class BallTrackerNode(Node):
                 if self._log_counter % 3 == 0:  # Log every 3rd update for better debugging
                     self.get_logger().info(
                         f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
-                        f'Laser[{laser_source}]: ({laser_x:.1f}, {laser_y:.1f}), '
+                        f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
                         f'err: ({error_x:.1f}, {error_y:.1f}), '
                         f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
                     )
