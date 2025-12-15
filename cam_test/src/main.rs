@@ -196,13 +196,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.tick().await;
         
         // Dequeue a buffer (wait for frame)
-        // stream.next() is blocking but should return quickly for camera frames (~33ms)
-        // If it blocks indefinitely, the camera may have stopped or disconnected
-        // Note: This blocking call in async context can stall the runtime, but for camera
-        // frames it should be fast. If deadlocks occur, consider using spawn_blocking
-        // with proper stream handling (requires restructuring to move stream).
-        let (buffer, meta) = match stream.next() {
-            Ok(result) => result,
+        // stream.next() is blocking - use block_in_place to avoid stalling async runtime
+        // This allows the blocking call without moving the stream
+        let frame_start = std::time::Instant::now();
+        let result = tokio::task::block_in_place(|| {
+            stream.next()
+        });
+        
+        let elapsed = frame_start.elapsed();
+        if elapsed > Duration::from_millis(100) {
+            eprintln!("WARNING: stream.next() took {:?} (unusually long)", elapsed);
+        }
+        
+        let (buffer, meta) = match result {
+            Ok((buf, m)) => (buf, m),
             Err(e) => {
                 eprintln!("ERROR: Failed to capture frame: {:?}", e);
                 eprintln!("  Camera may have disconnected or stopped streaming.");
@@ -214,6 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         frame_count += 1;
+        
+        // Log every frame initially, then periodically to verify we're capturing
+        if frame_count <= 5 || frame_count % 30 == 0 {
+            println!("Captured frame #{} (seq: {}, bytes: {})", 
+                frame_count, meta.sequence, meta.bytesused);
+        }
 
         // Get frame dimensions from format
         let width = actual_format.width;
