@@ -3,7 +3,7 @@
 # Configuration matches config.toml defaults used by Rust version
 # Publishes to /image topic with sensor_msgs/Image (encoding="jpeg")
 # Environment variables for tuning:
-#   CAM_DEVICE_PATH: Camera device path (default: /dev/video0)
+#   CAM_DEVICE_PATH: Camera device path (default: /dev/video1, supports MJPEG natively)
 #   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 512x512 to match config.toml)
 #   CAM_FPS: Target FPS (default: 15)
 #   JPEG_QUALITY: JPEG compression quality 1-100 (default: 65)
@@ -68,8 +68,8 @@ class CameraNode(Node):
         # Publishes sensor_msgs/Image with encoding="jpeg" (MJPEG from camera)
         self.pub_image = self.create_publisher(Image, "/image", 10)
 
-        # Match config.toml defaults - device_path can be overridden with CAM_DEVICE_PATH
-        self.device_path = os.environ.get("CAM_DEVICE_PATH", "/dev/video0")
+        # Use video1 which supports MJPEG natively - can be overridden with CAM_DEVICE_PATH
+        self.device_path = os.environ.get("CAM_DEVICE_PATH", "/dev/video1")
         # Reduced resolution for Pi 3 - match config.toml defaults (512x512)
         self.req_w = int(os.environ.get("CAM_WIDTH", "512"))
         self.req_h = int(os.environ.get("CAM_HEIGHT", "512"))
