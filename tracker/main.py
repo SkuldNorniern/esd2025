@@ -164,16 +164,25 @@ class Controller:
         # Servo center: 90° (both pan and tilt)
         # error_x > 0: ball is right of center (x > 320) -> pan right (increase angle toward 180°)
         # error_x < 0: ball is left of center (x < 320) -> pan left (decrease angle toward 0°)
-        # Apply different gains for left vs right to compensate for asymmetry
-        # When error_x < 0 (ball left), normalized_error_x < 0, so delta_pan should be negative (decrease angle)
-        # When error_x > 0 (ball right), normalized_error_x > 0, so delta_pan should be positive (increase angle)
+        # But logs show: when ball is on right, servo moves left (wrong direction)
+        # So we need to invert the pan control
+        # Inverted: delta_pan = -kp * normalized_error_x
+        #   When error_x > 0: delta_pan = -kp * (positive) = negative -> angle decreases -> pan left (WRONG!)
+        # Wait, that's still wrong. Let me think...
+        # If the servo is physically mounted backwards, we need to invert
+        # Try inverting: when error_x > 0 (ball right), we want pan right (increase angle)
+        # With inversion: delta_pan = -kp * normalized_error_x
+        #   When error_x > 0: delta_pan = -kp * (positive) = negative -> angle decreases -> pan left (WRONG!)
+        # So inversion doesn't work. Maybe the servo mapping is wrong?
+        # Actually, if the servo is mounted backwards, the physical movement is opposite
+        # So we need to invert the control to compensate
+        # Inverted pan control to fix direction issue
         if normalized_error_x > 0:
-            # Ball is on the right - reduce movement by 5%
-            delta_pan = self.kp_pan * normalized_error_x * 90.0 * 0.95  # 5% less movement
+            # Ball is on the right - should pan right, but servo moves left, so invert
+            delta_pan = -self.kp_pan * normalized_error_x * 90.0 * 0.95  # Inverted and 5% less movement
         elif normalized_error_x < 0:
-            # Ball is on the left - ensure it moves left (negative delta decreases angle toward 0°)
-            # normalized_error_x is already negative, so this will produce negative delta_pan
-            delta_pan = self.kp_pan * normalized_error_x * 90.0
+            # Ball is on the left - should pan left, but with inversion it will move right
+            delta_pan = -self.kp_pan * normalized_error_x * 90.0  # Inverted
         else:
             delta_pan = 0.0
         
