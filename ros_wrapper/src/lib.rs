@@ -79,9 +79,9 @@ where
     let publisher = node.create_publisher::<T>(topic, qos)
         .map_err(|e| RosWrapperError::PublisherCreation(format!("{:?}", e)))?;
     
-    // Create channel with larger capacity for high-throughput topics (e.g., images)
-    // 500 frames at ~50KB each = ~25MB buffer
-    let (tx, mut rx) = mpsc::channel::<T>(500);
+    // Create channel with moderate capacity for image topics
+    // 200 frames at ~50KB each = ~10MB buffer (balanced approach)
+    let (tx, mut rx) = mpsc::channel::<T>(200);
     
     // Share node using Arc<Mutex> for background task
     let node_arc = Arc::new(Mutex::new(node));
@@ -89,57 +89,39 @@ where
     
     // Spawn background task to handle publishing and node spinning
     tokio::spawn(async move {
-        let spin_wait = Duration::from_millis(10); // Reduced from 50ms for faster processing
-        let spin_once_timeout = Duration::from_millis(1); // Reduced for more responsive spinning
-        let mut dropped_count = 0u64;
-        let mut published_count = 0u64;
-
         loop {
-            // Try to drain multiple messages quickly to catch up if falling behind
-            let mut batch_count = 0;
-            let max_batch = 10; // Process up to 10 messages per iteration
-            
-            loop {
-                match rx.try_recv() {
-                    Ok(msg) => {
-                        // Publish message to ROS topic
-                        if let Err(e) = publisher.publish(&msg) {
-                            eprintln!("Failed to publish message: {:?}", e);
-                        } else {
-                            published_count += 1;
-                        }
-                        batch_count += 1;
-                        
-                        // Break after max_batch to allow spinning
-                        if batch_count >= max_batch {
-                            break;
-                        }
+            // Try to get a message without blocking (use try_recv for high throughput)
+            match rx.try_recv() {
+                Ok(msg) => {
+                    // Publish message to ROS topic
+                    if let Err(e) = publisher.publish(&msg) {
+                        eprintln!("Failed to publish message: {:?}", e);
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        // No more messages ready, break to spin
-                        break;
+                    
+                    // Spin briefly after each publish to process DDS events
+                    // Use try_lock to avoid blocking if someone else has the lock
+                    if let Ok(mut node) = node_for_spin.try_lock() {
+                        // Use zero timeout to avoid blocking while holding the lock
+                        node.spin_once(Duration::from_millis(0));
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // Sender dropped, exit task
-                        return;
-                    }
+                    
+                    // Yield to allow other tasks to run (critical for tokio fairness)
+                    tokio::task::yield_now().await;
                 }
-            }
-            
-            // Spin the node to process DDS events
-            if let Ok(mut node) = node_for_spin.lock() {
-                node.spin_once(spin_once_timeout);
-            }
-            
-            // If no messages were processed, wait a bit
-            if batch_count == 0 {
-                tokio::time::sleep(spin_wait).await;
-            }
-            
-            // Log stats periodically
-            if published_count > 0 && published_count % 100 == 0 {
-                if dropped_count > 0 {
-                    eprintln!("ROS publisher: {} published, {} dropped", published_count, dropped_count);
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // No messages available, spin the node and wait briefly
+                    // Use try_lock to avoid blocking if someone else has the lock
+                    if let Ok(mut node) = node_for_spin.try_lock() {
+                        // Use zero timeout to avoid blocking while holding the lock
+                        node.spin_once(Duration::from_millis(0));
+                    }
+                    
+                    // Small sleep to avoid busy-waiting
+                    tokio::time::sleep(Duration::from_micros(500)).await;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Sender dropped, exit task
+                    break;
                 }
             }
         }
@@ -182,8 +164,8 @@ where
     let mut subscriber = node.subscribe::<T>(topic, qos)
         .map_err(|e| RosWrapperError::SubscriberCreation(format!("{:?}", e)))?;
     
-    // Create channel with larger capacity for high-throughput topics (e.g., images)
-    let (tx, rx) = mpsc::channel::<T>(500);
+    // Create channel with moderate capacity for image topics
+    let (tx, rx) = mpsc::channel::<T>(200);
     
     // Share node using Arc<Mutex> for background task
     let node_arc = Arc::new(Mutex::new(node));
@@ -192,7 +174,6 @@ where
     // Spawn background task to handle subscription and node spinning
     tokio::spawn(async move {
         let spin_wait = Duration::from_millis(50);
-        let spin_once_timeout = Duration::from_millis(10);
 
         loop {
             match tokio::time::timeout(spin_wait, subscriber.next()).await {
@@ -204,7 +185,9 @@ where
                     }
 
                     // Also spin after forwarding so DDS events keep flowing under high receive rates.
-                    if let Ok(mut node) = node_for_spin.lock() {
+                    // Use try_lock to avoid blocking if someone else has the lock
+                    if let Ok(mut node) = node_for_spin.try_lock() {
+                        // Use zero timeout to avoid blocking while holding the lock
                         node.spin_once(Duration::from_millis(0));
                     }
                 }
@@ -214,8 +197,10 @@ where
                 }
                 Err(_elapsed) => {
                     // Periodically spin the node to process DDS events
-                    if let Ok(mut node) = node_for_spin.lock() {
-                        node.spin_once(spin_once_timeout);
+                    // Use try_lock to avoid blocking if someone else has the lock
+                    if let Ok(mut node) = node_for_spin.try_lock() {
+                        // Use zero timeout to avoid blocking while holding the lock
+                        node.spin_once(Duration::from_millis(0));
                     }
                 }
             }
