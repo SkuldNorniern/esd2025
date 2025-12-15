@@ -3,13 +3,13 @@
 # Configuration matches config.toml defaults used by Rust version
 # Publishes to /image topic with sensor_msgs/Image (encoding="jpeg")
 # Environment variables for tuning:
-#   CAM_DEVICE_PATH: Camera device path (default: /dev/video1, supports MJPEG natively)
+#   CAM_DEVICE_PATH: Camera device path (default: /dev/video0, must support MJPEG)
 #   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 512x512 to match config.toml)
 #   CAM_FPS: Target FPS (default: 15)
 #   JPEG_QUALITY: JPEG compression quality 1-100 (default: 65)
 #   PUBLISH_EVERY_N: Publish every Nth frame (default: 3 to match config.toml)
 #   CAM_WARMUP: Number of frames to discard on startup (default: 10)
-#   SHOW_TRACKING_VIEW: Set to "1" to enable real-time tracking visualization (default: "0")
+#   SHOW_TRACKING_VIEW: Set to "0" to disable real-time tracking visualization (enabled by default)
 import os, sys, time, signal, warnings
 from typing import Optional, Tuple
 
@@ -68,8 +68,9 @@ class CameraNode(Node):
         # Publishes sensor_msgs/Image with encoding="jpeg" (MJPEG from camera)
         self.pub_image = self.create_publisher(Image, "/image", 10)
 
-        # Use video1 which supports MJPEG natively - can be overridden with CAM_DEVICE_PATH
-        self.device_path = os.environ.get("CAM_DEVICE_PATH", "/dev/video1")
+        # Use video0 by default (matches Rust version) - can be overridden with CAM_DEVICE_PATH
+        # If this device doesn't support MJPEG, try /dev/video1
+        self.device_path = os.environ.get("CAM_DEVICE_PATH", "/dev/video0")
         # Reduced resolution for Pi 3 - match config.toml defaults (512x512)
         self.req_w = int(os.environ.get("CAM_WIDTH", "512"))
         self.req_h = int(os.environ.get("CAM_HEIGHT", "512"))
@@ -77,8 +78,8 @@ class CameraNode(Node):
         # Lower JPEG quality for smaller file sizes - can be overridden with JPEG_QUALITY env var
         self.jpeg_quality = int(os.environ.get("JPEG_QUALITY", "65"))
 
-        # Enable tracking view with SHOW_TRACKING_VIEW=1
-        self.show_tracking = os.environ.get("SHOW_TRACKING_VIEW", "0") != "0"
+        # Tracking view enabled by default (disable with SHOW_TRACKING_VIEW=0)
+        self.show_tracking = os.environ.get("SHOW_TRACKING_VIEW", "1") != "0"
         
         # Tracking state (latest detections)
         self.ball_bbox: Optional[Tuple[float, float, float, float]] = None
@@ -94,8 +95,12 @@ class CameraNode(Node):
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open camera device: {self.device_path}")
 
-        # Ask for MJPG
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        # CRITICAL: Set FOURCC to MJPEG **BEFORE** setting resolution
+        # Some cameras require FOURCC to be set first
+        mjpg_fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        self.cap.set(cv2.CAP_PROP_FOURCC, mjpg_fourcc)
+        
+        # Now set resolution and FPS
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req_w)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req_h)
         self.cap.set(cv2.CAP_PROP_FPS, self.req_fps)
@@ -114,8 +119,16 @@ class CameraNode(Node):
         fourcc_str = "".join([chr((fourcc_code >> 8 * i) & 0xFF) for i in range(4)])
 
         self.get_logger().info(f"Camera negotiated: {self.width}x{self.height} {fourcc_str} fps={self.fps:.1f}")
+        
+        # STRICT CHECK: Fail if not MJPEG (like Rust version does)
         if fourcc_str != "MJPG":
-            self.get_logger().warn(f"Camera did not negotiate MJPG (got {fourcc_str}). You may get bandwidth issues.")
+            self.get_logger().error(f"Camera did not negotiate MJPEG (got {fourcc_str})!")
+            self.get_logger().error(f"  This camera does not support MJPEG encoding.")
+            self.get_logger().error(f"  Solutions:")
+            self.get_logger().error(f"    1. Try different device: export CAM_DEVICE_PATH=/dev/video1")
+            self.get_logger().error(f"    2. Check v4l2-ctl: v4l2-ctl -d {self.device_path} --list-formats-ext")
+            self.get_logger().error(f"    3. Some cameras have multiple /dev/videoN - one for MJPEG, one for raw")
+            raise RuntimeError(f"Camera must support MJPEG encoding (got {fourcc_str})")
         
         # Warn if resolution doesn't match requested
         if self.width != self.req_w or self.height != self.req_h:
@@ -179,9 +192,14 @@ class CameraNode(Node):
         self.get_logger().info("  /image (sensor_msgs/Image, encoding='jpeg', MJPEG compressed)")
         if self.show_tracking:
             self.get_logger().info("")
-            self.get_logger().info("Tracking view enabled:")
+            self.get_logger().info("Tracking view: ENABLED")
             self.get_logger().info("  Subscribing to /ball_coords and /laser_pos")
             self.get_logger().info("  Real-time visualization in OpenCV window")
+            self.get_logger().info("  (Set SHOW_TRACKING_VIEW=0 to disable)")
+        else:
+            self.get_logger().info("")
+            self.get_logger().info("Tracking view: DISABLED")
+            self.get_logger().info("  (Set SHOW_TRACKING_VIEW=1 to enable)")
         self.get_logger().info("")
         self.get_logger().info("Press Ctrl+C to stop.")
     
