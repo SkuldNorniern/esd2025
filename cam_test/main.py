@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # Optimized for Raspberry Pi 3 - reduced resolution, FPS, and frame skipping
+# Configuration matches config.toml defaults used by Rust version
 # Environment variables for tuning:
-#   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 480x360)
+#   CAM_DEVICE_PATH: Camera device path (default: /dev/video0)
+#   CAM_WIDTH, CAM_HEIGHT: Resolution (default: 512x512 to match config.toml)
 #   CAM_FPS: Target FPS (default: 15)
 #   JPEG_QUALITY: JPEG compression quality 1-100 (default: 65)
-#   PUBLISH_EVERY_N: Skip N-1 frames between publishes (default: 3)
+#   PUBLISH_EVERY_N: Publish every Nth frame (default: 3 to match config.toml)
 #   PUBLISH_RAW: Set to "1" to enable raw RGB8 publishing (default: "0")
 #   CAM_WARMUP: Number of frames to discard on startup (default: 10)
 import os, sys, time, signal, warnings
@@ -39,10 +41,11 @@ class CameraNode(Node):
         # Add proper compressed stream (JPEG)
         self.pub_jpeg = self.create_publisher(CompressedImage, "/image/compressed", 10)
 
-        self.device_path = "/dev/video1"
-        # Reduced resolution for Pi 3 - can be overridden with CAM_WIDTH/CAM_HEIGHT env vars
-        self.req_w = int(os.environ.get("CAM_WIDTH", "480"))
-        self.req_h = int(os.environ.get("CAM_HEIGHT", "360"))
+        # Match config.toml defaults - device_path can be overridden with CAM_DEVICE_PATH
+        self.device_path = os.environ.get("CAM_DEVICE_PATH", "/dev/video0")
+        # Reduced resolution for Pi 3 - match config.toml defaults (512x512)
+        self.req_w = int(os.environ.get("CAM_WIDTH", "512"))
+        self.req_h = int(os.environ.get("CAM_HEIGHT", "512"))
         self.req_fps = int(os.environ.get("CAM_FPS", "15"))  # Reduced FPS for Pi 3
         # Lower JPEG quality for smaller file sizes - can be overridden with JPEG_QUALITY env var
         self.jpeg_quality = int(os.environ.get("JPEG_QUALITY", "65"))
@@ -81,6 +84,13 @@ class CameraNode(Node):
         self.get_logger().info(f"Camera negotiated: {self.width}x{self.height} {fourcc_str} fps={self.fps:.1f}")
         if fourcc_str != "MJPG":
             self.get_logger().warn(f"Camera did not negotiate MJPG (got {fourcc_str}). You may get bandwidth issues.")
+        
+        # Warn if resolution doesn't match requested
+        if self.width != self.req_w or self.height != self.req_h:
+            self.get_logger().warn(
+                f"Camera negotiated {self.width}x{self.height} instead of requested {self.req_w}x{self.req_h}. "
+                f"This is normal - camera may not support exact resolution."
+            )
 
         # Warm up / flush junk frames (reduced for faster startup)
         warmup_frames = int(os.environ.get("CAM_WARMUP", "10"))
@@ -99,9 +109,23 @@ class CameraNode(Node):
         signal.signal(signal.SIGINT, self._sig)
         signal.signal(signal.SIGTERM, self._sig)
 
+        self.get_logger().info("")
+        self.get_logger().info("ROS Configuration:")
+        self.get_logger().info(f"  ROS_DOMAIN_ID: {os.environ.get('ROS_DOMAIN_ID', '0')}")
+        self.get_logger().info("")
+        self.get_logger().info("Camera Configuration:")
+        self.get_logger().info(f"  Device: {self.device_path}")
+        self.get_logger().info(f"  Resolution: {self.width}x{self.height}")
+        self.get_logger().info(f"  FPS: {self.fps:.1f}")
+        self.get_logger().info(f"  Format: {fourcc_str}")
+        self.get_logger().info(f"  Publish every Nth frame: {self.publish_every_n}")
+        self.get_logger().info(f"  JPEG quality: {self.jpeg_quality}")
+        self.get_logger().info(f"  Publish raw RGB8: {self.publish_raw}")
+        self.get_logger().info("")
         self.get_logger().info("Publishing:")
         self.get_logger().info("  /image            (sensor_msgs/Image, rgb8)  [if PUBLISH_RAW=1]")
         self.get_logger().info("  /image/compressed (sensor_msgs/CompressedImage, jpeg)")
+        self.get_logger().info("")
         self.get_logger().info("Press Ctrl+C to stop.")
 
     def _sig(self, *_):
@@ -134,7 +158,7 @@ class CameraNode(Node):
 
         # Publish throttling (reduce network overhead)
         self.frame_count += 1
-        if self.frame_count % self.publish_every_n == 0:
+        if self.frame_count % self.publish_every_n != 0:
             return
 
         # 1) Publish raw /image (RGB8) for compatibility with your existing pipeline
@@ -168,9 +192,12 @@ class CameraNode(Node):
         cmsg.format = "jpeg"
         cmsg.data = jpeg.tobytes()
         self.pub_jpeg.publish(cmsg)
-        if self.frame_count % 30 == 0:
+        
+        # Log first few frames and then periodically
+        if self.frame_count <= 5 or self.frame_count % 60 == 0:
             self.get_logger().info(
-                f"Published #{self.frame_count} {w}x{h} jpeg={len(cmsg.data)}B bad={self.bad_count}"
+                f"Published frame #{self.frame_count}: {w}x{h} MJPEG ({len(cmsg.data)} bytes compressed, "
+                f"skip={self.publish_every_n}, bad={self.bad_count})"
             )
 
 def main():
