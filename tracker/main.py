@@ -165,11 +165,14 @@ class Controller:
         # error_x > 0: ball is right of center (x > 320) -> pan right (increase angle toward 180°)
         # error_x < 0: ball is left of center (x < 320) -> pan left (decrease angle toward 0°)
         # Apply different gains for left vs right to compensate for asymmetry
+        # When error_x < 0 (ball left), normalized_error_x < 0, so delta_pan should be negative (decrease angle)
+        # When error_x > 0 (ball right), normalized_error_x > 0, so delta_pan should be positive (increase angle)
         if normalized_error_x > 0:
             # Ball is on the right - reduce movement by 5%
             delta_pan = self.kp_pan * normalized_error_x * 90.0 * 0.95  # 5% less movement
         elif normalized_error_x < 0:
-            # Ball is on the left - full movement
+            # Ball is on the left - ensure it moves left (negative delta decreases angle toward 0°)
+            # normalized_error_x is already negative, so this will produce negative delta_pan
             delta_pan = self.kp_pan * normalized_error_x * 90.0
         else:
             delta_pan = 0.0
@@ -196,8 +199,10 @@ class Controller:
         
         # Add dead zone to prevent micro-movements and overshooting
         # Larger dead zone to prevent moving past stationary ball
+        # But don't apply dead zone to left side to ensure it moves
         dead_zone = 0.08  # 8% of image size (about 51 pixels for 640x640)
-        if abs(normalized_error_x) < dead_zone:
+        if abs(normalized_error_x) < dead_zone and normalized_error_x >= 0:
+            # Only apply dead zone for right side or center, not left side
             delta_pan = 0.0
         if abs(normalized_error_y) < dead_zone:
             delta_tilt = 0.0
