@@ -114,12 +114,12 @@ class Controller:
         self.cy_px = self._env_float("TRACKER_CY_PX", self.image_height / 2.0)
 
         # Control gains (units: degrees of servo change per degree of angular error).
-        # REDUCED for slow, smooth tracking that camera can follow
-        # Lower Kp = gentler response, less overshoot, easier for camera to track
-        self.kp_pan = self._env_float("TRACKER_KP_PAN", 0.5)
-        self.kp_tilt = self._env_float("TRACKER_KP_TILT", 0.5)
-        self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.05)
-        self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.05)
+        # Increased for more responsive tracking while maintaining stability
+        # Higher Kp = faster response, but may overshoot if too high
+        self.kp_pan = self._env_float("TRACKER_KP_PAN", 0.8)
+        self.kp_tilt = self._env_float("TRACKER_KP_TILT", 0.8)
+        self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.08)
+        self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.08)
 
         # Physical servo-to-laser mapping (verified from measurements):
         #   Pan INCREASE = Laser moves RIGHT (X increases)
@@ -161,8 +161,9 @@ class Controller:
         self.max_dt_s = self._env_float("TRACKER_MAX_DT_S", 0.08)
         # - Additionally clamp the *per tick* movement (degrees), independent of dt.
         # CRITICAL: Must be small enough for camera to track laser between frames
-        # At 30Hz, max_step=2.0° means laser moves ~20-40px per frame (trackable)
-        self.max_step_deg = self._env_float("TRACKER_MAX_STEP_DEG", 2.0)
+        # Increased to 3.5° for more responsive tracking while still trackable
+        # At 15Hz, max_step=3.5° means laser moves ~30-50px per frame (trackable)
+        self.max_step_deg = self._env_float("TRACKER_MAX_STEP_DEG", 3.5)
 
         # Small deadband in angular domain to prevent buzzing
         self.deadband_deg = self._env_float("TRACKER_DEADBAND_DEG", 0.3)
@@ -172,15 +173,39 @@ class Controller:
         # Higher alpha = more responsive but jittery
         self.ema_alpha = self._env_float("TRACKER_EMA_ALPHA", 0.3)
 
+        # Predictive tracking: estimate ball velocity and predict future position
+        # Prediction horizon accounts for control loop delay + servo response time
+        # Increased to 0.25s (250ms) for better prediction of fast-moving balls
+        self.prediction_horizon_s = self._env_float("TRACKER_PREDICTION_HORIZON_S", 0.25)
+        # Velocity smoothing factor (EMA alpha for velocity estimates)
+        # Increased to 0.6 for more responsive velocity tracking
+        self.velocity_ema_alpha = self._env_float("TRACKER_VELOCITY_EMA_ALPHA", 0.6)
+        # Minimum velocity magnitude (px/s) to enable prediction (reduces jitter when ball is stationary)
+        self.min_velocity_px_s = self._env_float("TRACKER_MIN_VELOCITY_PX_S", 10.0)
+        # Enable/disable prediction (default: enabled)
+        self.prediction_enabled = self._env_bool("TRACKER_PREDICTION_ENABLED", True)
+        # Adaptive prediction horizon: scale prediction based on ball speed
+        # Fast balls get longer prediction horizon
+        self.adaptive_prediction_enabled = self._env_bool("TRACKER_ADAPTIVE_PREDICTION", True)
+        self.max_prediction_horizon_s = self._env_float("TRACKER_MAX_PREDICTION_HORIZON_S", 0.4)
+
         self.last_update = time.time()
         self.last_err_pan_deg = 0.0
         self.last_err_tilt_deg = 0.0
         self._ball_ema: Optional[Tuple[float, float]] = None
         self._laser_ema: Optional[Tuple[float, float]] = None
+        # Ball velocity tracking (px/s) - smoothed with EMA
+        self._ball_velocity_px_s: Optional[Tuple[float, float]] = None
+        self._last_ball_pos_for_velocity: Optional[Tuple[float, float, float]] = None  # (x, y, time)
         # Internal estimate of laser dot position in pixels.
         # If `/laser_pos` is not available, we keep the last estimate and update it
         # based on the commanded servo angles (open-loop).
         self._laser_est_px: Optional[Tuple[float, float]] = None
+        
+        # Debug tracking: store recent predictions and actual positions for analysis
+        self._prediction_history: list = []  # (predicted_x, predicted_y, actual_x, actual_y, time)
+        self._control_output_history: list = []  # (P_term, I_term, D_term, total_delta)
+        self._last_predicted_pos: Optional[Tuple[float, float]] = None
         
         # Track error magnitude for adaptive control
         self._error_history: list = []
@@ -261,6 +286,68 @@ class Controller:
         x = max(0.0, min(self.image_width - 1.0, x))
         y = max(0.0, min(self.image_height - 1.0, y))
         return (x, y)
+    
+    def _update_ball_velocity(self, ball_x: float, ball_y: float, now_s: float) -> None:
+        """Update ball velocity estimate using EMA smoothing."""
+        if self._last_ball_pos_for_velocity is None:
+            self._last_ball_pos_for_velocity = (ball_x, ball_y, now_s)
+            self._ball_velocity_px_s = (0.0, 0.0)
+            return
+        
+        prev_x, prev_y, prev_time = self._last_ball_pos_for_velocity
+        dt = max(0.001, now_s - prev_time)
+        
+        # Calculate instantaneous velocity
+        vx_inst = (ball_x - prev_x) / dt
+        vy_inst = (ball_y - prev_y) / dt
+        
+        # Smooth velocity with EMA
+        if self._ball_velocity_px_s is None:
+            self._ball_velocity_px_s = (vx_inst, vy_inst)
+        else:
+            vx_prev, vy_prev = self._ball_velocity_px_s
+            alpha = max(0.0, min(1.0, self.velocity_ema_alpha))
+            vx_smooth = vx_prev * (1.0 - alpha) + vx_inst * alpha
+            vy_smooth = vy_prev * (1.0 - alpha) + vy_inst * alpha
+            self._ball_velocity_px_s = (vx_smooth, vy_smooth)
+        
+        self._last_ball_pos_for_velocity = (ball_x, ball_y, now_s)
+    
+    def _predict_ball_position(self, ball_x: float, ball_y: float) -> Tuple[float, float]:
+        """
+        Predict future ball position based on velocity estimate.
+        Returns predicted (x, y) position, or current position if prediction is disabled/unreliable.
+        Uses adaptive prediction horizon based on ball speed for better tracking.
+        """
+        if not self.prediction_enabled or self._ball_velocity_px_s is None:
+            return (ball_x, ball_y)
+        
+        vx, vy = self._ball_velocity_px_s
+        velocity_magnitude = math.sqrt(vx**2 + vy**2)
+        
+        # Only predict if velocity is significant (reduces jitter when ball is stationary)
+        if velocity_magnitude < self.min_velocity_px_s:
+            return (ball_x, ball_y)
+        
+        # Adaptive prediction horizon: faster balls get longer prediction
+        # Scale from base horizon to max horizon based on velocity magnitude
+        # Normalize velocity to 0-1 range (assuming max ~500 px/s for fast ball)
+        if self.adaptive_prediction_enabled:
+            max_expected_velocity = 500.0  # px/s
+            velocity_factor = min(1.0, velocity_magnitude / max_expected_velocity)
+            # Scale prediction horizon: base at low speed, max at high speed
+            effective_horizon = self.prediction_horizon_s + (
+                (self.max_prediction_horizon_s - self.prediction_horizon_s) * velocity_factor
+            )
+        else:
+            effective_horizon = self.prediction_horizon_s
+        
+        # Predict future position: current + velocity * prediction_horizon
+        pred_x = ball_x + vx * effective_horizon
+        pred_y = ball_y + vy * effective_horizon
+        
+        # Clamp to image bounds
+        return self._clamp_px(pred_x, pred_y)
     
     def _auto_tune_gains(self) -> None:
         """Automatically adjust control gains based on tracking performance."""
@@ -351,7 +438,22 @@ class Controller:
 
         # Smooth inputs (helps noisy detections / laser dot jitter).
         self._ball_ema = self._ema(self._ball_ema, ball_center_x, ball_center_y)
-        ball_center_x, ball_center_y = self._ball_ema
+        ball_center_x_smooth, ball_center_y_smooth = self._ball_ema
+        
+        # Update velocity estimate from smoothed position
+        self._update_ball_velocity(ball_center_x_smooth, ball_center_y_smooth, now_s)
+        
+        # Predict future ball position for better tracking
+        ball_center_x_pred, ball_center_y_pred = self._predict_ball_position(
+            ball_center_x_smooth, ball_center_y_smooth
+        )
+        
+        # Store prediction for debug analysis
+        self._last_predicted_pos = (ball_center_x_pred, ball_center_y_pred)
+        
+        # Use predicted position for control (aim ahead of the ball)
+        ball_center_x = ball_center_x_pred
+        ball_center_y = ball_center_y_pred
 
         laser_measured = (laser_x is not None) and (laser_y is not None)
 
@@ -462,13 +564,34 @@ class Controller:
         kd_pan_effective = self._kd_pan_adaptive
         kd_tilt_effective = self._kd_tilt_adaptive
         
-        # PID control law
-        delta_pan = (kp_pan_effective * err_pan_deg + 
-                     kd_pan_effective * derr_pan + 
-                     self._ki_pan * self._integral_pan_deg)
-        delta_tilt = (kp_tilt_effective * err_tilt_deg + 
-                      kd_tilt_effective * derr_tilt + 
-                      self._ki_tilt * self._integral_tilt_deg)
+        # Error-dependent gain scaling: increase gains when error is large for faster response
+        # This helps catch up quickly when ball is far away
+        error_magnitude_deg = math.sqrt(err_pan_deg**2 + err_tilt_deg**2)
+        if error_magnitude_deg > 5.0:  # Large error threshold (degrees)
+            # Scale up gains by up to 1.5x for very large errors
+            error_scale = min(1.5, 1.0 + (error_magnitude_deg - 5.0) / 10.0)
+            kp_pan_effective *= error_scale
+            kp_tilt_effective *= error_scale
+        
+        # PID control law - store individual terms for debug
+        p_term_pan = kp_pan_effective * err_pan_deg
+        d_term_pan = kd_pan_effective * derr_pan
+        i_term_pan = self._ki_pan * self._integral_pan_deg
+        delta_pan = p_term_pan + d_term_pan + i_term_pan
+        
+        p_term_tilt = kp_tilt_effective * err_tilt_deg
+        d_term_tilt = kd_tilt_effective * derr_tilt
+        i_term_tilt = self._ki_tilt * self._integral_tilt_deg
+        delta_tilt = p_term_tilt + d_term_tilt + i_term_tilt
+        
+        # Store control output breakdown for debug
+        self._control_output_history.append({
+            'pan': {'P': p_term_pan, 'I': i_term_pan, 'D': d_term_pan, 'total': delta_pan},
+            'tilt': {'P': p_term_tilt, 'I': i_term_tilt, 'D': d_term_tilt, 'total': delta_tilt},
+            'time': now_s
+        })
+        if len(self._control_output_history) > 20:
+            self._control_output_history.pop(0)
 
         if self.invert_pan:
             delta_pan = -delta_pan
@@ -517,6 +640,16 @@ class Controller:
         self.last_update = now_s
         self.last_err_pan_deg = err_pan_deg
         self.last_err_tilt_deg = err_tilt_deg
+        
+        # Store prediction vs actual for debug (will be compared in next update)
+        if self._last_predicted_pos is not None:
+            self._prediction_history.append({
+                'predicted': self._last_predicted_pos,
+                'actual': (ball_center_x_smooth, ball_center_y_smooth),
+                'time': now_s
+            })
+            if len(self._prediction_history) > 30:
+                self._prediction_history.pop(0)
 
         return (self.pan_angle, self.tilt_angle)
     
@@ -532,6 +665,15 @@ class Controller:
         self._integral_pan_deg = 0.0
         self._integral_tilt_deg = 0.0
         self._stuck_counter = 0
+        
+        # Reset velocity tracking
+        self._ball_velocity_px_s = None
+        self._last_ball_pos_for_velocity = None
+        
+        # Reset debug tracking
+        self._prediction_history = []
+        self._control_output_history = []
+        self._last_predicted_pos = None
 
     def reset_laser_estimate_to_center(self) -> None:
         """
@@ -769,6 +911,17 @@ class BallTrackerNode(Node):
         print(f"  Ball position EMA: α={self.controller.ema_alpha}")
         print(f"  Deadband: {self.controller.deadband_deg}° (prevents buzzing)")
         print(f"  Max dt: {self.controller.max_dt_s}s (rate limiter clamp)")
+        print()
+        print(f"Predictive Tracking:")
+        print(f"  Enabled: {'YES' if self.controller.prediction_enabled else 'NO'}")
+        if self.controller.prediction_enabled:
+            print(f"  Base prediction horizon: {self.controller.prediction_horizon_s*1000:.0f}ms")
+            if self.controller.adaptive_prediction_enabled:
+                print(f"  Adaptive prediction: YES (max: {self.controller.max_prediction_horizon_s*1000:.0f}ms)")
+                print(f"    - Faster balls get longer prediction horizon")
+            print(f"  Velocity EMA: α={self.controller.velocity_ema_alpha}")
+            print(f"  Min velocity: {self.controller.min_velocity_px_s:.0f} px/s (to enable prediction)")
+            print(f"  (Aims ahead of ball based on velocity estimate)")
         print("=" * 60)
         print()
     
@@ -838,6 +991,9 @@ class BallTrackerNode(Node):
                                 f"Rejected detector jump: dx={dx:.1f}px dy={dy:.1f}px dt={dt:.3f}s "
                                 f"(limit {self.max_jump_px_s:.0f}px/s)"
                             )
+                        # Reset velocity tracking on glitch to avoid bad predictions
+                        self.controller._ball_velocity_px_s = None
+                        self.controller._last_ball_pos_for_velocity = None
                         return
 
                 self._last_ball_center = (ball_center_x, ball_center_y)
@@ -1053,13 +1209,66 @@ class BallTrackerNode(Node):
                         self._prev_pan_log = pan_angle
                         self._prev_tilt_log = tilt_angle
                     
+                    # Enhanced velocity and prediction info
+                    velocity_info = ""
+                    prediction_info = ""
+                    if self.controller.prediction_enabled and self.controller._ball_velocity_px_s is not None:
+                        vx, vy = self.controller._ball_velocity_px_s
+                        vel_mag = math.sqrt(vx**2 + vy**2)
+                        
+                        # Calculate effective prediction horizon
+                        if self.controller.adaptive_prediction_enabled:
+                            max_expected_velocity = 500.0
+                            velocity_factor = min(1.0, vel_mag / max_expected_velocity)
+                            effective_horizon = self.controller.prediction_horizon_s + (
+                                (self.controller.max_prediction_horizon_s - self.controller.prediction_horizon_s) * velocity_factor
+                            )
+                        else:
+                            effective_horizon = self.controller.prediction_horizon_s
+                        
+                        if vel_mag >= self.controller.min_velocity_px_s:
+                            velocity_info = f" | vel: ({vx:+.0f},{vy:+.0f})px/s mag:{vel_mag:.0f}"
+                            prediction_info = f" | pred_horizon: {effective_horizon*1000:.0f}ms"
+                            
+                            # Show prediction vs actual if available
+                            if self.controller._last_predicted_pos is not None:
+                                pred_x, pred_y = self.controller._last_predicted_pos
+                                pred_error = math.sqrt((pred_x - ball_center_x)**2 + (pred_y - ball_center_y)**2)
+                                prediction_info += f" pred_err:{pred_error:.1f}px"
+                        else:
+                            velocity_info = f" | vel: ({vx:+.0f},{vy:+.0f})px/s (low)"
+                    
+                    # Get control output breakdown for debug
+                    control_debug = ""
+                    if self.controller._control_output_history:
+                        latest = self.controller._control_output_history[-1]
+                        pan_ctrl = latest['pan']
+                        tilt_ctrl = latest['tilt']
+                        control_debug = (
+                            f" | PID[pan]: P:{pan_ctrl['P']:+.2f} I:{pan_ctrl['I']:+.2f} D:{pan_ctrl['D']:+.2f} "
+                            f"PID[tilt]: P:{tilt_ctrl['P']:+.2f} I:{tilt_ctrl['I']:+.2f} D:{tilt_ctrl['D']:+.2f}"
+                        )
+                    
+                    # Calculate prediction accuracy if we have history
+                    pred_accuracy = ""
+                    if len(self.controller._prediction_history) >= 5:
+                        recent_preds = self.controller._prediction_history[-5:]
+                        total_pred_error = 0.0
+                        for entry in recent_preds:
+                            pred_x, pred_y = entry['predicted']
+                            actual_x, actual_y = entry['actual']
+                            err = math.sqrt((pred_x - actual_x)**2 + (pred_y - actual_y)**2)
+                            total_pred_error += err
+                        avg_pred_error = total_pred_error / len(recent_preds)
+                        pred_accuracy = f" | pred_accuracy: {avg_pred_error:.1f}px (avg)"
+                    
                     # Include adaptive gain info if enabled
                     if self.controller._adaptive_enabled:
                         self.get_logger().info(
                             f'Ball: ({ball_center_x:.0f},{ball_center_y:.0f}), '
                             f'Laser[{laser_source}]: ({lx:.0f},{ly:.0f}), '
                             f'error: {error_magnitude:.1f}px{error_trend} ({error_x:+.0f},{error_y:+.0f}), '
-                            f'servo: pan={pan_angle:.1f}° tilt={tilt_angle:.1f}°{servo_delta} | '
+                            f'servo: pan={pan_angle:.1f}° tilt={tilt_angle:.1f}°{servo_delta}{velocity_info}{prediction_info}{pred_accuracy}{control_debug} | '
                             f'Kp:{self.controller._kp_pan_adaptive:.2f}/{self.controller._kp_tilt_adaptive:.2f} '
                             f'Ki:{self.controller._ki_pan:.3f}/{self.controller._ki_tilt:.3f}'
                         )
@@ -1068,7 +1277,7 @@ class BallTrackerNode(Node):
                             f'Ball: ({ball_center_x:.0f},{ball_center_y:.0f}), '
                             f'Laser[{laser_source}]: ({lx:.0f},{ly:.0f}), '
                             f'error: {error_magnitude:.1f}px{error_trend} ({error_x:+.0f},{error_y:+.0f}), '
-                            f'servo: pan={pan_angle:.1f}° tilt={tilt_angle:.1f}°{servo_delta}'
+                            f'servo: pan={pan_angle:.1f}° tilt={tilt_angle:.1f}°{servo_delta}{velocity_info}{prediction_info}{pred_accuracy}{control_debug}'
                         )
                 
                 self.last_detection_time = current_time
