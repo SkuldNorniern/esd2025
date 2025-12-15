@@ -170,6 +170,35 @@ class Controller:
         # Track error magnitude for adaptive control
         self._error_history: list = []
         self._stuck_counter = 0
+        
+        # Adaptive tuning state
+        self._adaptive_enabled = self._env_bool("TRACKER_ADAPTIVE", True)
+        self._kp_pan_adaptive = self.kp_pan
+        self._kp_tilt_adaptive = self.kp_tilt
+        self._kd_pan_adaptive = self.kd_pan
+        self._kd_tilt_adaptive = self.kd_tilt
+        
+        # Performance tracking for auto-tuning
+        self._convergence_history: list = []  # Track if error is decreasing
+        self._oscillation_detector_pan: list = []  # Detect sign flips (oscillation)
+        self._oscillation_detector_tilt: list = []
+        self._last_adjustment_time = time.time()
+        self._adjustment_interval = 2.0  # Adjust gains every 2 seconds
+        
+        # Integral terms for steady-state error correction (I in PID)
+        self._integral_pan_deg = 0.0
+        self._integral_tilt_deg = 0.0
+        self._ki_pan = self._env_float("TRACKER_KI_PAN", 0.0)
+        self._ki_tilt = self._env_float("TRACKER_KI_TILT", 0.0)
+        self._integral_max_deg = 10.0  # Anti-windup limit
+        
+        # Tuning info for logging
+        self._last_tune_info = {
+            'avg_error': 0.0,
+            'pan_osc': False,
+            'tilt_osc': False,
+            'kp_changed': False
+        }
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -216,6 +245,81 @@ class Controller:
         x = max(0.0, min(self.image_width - 1.0, x))
         y = max(0.0, min(self.image_height - 1.0, y))
         return (x, y)
+    
+    def _auto_tune_gains(self) -> None:
+        """Automatically adjust control gains based on tracking performance."""
+        if len(self._error_history) < 8:
+            return
+        
+        # Analyze recent error trend
+        recent_errors = self._error_history[-8:]
+        avg_error = sum(recent_errors) / len(recent_errors)
+        error_trend = recent_errors[-1] - recent_errors[0]  # Positive = getting worse
+        error_variance = sum((e - avg_error)**2 for e in recent_errors) / len(recent_errors)
+        
+        # Detect oscillations (sign flips in error signal)
+        pan_oscillating = self._detect_oscillation(self._oscillation_detector_pan)
+        tilt_oscillating = self._detect_oscillation(self._oscillation_detector_tilt)
+        
+        # Tune Pan gains
+        if pan_oscillating:
+            # Reduce gains to dampen oscillation
+            self._kp_pan_adaptive *= 0.85
+            self._kd_pan_adaptive *= 1.1  # Increase damping
+        elif avg_error > 3.0 and error_trend >= 0:
+            # Error is large and not improving - increase Kp
+            self._kp_pan_adaptive = min(2.5, self._kp_pan_adaptive * 1.15)
+            # Enable integral term if stuck with steady-state error
+            if self._ki_pan == 0.0:
+                self._ki_pan = 0.05
+        elif avg_error < 0.8:
+            # Tracking well - slightly reduce gains for smoothness
+            self._kp_pan_adaptive = max(self.kp_pan * 0.8, self._kp_pan_adaptive * 0.98)
+        
+        # Tune Tilt gains (same logic)
+        if tilt_oscillating:
+            self._kp_tilt_adaptive *= 0.85
+            self._kd_tilt_adaptive *= 1.1
+        elif avg_error > 3.0 and error_trend >= 0:
+            self._kp_tilt_adaptive = min(2.5, self._kp_tilt_adaptive * 1.15)
+            if self._ki_tilt == 0.0:
+                self._ki_tilt = 0.05
+        elif avg_error < 0.8:
+            self._kp_tilt_adaptive = max(self.kp_tilt * 0.8, self._kp_tilt_adaptive * 0.98)
+        
+        # Bounds checking
+        prev_kp_pan = self._kp_pan_adaptive
+        prev_kp_tilt = self._kp_tilt_adaptive
+        
+        self._kp_pan_adaptive = max(0.3, min(3.0, self._kp_pan_adaptive))
+        self._kp_tilt_adaptive = max(0.3, min(3.0, self._kp_tilt_adaptive))
+        self._kd_pan_adaptive = max(0.0, min(0.3, self._kd_pan_adaptive))
+        self._kd_tilt_adaptive = max(0.0, min(0.3, self._kd_tilt_adaptive))
+        self._ki_pan = max(0.0, min(0.2, self._ki_pan))
+        self._ki_tilt = max(0.0, min(0.2, self._ki_tilt))
+        
+        # Store tuning info for logging
+        self._last_tune_info = {
+            'avg_error': avg_error,
+            'pan_osc': pan_oscillating,
+            'tilt_osc': tilt_oscillating,
+            'kp_changed': abs(self._kp_pan_adaptive - prev_kp_pan) > 0.01 or 
+                         abs(self._kp_tilt_adaptive - prev_kp_tilt) > 0.01
+        }
+    
+    def _detect_oscillation(self, error_history: list) -> bool:
+        """Detect if the error signal is oscillating (repeated sign changes)."""
+        if len(error_history) < 6:
+            return False
+        
+        # Count sign changes in recent history
+        sign_changes = 0
+        for i in range(1, len(error_history)):
+            if error_history[i] * error_history[i-1] < 0:
+                sign_changes += 1
+        
+        # If more than half the samples are sign changes, we're oscillating
+        return sign_changes >= (len(error_history) - 1) // 2
 
     def update(
         self,
@@ -294,29 +398,61 @@ class Controller:
         derr_pan = (err_pan_deg - self.last_err_pan_deg) / dt
         derr_tilt = (err_tilt_deg - self.last_err_tilt_deg) / dt
 
-        # Adaptive gain: boost if error is large and not decreasing
+        # Adaptive gain tuning
         error_magnitude = math.sqrt(err_pan_deg**2 + err_tilt_deg**2)
         self._error_history.append(error_magnitude)
-        if len(self._error_history) > 5:
+        if len(self._error_history) > 10:
             self._error_history.pop(0)
         
-        # If error is consistently large (>2 degrees) for multiple updates, boost gains
-        gain_boost = 1.0
-        if len(self._error_history) >= 5:
+        # Track oscillations (sign changes in error)
+        self._oscillation_detector_pan.append(err_pan_deg)
+        self._oscillation_detector_tilt.append(err_tilt_deg)
+        if len(self._oscillation_detector_pan) > 8:
+            self._oscillation_detector_pan.pop(0)
+        if len(self._oscillation_detector_tilt) > 8:
+            self._oscillation_detector_tilt.pop(0)
+        
+        # Integral term accumulation (with anti-windup)
+        if abs(err_pan_deg) > self.deadband_deg:
+            self._integral_pan_deg += err_pan_deg * dt
+            self._integral_pan_deg = max(-self._integral_max_deg, 
+                                        min(self._integral_max_deg, self._integral_pan_deg))
+        else:
+            self._integral_pan_deg *= 0.95  # Decay when in deadband
+            
+        if abs(err_tilt_deg) > self.deadband_deg:
+            self._integral_tilt_deg += err_tilt_deg * dt
+            self._integral_tilt_deg = max(-self._integral_max_deg, 
+                                         min(self._integral_max_deg, self._integral_tilt_deg))
+        else:
+            self._integral_tilt_deg *= 0.95
+        
+        # Auto-tune gains periodically
+        if self._adaptive_enabled and (now_s - self._last_adjustment_time) >= self._adjustment_interval:
+            self._auto_tune_gains()
+            self._last_adjustment_time = now_s
+        
+        # Detect if we're stuck (large error not improving)
+        if len(self._error_history) >= 10:
             avg_error = sum(self._error_history) / len(self._error_history)
-            if avg_error > 2.0:
-                # Error is large and not improving - boost gains
-                gain_boost = 1.5
+            if avg_error > 3.0:
                 self._stuck_counter += 1
-            else:
-                self._stuck_counter = 0
+            elif avg_error < 1.0:
+                self._stuck_counter = max(0, self._stuck_counter - 2)
         
-        # Apply boosted gains
-        kp_pan_effective = self.kp_pan * gain_boost
-        kp_tilt_effective = self.kp_tilt * gain_boost
+        # Use adaptive gains
+        kp_pan_effective = self._kp_pan_adaptive
+        kp_tilt_effective = self._kp_tilt_adaptive
+        kd_pan_effective = self._kd_pan_adaptive
+        kd_tilt_effective = self._kd_tilt_adaptive
         
-        delta_pan = kp_pan_effective * err_pan_deg + self.kd_pan * derr_pan
-        delta_tilt = kp_tilt_effective * err_tilt_deg + self.kd_tilt * derr_tilt
+        # PID control law
+        delta_pan = (kp_pan_effective * err_pan_deg + 
+                     kd_pan_effective * derr_pan + 
+                     self._ki_pan * self._integral_pan_deg)
+        delta_tilt = (kp_tilt_effective * err_tilt_deg + 
+                      kd_tilt_effective * derr_tilt + 
+                      self._ki_tilt * self._integral_tilt_deg)
 
         if self.invert_pan:
             delta_pan = -delta_pan
@@ -371,6 +507,14 @@ class Controller:
         """Reset to center position"""
         self.pan_angle = float(self.pan_center)
         self.tilt_angle = float(self.tilt_center)
+        
+        # Reset adaptive state
+        self._error_history = []
+        self._oscillation_detector_pan = []
+        self._oscillation_detector_tilt = []
+        self._integral_pan_deg = 0.0
+        self._integral_tilt_deg = 0.0
+        self._stuck_counter = 0
 
     def reset_laser_estimate_to_center(self) -> None:
         """
@@ -568,8 +712,15 @@ class BallTrackerNode(Node):
         print(f"  max_jump_px_s: {self.max_jump_px_s}")
         print(f"  HFOV/VFOV deg: {self.controller.hfov_deg}/{self.controller.vfov_deg}")
         print(f"  fx/fy px: {self.controller.fx_px}/{self.controller.fy_px}")
-        print(f"  kp pan/tilt: {self.controller.kp_pan}/{self.controller.kp_tilt}")
-        print(f"  kd pan/tilt: {self.controller.kd_pan}/{self.controller.kd_tilt}")
+        print(f"  kp pan/tilt (initial): {self.controller.kp_pan}/{self.controller.kp_tilt}")
+        print(f"  kd pan/tilt (initial): {self.controller.kd_pan}/{self.controller.kd_tilt}")
+        print(f"  ki pan/tilt (initial): {self.controller._ki_pan}/{self.controller._ki_tilt}")
+        print(f"  adaptive_tuning: {self.controller._adaptive_enabled} (TRACKER_ADAPTIVE env var)")
+        if self.controller._adaptive_enabled:
+            print(f"    - Gains will auto-adjust every {self.controller._adjustment_interval}s")
+            print(f"    - Kp range: 0.3 to 3.0 (initial: {self.controller.kp_pan:.2f})")
+            print(f"    - Ki auto-enabled if stuck (max: 0.2)")
+            print(f"    - Oscillation detection and damping enabled")
         print(f"  invert pan/tilt: {self.controller.invert_pan}/{self.controller.invert_tilt}")
         print(f"  center pan/tilt deg: {self.controller.pan_center}/{self.controller.tilt_center}")
         print(f"  max_speed_deg_s: {self.controller.max_speed_deg_s}")
@@ -732,13 +883,36 @@ class BallTrackerNode(Node):
                     self._log_counter = 0
                 self._log_counter += 1
                 
+                # Log adaptive tuning changes
+                if self.controller._adaptive_enabled and hasattr(self.controller, '_last_tune_info'):
+                    tune_info = self.controller._last_tune_info
+                    if tune_info.get('kp_changed', False):
+                        msg_parts = [f"Auto-tuned gains: Kp={self.controller._kp_pan_adaptive:.2f}/{self.controller._kp_tilt_adaptive:.2f}"]
+                        if tune_info.get('pan_osc') or tune_info.get('tilt_osc'):
+                            msg_parts.append("(reducing - oscillation detected)")
+                        elif tune_info.get('avg_error', 0) > 3.0:
+                            msg_parts.append("(increasing - slow convergence)")
+                        self.get_logger().info(' '.join(msg_parts))
+                        self.controller._last_tune_info['kp_changed'] = False
+                
                 if self._log_counter % 3 == 0:  # Log every 3rd update for better debugging
-                    self.get_logger().info(
-                        f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
-                        f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
-                        f'err: ({error_x:.1f}, {error_y:.1f}), '
-                        f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
-                    )
+                    # Include adaptive gain info if enabled
+                    if self.controller._adaptive_enabled:
+                        self.get_logger().info(
+                            f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
+                            f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
+                            f'err: ({error_x:.1f}, {error_y:.1f}), '
+                            f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}° | '
+                            f'Kp: {self.controller._kp_pan_adaptive:.2f}/{self.controller._kp_tilt_adaptive:.2f}, '
+                            f'Ki: {self.controller._ki_pan:.3f}/{self.controller._ki_tilt:.3f}'
+                        )
+                    else:
+                        self.get_logger().info(
+                            f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
+                            f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
+                            f'err: ({error_x:.1f}, {error_y:.1f}), '
+                            f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
+                        )
                 
                 self.last_detection_time = current_time
             else:
