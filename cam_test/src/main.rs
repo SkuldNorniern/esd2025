@@ -242,6 +242,18 @@ async fn async_main() -> Result<(), CameraError> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(PUBLISH_EVERY_N);
     println!("Publishing every {} frame(s) (from config.toml, use PUBLISH_EVERY_N env var to override)", publish_every_n);
+    
+    // Maximum frame age in milliseconds - drop frames older than this to reduce latency
+    // Default: 100ms (drop frames that are more than 100ms old)
+    let max_frame_age_ms: u64 = std::env::var("MAX_FRAME_AGE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    println!("Max frame age: {}ms (use MAX_FRAME_AGE_MS env var to override)", max_frame_age_ms);
+    
+    // Track dropped frames for latency management
+    let mut frames_dropped_for_latency = 0u64;
+    
     println!("Starting capture loop, waiting for first frame from camera...");
     
     loop {
@@ -278,6 +290,35 @@ async fn async_main() -> Result<(), CameraError> {
         };
 
         frame_count += 1;
+        
+        // Check frame age and drop old frames to reduce latency
+        // V4L2 timestamp is in the frame metadata
+        let frame_timestamp_us = meta.timestamp.sec as u64 * 1_000_000 + meta.timestamp.usec as u64;
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        
+        // Calculate frame age in milliseconds
+        // Note: frame_timestamp is relative to system boot on some drivers, so we use 
+        // the difference between consecutive frames as a fallback
+        let frame_age_ms = if frame_timestamp_us > 0 && frame_timestamp_us < now_us {
+            (now_us - frame_timestamp_us) / 1000
+        } else {
+            // Fallback: use elapsed time since we called stream.next()
+            elapsed.as_millis() as u64
+        };
+        
+        // Drop frame if too old (buffer backed up)
+        if frame_age_ms > max_frame_age_ms && frame_count > 10 {
+            frames_dropped_for_latency += 1;
+            if frames_dropped_for_latency % 30 == 1 {
+                eprintln!("Dropping frame #{} (age: {}ms > {}ms max) for latency - total dropped: {}", 
+                    frame_count, frame_age_ms, max_frame_age_ms, frames_dropped_for_latency);
+            }
+            continue;
+        }
+        
         let should_publish = frame_count % publish_every_n == 1;
         
         // Log every frame initially, then periodically to verify we're capturing
@@ -442,17 +483,19 @@ async fn async_main() -> Result<(), CameraError> {
         // Log frame capture info periodically (less frequent to reduce overhead)
         if frame_count % 60 == 0 {
             if format_is_mjpeg {
-                println!("Published frame #{}: {}x{} MJPEG ({} bytes compressed, skip={})", 
+                println!("Published frame #{}: {}x{} MJPEG ({} bytes, skip={}, dropped_latency={})", 
                     frame_count,
                     width, height, 
                     data_size,
-                    publish_every_n);
+                    publish_every_n,
+                    frames_dropped_for_latency);
             } else {
-                println!("Published frame #{}: {}x{} RGB3/rgb24 ({} bytes, skip={})", 
+                println!("Published frame #{}: {}x{} RGB3/rgb24 ({} bytes, skip={}, dropped_latency={})", 
                     frame_count,
                     width, height, 
                     data_size,
-                    publish_every_n);
+                    publish_every_n,
+                    frames_dropped_for_latency);
             }
         }
         
