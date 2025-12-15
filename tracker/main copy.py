@@ -120,9 +120,19 @@ class Controller:
         self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.08)
         self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.08)
 
-        # Default to inverted pan because the common physical pan linkage in this project
-        # makes "increase angle" move the laser left. Override with TRACKER_INVERT_PAN=0 if needed.
-        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", True)
+        # Physical servo-to-laser mapping (verified from measurements):
+        #   Pan INCREASE = Laser moves RIGHT (X increases)
+        #   Pan DECREASE = Laser moves LEFT (X decreases)
+        #   Tilt INCREASE = Laser moves DOWN (Y increases)
+        #   Tilt DECREASE = Laser moves UP (Y decreases)
+        #
+        # With this mapping:
+        #   - Positive X error (ball right of laser) needs positive pan delta
+        #   - Positive Y error (ball below laser) needs positive tilt delta
+        # So both inversions should be False by default.
+        # Override with TRACKER_INVERT_PAN=1 or TRACKER_INVERT_TILT=1 if your
+        # physical setup has the opposite relationship.
+        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", False)
         self.invert_tilt = self._env_bool("TRACKER_INVERT_TILT", False)
 
         self.pan_center = self._env_float("TRACKER_PAN_CENTER_DEG", 90.0)
@@ -485,9 +495,10 @@ class Controller:
         self.tilt_angle = new_tilt
 
         # Open-loop laser estimate update (dead-reckoning) when no measurement is present.
-        # Note: use the *same* sign convention as the pan/tilt inversion mapping:
-        # - invert_pan=True => increasing pan moves laser left => x decreases.
-        # - invert_tilt=True => increasing tilt moves laser up => y decreases.
+        # Sign convention (with default invert_pan=False, invert_tilt=False):
+        # - Increasing pan moves laser RIGHT => x increases
+        # - Increasing tilt moves laser DOWN => y increases
+        # If invert flags are True, the relationship is flipped.
         if not laser_measured:
             if self._laser_est_px is None:
                 self._laser_est_px = (self.cx_px, self.cy_px)
@@ -886,10 +897,30 @@ class BallTrackerNode(Node):
                     self.servo.set_pan(pan_angle)
                     self.servo.set_tilt(tilt_angle)
 
-                # If we are saturating the tilt at 0°/180° for a while, it often means:
-                # - the mechanical range is insufficient, OR
-                # - `TRACKER_INVERT_TILT` is wrong for the current servo installation.
-                # This doesn't auto-flip the sign (too risky), but it gives a clear hint.
+                # Saturation warnings: if a servo hits its limit for a while, the inversion
+                # setting might be wrong for the current physical setup.
+                
+                # Pan saturation check
+                if not hasattr(self, "_pan_sat_since_s"):
+                    self._pan_sat_since_s = None
+                at_pan_min = abs(pan_angle - self.controller.pan_min) < 1e-6
+                at_pan_max = abs(pan_angle - self.controller.pan_max) < 1e-6
+                if at_pan_min or at_pan_max:
+                    if self._pan_sat_since_s is None:
+                        self._pan_sat_since_s = current_time
+                    elif (current_time - self._pan_sat_since_s) >= 1.0:
+                        if not hasattr(self, "_last_pan_sat_log_s"):
+                            self._last_pan_sat_log_s = 0.0
+                        if (current_time - self._last_pan_sat_log_s) >= 2.0:
+                            self.get_logger().warn(
+                                "Pan servo saturated at limit (0° or 180°). "
+                                "If the laser moves the wrong way horizontally, toggle TRACKER_INVERT_PAN (0/1)."
+                            )
+                            self._last_pan_sat_log_s = current_time
+                else:
+                    self._pan_sat_since_s = None
+                
+                # Tilt saturation check
                 if not hasattr(self, "_tilt_sat_since_s"):
                     self._tilt_sat_since_s = None
                 at_tilt_min = abs(tilt_angle - self.controller.tilt_min) < 1e-6

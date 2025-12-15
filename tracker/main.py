@@ -119,9 +119,19 @@ class Controller:
         self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.0)
         self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.0)
 
-        # Default to inverted pan because the common physical pan linkage in this project
-        # makes "increase angle" move the laser left. Override with TRACKER_INVERT_PAN=0 if needed.
-        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", True)
+        # Physical servo-to-laser mapping (verified from measurements):
+        #   Pan INCREASE = Laser moves RIGHT (X increases)
+        #   Pan DECREASE = Laser moves LEFT (X decreases)
+        #   Tilt INCREASE = Laser moves DOWN (Y increases)
+        #   Tilt DECREASE = Laser moves UP (Y decreases)
+        #
+        # With this mapping:
+        #   - Positive X error (ball right of laser) needs positive pan delta
+        #   - Positive Y error (ball below laser) needs positive tilt delta
+        # So both inversions should be False by default.
+        # Override with TRACKER_INVERT_PAN=1 or TRACKER_INVERT_TILT=1 if your
+        # physical setup has the opposite relationship.
+        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", False)
         self.invert_tilt = self._env_bool("TRACKER_INVERT_TILT", False)
 
         self.pan_center = self._env_float("TRACKER_PAN_CENTER_DEG", 90.0)
@@ -313,9 +323,10 @@ class Controller:
         self.tilt_angle = new_tilt
 
         # Open-loop laser estimate update (dead-reckoning) when no measurement is present.
-        # Note: use the *same* sign convention as the pan/tilt inversion mapping:
-        # - invert_pan=True => increasing pan moves laser left => x decreases.
-        # - invert_tilt=True => increasing tilt moves laser up => y decreases.
+        # Sign convention (with default invert_pan=False, invert_tilt=False):
+        # - Increasing pan moves laser RIGHT => x increases
+        # - Increasing tilt moves laser DOWN => y increases
+        # If invert flags are True, the relationship is flipped.
         if not laser_measured:
             if self._laser_est_px is None:
                 self._laser_est_px = (self.cx_px, self.cy_px)
