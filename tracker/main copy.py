@@ -859,6 +859,52 @@ class BallTrackerNode(Node):
                 if laser_valid:
                     self._laser_estimated_steps = 0
                     self._laser_recovery_active = False
+                    
+                    # Diagnostic: detect if servos are moving but laser isn't
+                    if not hasattr(self, "_prev_servo_pos"):
+                        self._prev_servo_pos = (self.controller.pan_angle, self.controller.tilt_angle)
+                        self._prev_laser_pos = (laser_x, laser_y)
+                        self._stationary_laser_counter = 0
+                        self._laser_move_log_counter = 0
+                    else:
+                        prev_pan, prev_tilt = self._prev_servo_pos
+                        prev_lx, prev_ly = self._prev_laser_pos
+                        
+                        servo_moved = abs(self.controller.pan_angle - prev_pan) > 2.0 or abs(self.controller.tilt_angle - prev_tilt) > 2.0
+                        laser_moved = abs(laser_x - prev_lx) > 5.0 or abs(laser_y - prev_ly) > 5.0
+                        
+                        # Log when laser actually moves
+                        if laser_moved:
+                            self._laser_move_log_counter += 1
+                            if self._laser_move_log_counter % 3 == 0:
+                                dlx = laser_x - prev_lx
+                                dly = laser_y - prev_ly
+                                self.get_logger().info(
+                                    f"Laser moved: ({prev_lx:.0f},{prev_ly:.0f}) -> ({laser_x:.0f},{laser_y:.0f}) "
+                                    f"Δ({dlx:+.0f},{dly:+.0f}px) | "
+                                    f"Servo: pan={self.controller.pan_angle:.0f}° tilt={self.controller.tilt_angle:.0f}°"
+                                )
+                        
+                        if servo_moved and not laser_moved:
+                            self._stationary_laser_counter += 1
+                            if self._stationary_laser_counter >= 3:
+                                if not hasattr(self, "_last_stationary_warn_s"):
+                                    self._last_stationary_warn_s = 0.0
+                                if (current_time - self._last_stationary_warn_s) >= 3.0:
+                                    self.get_logger().error(
+                                        f"SERVO MOVEMENT NOT AFFECTING LASER POSITION! "
+                                        f"Pan moved {prev_pan:.0f}° -> {self.controller.pan_angle:.0f}°, "
+                                        f"Tilt moved {prev_tilt:.0f}° -> {self.controller.tilt_angle:.0f}°, "
+                                        f"but laser stayed at ({laser_x:.0f}, {laser_y:.0f}). "
+                                        f"Check: (1) Is camera mounted on servos? (2) Are servos physically connected to laser mount?"
+                                    )
+                                    self._last_stationary_warn_s = current_time
+                                    self._stationary_laser_counter = 0
+                        elif laser_moved:
+                            self._stationary_laser_counter = 0
+                        
+                        self._prev_servo_pos = (self.controller.pan_angle, self.controller.tilt_angle)
+                        self._prev_laser_pos = (laser_x, laser_y)
                 else:
                     self._laser_estimated_steps += 1
                 
@@ -970,23 +1016,51 @@ class BallTrackerNode(Node):
                     # Calculate tracking quality metrics
                     error_magnitude = math.sqrt(error_x**2 + error_y**2)
                     
+                    # Track error trend (getting better or worse)
+                    if not hasattr(self, '_prev_error_mag'):
+                        self._prev_error_mag = error_magnitude
+                        error_trend = ""
+                    else:
+                        error_delta = error_magnitude - self._prev_error_mag
+                        if abs(error_delta) < 2.0:
+                            error_trend = " (stable)"
+                        elif error_delta < 0:
+                            error_trend = f" (BETTER {error_delta:+.1f})"
+                        else:
+                            error_trend = f" (WORSE {error_delta:+.1f})"
+                        self._prev_error_mag = error_magnitude
+                    
+                    # Show servo movement delta
+                    if not hasattr(self, '_prev_pan_log'):
+                        self._prev_pan_log = pan_angle
+                        self._prev_tilt_log = tilt_angle
+                        servo_delta = ""
+                    else:
+                        dpan = pan_angle - self._prev_pan_log
+                        dtilt = tilt_angle - self._prev_tilt_log
+                        if abs(dpan) > 0.5 or abs(dtilt) > 0.5:
+                            servo_delta = f" Δ({dpan:+.1f}°,{dtilt:+.1f}°)"
+                        else:
+                            servo_delta = " (no move)"
+                        self._prev_pan_log = pan_angle
+                        self._prev_tilt_log = tilt_angle
+                    
                     # Include adaptive gain info if enabled
                     if self.controller._adaptive_enabled:
                         self.get_logger().info(
-                            f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
-                            f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
-                            f'error: {error_magnitude:.1f}px ({error_x:+.1f}, {error_y:+.1f}), '
-                            f'servo: pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}° | '
-                            f'Kp: {self.controller._kp_pan_adaptive:.2f}/{self.controller._kp_tilt_adaptive:.2f}, '
-                            f'Kd: {self.controller._kd_pan_adaptive:.3f}/{self.controller._kd_tilt_adaptive:.3f}, '
-                            f'Ki: {self.controller._ki_pan:.3f}/{self.controller._ki_tilt:.3f}'
+                            f'Ball: ({ball_center_x:.0f},{ball_center_y:.0f}), '
+                            f'Laser[{laser_source}]: ({lx:.0f},{ly:.0f}), '
+                            f'error: {error_magnitude:.1f}px{error_trend} ({error_x:+.0f},{error_y:+.0f}), '
+                            f'servo: pan={pan_angle:.1f}° tilt={tilt_angle:.1f}°{servo_delta} | '
+                            f'Kp:{self.controller._kp_pan_adaptive:.2f}/{self.controller._kp_tilt_adaptive:.2f} '
+                            f'Ki:{self.controller._ki_pan:.3f}/{self.controller._ki_tilt:.3f}'
                         )
                     else:
                         self.get_logger().info(
-                            f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
-                            f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
-                            f'error: {error_magnitude:.1f}px ({error_x:+.1f}, {error_y:+.1f}), '
-                            f'servo: pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
+                            f'Ball: ({ball_center_x:.0f},{ball_center_y:.0f}), '
+                            f'Laser[{laser_source}]: ({lx:.0f},{ly:.0f}), '
+                            f'error: {error_magnitude:.1f}px{error_trend} ({error_x:+.0f},{error_y:+.0f}), '
+                            f'servo: pan={pan_angle:.1f}° tilt={tilt_angle:.1f}°{servo_delta}'
                         )
                 
                 self.last_detection_time = current_time
