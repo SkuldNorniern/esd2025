@@ -120,7 +120,8 @@ class Controller:
         self.last_ball_center_y: Optional[float] = None
         self.position_change_threshold = 5.0  # Pixels - if ball moves less than this, consider it stationary (increased to prevent overshooting)
     
-    def update(self, x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float]:
+    def update(self, x1: float, y1: float, x2: float, y2: float, 
+               laser_x: Optional[float] = None, laser_y: Optional[float] = None) -> Tuple[float, float]:
         """Update servo positions based on ball detection"""
         # Calculate ball center
         ball_center_x = (x1 + x2) / 2.0
@@ -131,11 +132,18 @@ class Controller:
         ball_height = abs(y2 - y1)
         ball_area = ball_width * ball_height
         
-        # Calculate image center and error early
-        image_center_x = self.image_width / 2.0
-        image_center_y = self.image_height / 2.0
-        error_x = ball_center_x - image_center_x
-        error_y = ball_center_y - image_center_y
+        # Use provided laser position or fallback to image center
+        if laser_x is not None and laser_y is not None:
+            target_x = laser_x
+            target_y = laser_y
+        else:
+            # Fallback to image center
+            target_x = self.image_width / 2.0
+            target_y = self.image_height / 2.0
+        
+        # Calculate error relative to laser position
+        error_x = ball_center_x - target_x
+        error_y = ball_center_y - target_y
         error_magnitude = (error_x**2 + error_y**2)**0.5
         
         # Check if laser is already within the ball's area
@@ -145,6 +153,10 @@ class Controller:
         if abs(error_x) < ball_half_width and abs(error_y) < ball_half_height:
             # Laser is within the ball's bounding box - no need to move
             return (self.pan_angle, self.tilt_angle)
+        
+        # Store image center for normalization (used later)
+        image_center_x = self.image_width / 2.0
+        image_center_y = self.image_height / 2.0
         
         # Check if ball position actually changed significantly
         # But allow movement if error is large (ball is far from center)
@@ -164,7 +176,9 @@ class Controller:
         self.last_ball_center_x = ball_center_x
         self.last_ball_center_y = ball_center_y
         
-        # Normalize error to -1.0 to 1.0 range
+        # Normalize error to -1.0 to 1.0 range (use image center for normalization)
+        image_center_x = self.image_width / 2.0
+        image_center_y = self.image_height / 2.0
         normalized_error_x = error_x / image_center_x
         normalized_error_y = error_y / image_center_y
         
@@ -273,6 +287,23 @@ def parse_coordinates(s: str) -> Optional[Tuple[float, float, float, float]]:
         return None
 
 
+def parse_laser_position(s: str) -> Optional[Tuple[float, float]]:
+    """Parse laser position string: 'x,y' or 'none'"""
+    if s == "none":
+        return None
+    
+    parts = s.split(',')
+    if len(parts) != 2:
+        return None
+    
+    try:
+        x = float(parts[0])
+        y = float(parts[1])
+        return (x, y)
+    except ValueError:
+        return None
+
+
 class BallTrackerNode(Node):
     """ROS2 node for ball tracking"""
     
@@ -309,6 +340,11 @@ class BallTrackerNode(Node):
         self.coords: Optional[Tuple[float, float, float, float]] = None
         self.last_coords_update = time.time()
         
+        # Laser position state (from ROS topic)
+        self.laser_pos: Optional[Tuple[float, float]] = None
+        self.last_laser_update = time.time()
+        self.laser_timeout = 1.0  # If no laser update for 1s, use image center as fallback
+        
         # Timeout for reset (2 seconds)
         self.timeout = 2.0
         self.last_detection_time = time.time()
@@ -327,6 +363,20 @@ class BallTrackerNode(Node):
         print("  Message type: std_msgs/String")
         print("  Format: 'x1,y1,x2,y2' or 'none'")
         print(f"ROS_DOMAIN_ID: {os.environ.get('ROS_DOMAIN_ID', '0')}")
+        print()
+        
+        # Create subscriber for laser position (for real-time calibration)
+        print("Subscribing to laser position topic...")
+        self.laser_subscription = self.create_subscription(
+            String,
+            '/laser_pos',
+            self.laser_callback,
+            10
+        )
+        
+        print("Laser position subscriber created")
+        print("  Topic: /laser_pos")
+        print("  Format: 'x,y' or 'none'")
         print()
         
         # Create publisher for laser position (for real-time calibration)
@@ -350,6 +400,12 @@ class BallTrackerNode(Node):
         self.coords = parsed
         self.last_coords_update = time.time()
     
+    def laser_callback(self, msg: String) -> None:
+        """Callback for laser position messages"""
+        parsed = parse_laser_position(msg.data)
+        self.laser_pos = parsed
+        self.last_laser_update = time.time()
+    
     def control_loop(self) -> None:
         """Main control loop - runs at 10Hz"""
         current_time = time.time()
@@ -364,24 +420,30 @@ class BallTrackerNode(Node):
                 ball_center_x = (x1 + x2) / 2.0
                 ball_center_y = (y1 + y2) / 2.0
                 
-                # Calculate where laser should be pointing (image center = where servos point)
-                laser_x = self.image_width / 2.0
-                laser_y = self.image_height / 2.0
+                # Get laser position from ROS topic, or fallback to image center
+                if (self.laser_pos is not None and 
+                    current_time - self.last_laser_update < self.laser_timeout):
+                    laser_x, laser_y = self.laser_pos
+                else:
+                    # Fallback to image center if no laser position received
+                    laser_x = self.image_width / 2.0
+                    laser_y = self.image_height / 2.0
                 
                 # Publish laser position (ball center coordinates for calibration)
                 laser_msg = String()
                 laser_msg.data = f"{ball_center_x:.2f},{ball_center_y:.2f}"
                 self.laser_pub.publish(laser_msg)
                 
-                pan_angle, tilt_angle = self.controller.update(x1, y1, x2, y2)
+                # Update controller with laser position for accurate error calculation
+                pan_angle, tilt_angle = self.controller.update(x1, y1, x2, y2, laser_x, laser_y)
                 
                 if self.servo is not None:
                     self.servo.set_pan(pan_angle)
                     self.servo.set_tilt(tilt_angle)
                 
-                # Calculate error for better logging (ball_center already calculated above)
-                error_x = ball_center_x - (self.image_width / 2.0)
-                error_y = ball_center_y - (self.image_height / 2.0)
+                # Calculate error relative to actual laser position
+                error_x = ball_center_x - laser_x
+                error_y = ball_center_y - laser_y
                 
                 # Calculate what the delta should be for debugging
                 normalized_err_x = error_x / (self.image_width / 2.0)
