@@ -89,8 +89,10 @@ class ServoController:
     
     def shutdown(self) -> None:
         """Set servos to center position before shutdown"""
-        self.set_pan(90.0)
-        self.set_tilt(90.0)
+        pan_center = float(os.environ.get("TRACKER_PAN_CENTER_DEG", "90.0"))
+        tilt_center = float(os.environ.get("TRACKER_TILT_CENTER_DEG", "90.0"))
+        self.set_pan(pan_center)
+        self.set_tilt(tilt_center)
         time.sleep(0.1)  # Give servos time to move
 
 
@@ -137,6 +139,15 @@ class Controller:
 
         # Servo speed limit (deg/sec)
         self.max_speed_deg_s = self._env_float("TRACKER_MAX_SPEED_DEG_S", 120.0)
+
+        # Safety clamps:
+        # - If the control loop is delayed (ROS callback scheduling, pigpio latency, CPU load),
+        #   `dt` can jump from ~0.05s (20Hz) to 0.15s+ and the rate limiter would allow a
+        #   proportionally larger per-tick move (e.g. 120 deg/s * 0.15s = 18 deg), which feels
+        #   "aggressive". Clamp the effective dt used for rate limiting and the D-term.
+        self.max_dt_s = self._env_float("TRACKER_MAX_DT_S", 0.08)
+        # - Additionally clamp the *per tick* movement (degrees), independent of dt.
+        self.max_step_deg = self._env_float("TRACKER_MAX_STEP_DEG", 4.0)
 
         # Small deadband in angular domain to prevent buzzing
         self.deadband_deg = self._env_float("TRACKER_DEADBAND_DEG", 0.4)
@@ -195,26 +206,7 @@ class Controller:
             return math.tan(math.radians(deg)) * self.fy_px
         return deg * (self.image_height / self.vfov_deg)
 
-    def _laser_estimate_from_servo_angles(self) -> Tuple[float, float]:
-        """
-        Predict laser pixel position from current servo angles (open-loop).
-
-        Sign convention:
-        - If `invert_pan` is True, increasing pan angle moves the laser LEFT (negative x),
-          so x displacement uses a negative sign.
-        - If `invert_tilt` is True, increasing tilt angle moves the laser UP (negative y),
-          so y displacement uses a negative sign.
-        """
-        sign_pan = -1.0 if self.invert_pan else 1.0
-        sign_tilt = -1.0 if self.invert_tilt else 1.0
-
-        pan_delta_deg = self.pan_angle - self.pan_center
-        tilt_delta_deg = self.tilt_angle - self.tilt_center
-
-        x = self.cx_px + sign_pan * self._deg_to_px_x(pan_delta_deg)
-        y = self.cy_px + sign_tilt * self._deg_to_px_y(tilt_delta_deg)
-
-        # Clamp to image bounds
+    def _clamp_px(self, x: float, y: float) -> Tuple[float, float]:
         x = max(0.0, min(self.image_width - 1.0, x))
         y = max(0.0, min(self.image_height - 1.0, y))
         return (x, y)
@@ -235,10 +227,15 @@ class Controller:
         self._ball_ema = self._ema(self._ball_ema, ball_center_x, ball_center_y)
         ball_center_x, ball_center_y = self._ball_ema
 
+        laser_measured = (laser_x is not None) and (laser_y is not None)
+
         # Laser position:
         # - If a measurement is provided, use it (smoothed) and update our estimate.
-        # - If no measurement is provided, keep an estimate based on servo angles (open-loop).
-        if laser_x is not None and laser_y is not None:
+        # - If no measurement is provided, keep the last estimate and update it based on the
+        #   *commanded servo movement* (dead-reckoning). This matches the desired behavior:
+        #   "keep the latest position and add based on the angle movement", and avoids large
+        #   jumps if the absolute angle->pixel model is imperfect.
+        if laser_measured:
             self._laser_ema = self._ema(self._laser_ema, laser_x, laser_y)
             laser_x, laser_y = self._laser_ema
             self._laser_est_px = (laser_x, laser_y)
@@ -246,18 +243,10 @@ class Controller:
             if self._laser_est_px is None:
                 # Initialize estimate to center on first use.
                 self._laser_est_px = (self.cx_px, self.cy_px)
-            # Update estimate from the angles we are commanding.
-            laser_x, laser_y = self._laser_estimate_from_servo_angles()
-            self._laser_est_px = (laser_x, laser_y)
+            laser_x, laser_y = self._laser_est_px
 
-        # If laser is already within the ball bbox, hold position (no hunting).
-        if abs(ball_center_x - laser_x) <= (ball_width / 2.0) and abs(ball_center_y - laser_y) <= (ball_height / 2.0):
-            self.last_update = now_s
-            self.last_err_pan_deg = 0.0
-            self.last_err_tilt_deg = 0.0
-            return (self.pan_angle, self.tilt_angle)
-
-        dt = max(0.001, now_s - self.last_update)
+        dt_raw = max(0.001, now_s - self.last_update)
+        dt = min(dt_raw, max(0.001, self.max_dt_s))
 
         err_px_x = ball_center_x - laser_x
         err_px_y = ball_center_y - laser_y
@@ -288,8 +277,26 @@ class Controller:
         delta_pan = max(-max_delta, min(max_delta, delta_pan))
         delta_tilt = max(-max_delta, min(max_delta, delta_tilt))
 
+        # Per-tick clamp (deg)
+        delta_pan = max(-self.max_step_deg, min(self.max_step_deg, delta_pan))
+        delta_tilt = max(-self.max_step_deg, min(self.max_step_deg, delta_tilt))
+
         self.pan_angle = max(self.pan_min, min(self.pan_max, self.pan_angle + delta_pan))
         self.tilt_angle = max(self.tilt_min, min(self.tilt_max, self.tilt_angle + delta_tilt))
+
+        # Open-loop laser estimate update (dead-reckoning) when no measurement is present.
+        # Note: use the *same* sign convention as the pan/tilt inversion mapping:
+        # - invert_pan=True => increasing pan moves laser left => x decreases.
+        # - invert_tilt=True => increasing tilt moves laser up => y decreases.
+        if not laser_measured:
+            if self._laser_est_px is None:
+                self._laser_est_px = (self.cx_px, self.cy_px)
+            est_x, est_y = self._laser_est_px
+            sign_pan = -1.0 if self.invert_pan else 1.0
+            sign_tilt = -1.0 if self.invert_tilt else 1.0
+            est_x += sign_pan * self._deg_to_px_x(delta_pan)
+            est_y += sign_tilt * self._deg_to_px_y(delta_tilt)
+            self._laser_est_px = self._clamp_px(est_x, est_y)
 
         self.last_update = now_s
         self.last_err_pan_deg = err_pan_deg
@@ -405,7 +412,8 @@ class BallTrackerNode(Node):
         # Laser position state (from ROS topic)
         self.laser_pos: Optional[Tuple[float, float]] = None
         self.last_laser_update = time.time()
-        self.laser_timeout = 1.0  # If no laser update for 1s, fall back to open-loop (assume center)
+        # If no `/laser_pos` update for this long, fall back to open-loop estimation.
+        self.laser_timeout = 1.0
         
         # Timeout for reset (2 seconds)
         self.timeout = 2.0
@@ -478,6 +486,8 @@ class BallTrackerNode(Node):
         print(f"  invert pan/tilt: {self.controller.invert_pan}/{self.controller.invert_tilt}")
         print(f"  center pan/tilt deg: {self.controller.pan_center}/{self.controller.tilt_center}")
         print(f"  max_speed_deg_s: {self.controller.max_speed_deg_s}")
+        print(f"  max_dt_s: {self.controller.max_dt_s}")
+        print(f"  max_step_deg: {self.controller.max_step_deg}")
         print(f"  deadband_deg: {self.controller.deadband_deg}")
         print(f"  ema_alpha: {self.controller.ema_alpha}")
         print()
@@ -495,7 +505,7 @@ class BallTrackerNode(Node):
         self.last_laser_update = time.time()
     
     def control_loop(self) -> None:
-        """Main control loop - runs at 10Hz"""
+        """Main control loop - runs at `TRACKER_CONTROL_HZ`."""
         current_time = time.time()
         
         # Check for ball detection coordinates
@@ -534,8 +544,8 @@ class BallTrackerNode(Node):
                 self._last_ball_time_s = current_time
                 
                 # Get laser position from ROS topic (from calibration node)
-                # If `/laser_pos` is not available, we fall back to open-loop: assume the laser is at image center.
-                # This will still "track to center" (camera-axis tracking), but accurate laser pointing needs real `/laser_pos`.
+                # If `/laser_pos` is not available, we fall back to open-loop:
+                # keep the latest laser estimate and dead-reckon based on the servo commands.
                 if self.laser_pos is not None and (current_time - self.last_laser_update) < self.laser_timeout:
                     laser_x, laser_y = self.laser_pos
                     laser_source = "measured"
