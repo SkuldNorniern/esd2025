@@ -114,11 +114,11 @@ class Controller:
         self.cy_px = self._env_float("TRACKER_CY_PX", self.image_height / 2.0)
 
         # Control gains (units: degrees of servo change per degree of angular error).
-        # Increased default gains for more aggressive tracking
-        self.kp_pan = self._env_float("TRACKER_KP_PAN", 1.2)
-        self.kp_tilt = self._env_float("TRACKER_KP_TILT", 1.2)
-        self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.05)
-        self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.05)
+        # Tuned for real-world ball tracking with RoboFlow detections
+        self.kp_pan = self._env_float("TRACKER_KP_PAN", 1.0)
+        self.kp_tilt = self._env_float("TRACKER_KP_TILT", 1.0)
+        self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.08)
+        self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.08)
 
         # Default to inverted pan because the common physical pan linkage in this project
         # makes "increase angle" move the laser left. Override with TRACKER_INVERT_PAN=0 if needed.
@@ -138,8 +138,8 @@ class Controller:
         self.tilt_min = 0.0
         self.tilt_max = 180.0
 
-        # Servo speed limit (deg/sec) - increased for faster response
-        self.max_speed_deg_s = self._env_float("TRACKER_MAX_SPEED_DEG_S", 180.0)
+        # Servo speed limit (deg/sec) - balanced for smooth tracking
+        self.max_speed_deg_s = self._env_float("TRACKER_MAX_SPEED_DEG_S", 150.0)
 
         # Safety clamps:
         # - If the control loop is delayed (ROS callback scheduling, pigpio latency, CPU load),
@@ -148,14 +148,15 @@ class Controller:
         #   "aggressive". Clamp the effective dt used for rate limiting and the D-term.
         self.max_dt_s = self._env_float("TRACKER_MAX_DT_S", 0.08)
         # - Additionally clamp the *per tick* movement (degrees), independent of dt.
-        # Increased to allow more aggressive movements
-        self.max_step_deg = self._env_float("TRACKER_MAX_STEP_DEG", 8.0)
+        # Balanced for smooth yet responsive tracking
+        self.max_step_deg = self._env_float("TRACKER_MAX_STEP_DEG", 6.0)
 
-        # Small deadband in angular domain to prevent buzzing - reduced for better accuracy
-        self.deadband_deg = self._env_float("TRACKER_DEADBAND_DEG", 0.2)
+        # Small deadband in angular domain to prevent buzzing
+        self.deadband_deg = self._env_float("TRACKER_DEADBAND_DEG", 0.3)
 
-        # Optional EMA smoothing of input points (0..1) - increased for more responsive tracking
-        self.ema_alpha = self._env_float("TRACKER_EMA_ALPHA", 0.6)
+        # Optional EMA smoothing of input points (0..1)
+        # Higher alpha = more responsive but jittery, lower = smoother but laggy
+        self.ema_alpha = self._env_float("TRACKER_EMA_ALPHA", 0.5)
 
         self.last_update = time.time()
         self.last_err_pan_deg = 0.0
@@ -261,31 +262,31 @@ class Controller:
         pan_oscillating = self._detect_oscillation(self._oscillation_detector_pan)
         tilt_oscillating = self._detect_oscillation(self._oscillation_detector_tilt)
         
-        # Tune Pan gains
+        # Tune Pan gains - adjusted thresholds for real-world tracking
         if pan_oscillating:
             # Reduce gains to dampen oscillation
-            self._kp_pan_adaptive *= 0.85
-            self._kd_pan_adaptive *= 1.1  # Increase damping
-        elif avg_error > 3.0 and error_trend >= 0:
-            # Error is large and not improving - increase Kp
-            self._kp_pan_adaptive = min(2.5, self._kp_pan_adaptive * 1.15)
-            # Enable integral term if stuck with steady-state error
-            if self._ki_pan == 0.0:
-                self._ki_pan = 0.05
-        elif avg_error < 0.8:
+            self._kp_pan_adaptive *= 0.90
+            self._kd_pan_adaptive *= 1.05  # Gentle damping increase
+        elif avg_error > 4.0 and error_trend >= 0:
+            # Error is large and not improving - increase Kp gradually
+            self._kp_pan_adaptive = min(2.0, self._kp_pan_adaptive * 1.10)
+            # Enable integral term if persistently stuck
+            if self._ki_pan == 0.0 and len(self._error_history) >= 10:
+                self._ki_pan = 0.03
+        elif avg_error < 1.0:
             # Tracking well - slightly reduce gains for smoothness
-            self._kp_pan_adaptive = max(self.kp_pan * 0.8, self._kp_pan_adaptive * 0.98)
+            self._kp_pan_adaptive = max(self.kp_pan * 0.7, self._kp_pan_adaptive * 0.99)
         
         # Tune Tilt gains (same logic)
         if tilt_oscillating:
-            self._kp_tilt_adaptive *= 0.85
-            self._kd_tilt_adaptive *= 1.1
-        elif avg_error > 3.0 and error_trend >= 0:
-            self._kp_tilt_adaptive = min(2.5, self._kp_tilt_adaptive * 1.15)
-            if self._ki_tilt == 0.0:
-                self._ki_tilt = 0.05
-        elif avg_error < 0.8:
-            self._kp_tilt_adaptive = max(self.kp_tilt * 0.8, self._kp_tilt_adaptive * 0.98)
+            self._kp_tilt_adaptive *= 0.90
+            self._kd_tilt_adaptive *= 1.05
+        elif avg_error > 4.0 and error_trend >= 0:
+            self._kp_tilt_adaptive = min(2.0, self._kp_tilt_adaptive * 1.10)
+            if self._ki_tilt == 0.0 and len(self._error_history) >= 10:
+                self._ki_tilt = 0.03
+        elif avg_error < 1.0:
+            self._kp_tilt_adaptive = max(self.kp_tilt * 0.7, self._kp_tilt_adaptive * 0.99)
         
         # Bounds checking
         prev_kp_pan = self._kp_pan_adaptive
@@ -435,10 +436,10 @@ class Controller:
         # Detect if we're stuck (large error not improving)
         if len(self._error_history) >= 10:
             avg_error = sum(self._error_history) / len(self._error_history)
-            if avg_error > 3.0:
+            if avg_error > 4.0:
                 self._stuck_counter += 1
-            elif avg_error < 1.0:
-                self._stuck_counter = max(0, self._stuck_counter - 2)
+            elif avg_error < 1.5:
+                self._stuck_counter = max(0, self._stuck_counter - 1)
         
         # Use adaptive gains
         kp_pan_effective = self._kp_pan_adaptive
@@ -611,11 +612,13 @@ class BallTrackerNode(Node):
             print("GPIO not available, running in simulation mode")
             self.servo = None
         
-        # Image dimensions (should match camera resolution: 640x640)
-        # Updated from 320x240 to match cam_test resolution change
-        self.image_width = 640
-        self.image_height = 640
+        # Image dimensions (should match camera resolution: 640x480)
+        # Get from environment or use detected size from first message
+        self.image_width = int(os.environ.get("TRACKER_IMAGE_WIDTH", "640"))
+        self.image_height = int(os.environ.get("TRACKER_IMAGE_HEIGHT", "480"))
         self.controller = Controller(self.image_width, self.image_height)
+        print(f"  Using image dimensions: {self.image_width}x{self.image_height}")
+        print(f"  (Set TRACKER_IMAGE_WIDTH/HEIGHT env vars to override)")
 
         # Reject one-frame detector glitches that jump too far (px/sec).
         # This is extremely common with bounding-box detectors and causes servo snaps.
@@ -704,30 +707,50 @@ class BallTrackerNode(Node):
         print()
 
         # Log effective config for easier tuning
-        print("Tracker config:")
-        print(f"  control_hz: {1.0 / self.control_period_s:.1f}")
-        print(f"  image: {self.image_width}x{self.image_height}")
-        print(f"  laser_timeout_s: {self.laser_timeout}")
-        print(f"  laser_estimated_max_steps: {self.laser_estimated_max_steps} (fixed)")
-        print(f"  max_jump_px_s: {self.max_jump_px_s}")
-        print(f"  HFOV/VFOV deg: {self.controller.hfov_deg}/{self.controller.vfov_deg}")
-        print(f"  fx/fy px: {self.controller.fx_px}/{self.controller.fy_px}")
-        print(f"  kp pan/tilt (initial): {self.controller.kp_pan}/{self.controller.kp_tilt}")
-        print(f"  kd pan/tilt (initial): {self.controller.kd_pan}/{self.controller.kd_tilt}")
-        print(f"  ki pan/tilt (initial): {self.controller._ki_pan}/{self.controller._ki_tilt}")
-        print(f"  adaptive_tuning: {self.controller._adaptive_enabled} (TRACKER_ADAPTIVE env var)")
+        print()
+        print("=" * 60)
+        print("TRACKER CONFIGURATION (Adaptive PID with Laser Feedback)")
+        print("=" * 60)
+        print(f"Control Loop:")
+        print(f"  Rate: {1.0 / self.control_period_s:.1f} Hz")
+        print(f"  Image: {self.image_width}x{self.image_height} px")
+        print()
+        print(f"Detection Filters:")
+        print(f"  Max jump: {self.max_jump_px_s:.0f} px/s (rejects glitches)")
+        print(f"  Timeout: {self.timeout}s (resets to center if no ball)")
+        print()
+        print(f"Laser Feedback:")
+        print(f"  Timeout: {self.laser_timeout}s (falls back to estimation)")
+        print(f"  Max estimation steps: {self.laser_estimated_max_steps} (before recentering)")
+        print()
+        print(f"Camera Model:")
+        print(f"  HFOV/VFOV: {self.controller.hfov_deg}/{self.controller.vfov_deg}°")
+        if self.controller.fx_px > 0 or self.controller.fy_px > 0:
+            print(f"  Focal length: fx={self.controller.fx_px:.1f}, fy={self.controller.fy_px:.1f} px")
+        print()
+        print(f"PID Controller (Initial):")
+        print(f"  Kp: {self.controller.kp_pan}/{self.controller.kp_tilt} (proportional)")
+        print(f"  Kd: {self.controller.kd_pan}/{self.controller.kd_tilt} (derivative)")
+        print(f"  Ki: {self.controller._ki_pan}/{self.controller._ki_tilt} (integral)")
+        print(f"  Adaptive: {'ENABLED' if self.controller._adaptive_enabled else 'DISABLED'}")
         if self.controller._adaptive_enabled:
-            print(f"    - Gains will auto-adjust every {self.controller._adjustment_interval}s")
-            print(f"    - Kp range: 0.3 to 3.0 (initial: {self.controller.kp_pan:.2f})")
-            print(f"    - Ki auto-enabled if stuck (max: 0.2)")
-            print(f"    - Oscillation detection and damping enabled")
-        print(f"  invert pan/tilt: {self.controller.invert_pan}/{self.controller.invert_tilt}")
-        print(f"  center pan/tilt deg: {self.controller.pan_center}/{self.controller.tilt_center}")
-        print(f"  max_speed_deg_s: {self.controller.max_speed_deg_s}")
-        print(f"  max_dt_s: {self.controller.max_dt_s}")
-        print(f"  max_step_deg: {self.controller.max_step_deg}")
-        print(f"  deadband_deg: {self.controller.deadband_deg}")
-        print(f"  ema_alpha: {self.controller.ema_alpha}")
+            print(f"    - Auto-tunes every {self.controller._adjustment_interval}s")
+            print(f"    - Kp range: 0.3 to 2.0")
+            print(f"    - Detects oscillations & adjusts gains")
+            print(f"    - Enables Ki if stuck (max: 0.2)")
+        print()
+        print(f"Servo Configuration:")
+        print(f"  Center: pan={self.controller.pan_center}°, tilt={self.controller.tilt_center}°")
+        print(f"  Invert: pan={self.controller.invert_pan}, tilt={self.controller.invert_tilt}")
+        print(f"  Limits: pan=[{self.controller.pan_min}°, {self.controller.pan_max}°], tilt=[{self.controller.tilt_min}°, {self.controller.tilt_max}°]")
+        print(f"  Max speed: {self.controller.max_speed_deg_s}°/s")
+        print(f"  Max step: {self.controller.max_step_deg}° per tick")
+        print()
+        print(f"Smoothing & Filtering:")
+        print(f"  Ball position EMA: α={self.controller.ema_alpha}")
+        print(f"  Deadband: {self.controller.deadband_deg}° (prevents buzzing)")
+        print(f"  Max dt: {self.controller.max_dt_s}s (rate limiter clamp)")
+        print("=" * 60)
         print()
     
     def coords_callback(self, msg: String) -> None:
@@ -761,9 +784,26 @@ class BallTrackerNode(Node):
                 ball_width = abs(x2 - x1)
                 ball_height = abs(y2 - y1)
 
+                # Check if ball is clipped at image edge (partial detection)
+                # RoboFlow often returns bbox extending to image edge (e.g., x2=640.0)
+                is_clipped_left = x1 <= 1.0
+                is_clipped_right = x2 >= (self.image_width - 1.0)
+                is_clipped_top = y1 <= 1.0
+                is_clipped_bottom = y2 >= (self.image_height - 1.0)
+                is_clipped = is_clipped_left or is_clipped_right or is_clipped_top or is_clipped_bottom
+                
                 # Clamp to image bounds to keep math sane if detector returns out-of-range coords.
                 ball_center_x = max(0.0, min(float(self.image_width - 1), ball_center_x))
                 ball_center_y = max(0.0, min(float(self.image_height - 1), ball_center_y))
+                
+                # Log clipped detections occasionally for debugging
+                if is_clipped and self._log_counter % 10 == 0:
+                    edges = []
+                    if is_clipped_left: edges.append("LEFT")
+                    if is_clipped_right: edges.append("RIGHT")
+                    if is_clipped_top: edges.append("TOP")
+                    if is_clipped_bottom: edges.append("BOTTOM")
+                    self.get_logger().debug(f"Ball clipped at edge: {', '.join(edges)}")
 
                 # Glitch filter: reject single-frame jumps that exceed max_jump_px_s.
                 if self._last_ball_center is not None and self._last_ball_time_s is not None:
@@ -895,23 +935,27 @@ class BallTrackerNode(Node):
                         self.get_logger().info(' '.join(msg_parts))
                         self.controller._last_tune_info['kp_changed'] = False
                 
-                if self._log_counter % 3 == 0:  # Log every 3rd update for better debugging
+                if self._log_counter % 5 == 0:  # Log every 5th update to reduce spam
+                    # Calculate tracking quality metrics
+                    error_magnitude = math.sqrt(error_x**2 + error_y**2)
+                    
                     # Include adaptive gain info if enabled
                     if self.controller._adaptive_enabled:
                         self.get_logger().info(
                             f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
                             f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
-                            f'err: ({error_x:.1f}, {error_y:.1f}), '
-                            f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}° | '
+                            f'error: {error_magnitude:.1f}px ({error_x:+.1f}, {error_y:+.1f}), '
+                            f'servo: pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}° | '
                             f'Kp: {self.controller._kp_pan_adaptive:.2f}/{self.controller._kp_tilt_adaptive:.2f}, '
+                            f'Kd: {self.controller._kd_pan_adaptive:.3f}/{self.controller._kd_tilt_adaptive:.3f}, '
                             f'Ki: {self.controller._ki_pan:.3f}/{self.controller._ki_tilt:.3f}'
                         )
                     else:
                         self.get_logger().info(
                             f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
                             f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
-                            f'err: ({error_x:.1f}, {error_y:.1f}), '
-                            f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
+                            f'error: {error_magnitude:.1f}px ({error_x:+.1f}, {error_y:+.1f}), '
+                            f'servo: pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
                         )
                 
                 self.last_detection_time = current_time
