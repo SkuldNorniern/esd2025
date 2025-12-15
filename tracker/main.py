@@ -281,8 +281,20 @@ class Controller:
         delta_pan = max(-self.max_step_deg, min(self.max_step_deg, delta_pan))
         delta_tilt = max(-self.max_step_deg, min(self.max_step_deg, delta_tilt))
 
-        self.pan_angle = max(self.pan_min, min(self.pan_max, self.pan_angle + delta_pan))
-        self.tilt_angle = max(self.tilt_min, min(self.tilt_max, self.tilt_angle + delta_tilt))
+        # IMPORTANT:
+        # Use the *actual applied* servo movement after limit clamping.
+        # If we dead-reckon the laser estimate using the commanded delta while the servo is
+        # saturated (e.g. pan already at 0°), the estimate can "move" even though the hardware
+        # cannot. That leads to fake small pixel error in logs while the real laser dot is
+        # off-screen.
+        prev_pan = self.pan_angle
+        prev_tilt = self.tilt_angle
+        new_pan = max(self.pan_min, min(self.pan_max, self.pan_angle + delta_pan))
+        new_tilt = max(self.tilt_min, min(self.tilt_max, self.tilt_angle + delta_tilt))
+        applied_delta_pan = new_pan - prev_pan
+        applied_delta_tilt = new_tilt - prev_tilt
+        self.pan_angle = new_pan
+        self.tilt_angle = new_tilt
 
         # Open-loop laser estimate update (dead-reckoning) when no measurement is present.
         # Note: use the *same* sign convention as the pan/tilt inversion mapping:
@@ -294,8 +306,8 @@ class Controller:
             est_x, est_y = self._laser_est_px
             sign_pan = -1.0 if self.invert_pan else 1.0
             sign_tilt = -1.0 if self.invert_tilt else 1.0
-            est_x += sign_pan * self._deg_to_px_x(delta_pan)
-            est_y += sign_tilt * self._deg_to_px_y(delta_tilt)
+            est_x += sign_pan * self._deg_to_px_x(applied_delta_pan)
+            est_y += sign_tilt * self._deg_to_px_y(applied_delta_tilt)
             self._laser_est_px = self._clamp_px(est_x, est_y)
 
         self.last_update = now_s
@@ -450,8 +462,19 @@ class BallTrackerNode(Node):
         # Timestamps for watchdog state
         self._last_laser_seen_time_s: Optional[float] = None
         self._laser_edge_since_s: Optional[float] = None
+        self._laser_estimated_since_s: Optional[float] = None
         self._laser_recovery_active = False
         self._last_laser_recovery_log_s = 0.0
+
+        # If we've previously seen a valid laser measurement, and we are forced into estimation
+        # for "too long", treat that as laser loss and run the recovery behavior.
+        # This catches cases where the dot is out-of-frame but the open-loop estimate remains
+        # in-bounds (e.g. due to clamping / servo saturation).
+        try:
+            self.laser_estimated_max_s = float(os.environ.get("TRACKER_LASER_ESTIMATED_MAX_S", "1.5"))
+        except ValueError:
+            self.laser_estimated_max_s = 1.5
+        self.laser_estimated_max_s = max(0.1, self.laser_estimated_max_s)
         
         # Timeout for reset (2 seconds)
         self.timeout = 2.0
@@ -518,6 +541,7 @@ class BallTrackerNode(Node):
         print(f"  laser_timeout_s: {self.laser_timeout}")
         print(f"  laser_lost_timeout_s: {self.laser_lost_timeout_s}")
         print(f"  laser_edge_margin_px: {self.laser_edge_margin_px}")
+        print(f"  laser_estimated_max_s: {self.laser_estimated_max_s}")
         print(f"  max_jump_px_s: {self.max_jump_px_s}")
         print(f"  HFOV/VFOV deg: {self.controller.hfov_deg}/{self.controller.vfov_deg}")
         print(f"  fx/fy px: {self.controller.fx_px}/{self.controller.fy_px}")
@@ -616,7 +640,11 @@ class BallTrackerNode(Node):
                 if laser_valid:
                     self._last_laser_seen_time_s = current_time
                     self._laser_edge_since_s = None
+                    self._laser_estimated_since_s = None
                     self._laser_recovery_active = False
+                else:
+                    if self._laser_estimated_since_s is None:
+                        self._laser_estimated_since_s = current_time
                 
                 # Laser lost watchdog:
                 # If we have no valid laser measurement for too long, or if our open-loop estimate is
@@ -639,9 +667,17 @@ class BallTrackerNode(Node):
                     self._laser_edge_since_s = None
 
                 edge_for_s = (current_time - self._laser_edge_since_s) if self._laser_edge_since_s is not None else 0.0
+                estimated_for_s = (
+                    (current_time - self._laser_estimated_since_s)
+                    if (self._laser_estimated_since_s is not None)
+                    else 0.0
+                )
 
-                need_recover = ((ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s)) or
-                                (edge_for_s >= self.laser_lost_timeout_s))
+                need_recover = (
+                    (ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s)) or
+                    (edge_for_s >= self.laser_lost_timeout_s) or
+                    (ever_seen_laser and (estimated_for_s >= self.laser_estimated_max_s))
+                )
                 if need_recover:
                     self._laser_recovery_active = True
                     self.controller.reset_to_center()
@@ -652,7 +688,12 @@ class BallTrackerNode(Node):
 
                     # Throttle recovery logs (avoid spamming at control rate).
                     if (current_time - self._last_laser_recovery_log_s) >= 1.0:
-                        why = "lost" if (ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s)) else "edge"
+                        if ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s):
+                            why = "lost"
+                        elif ever_seen_laser and (estimated_for_s >= self.laser_estimated_max_s):
+                            why = "estimated"
+                        else:
+                            why = "edge"
                         self.get_logger().warn(
                             f"Laser out of frame for ~{min(lost_for_s, 999.0):.1f}s (reason={why}); "
                             f"recentering to reacquire (timeout={self.laser_lost_timeout_s:.1f}s)"
@@ -673,6 +714,29 @@ class BallTrackerNode(Node):
                 if self.servo is not None:
                     self.servo.set_pan(pan_angle)
                     self.servo.set_tilt(tilt_angle)
+
+                # If we are saturating the tilt at 0°/180° for a while, it often means:
+                # - the mechanical range is insufficient, OR
+                # - `TRACKER_INVERT_TILT` is wrong for the current servo installation.
+                # This doesn't auto-flip the sign (too risky), but it gives a clear hint.
+                if not hasattr(self, "_tilt_sat_since_s"):
+                    self._tilt_sat_since_s = None
+                at_tilt_min = abs(tilt_angle - self.controller.tilt_min) < 1e-6
+                at_tilt_max = abs(tilt_angle - self.controller.tilt_max) < 1e-6
+                if at_tilt_min or at_tilt_max:
+                    if self._tilt_sat_since_s is None:
+                        self._tilt_sat_since_s = current_time
+                    elif (current_time - self._tilt_sat_since_s) >= 1.0:
+                        if not hasattr(self, "_last_tilt_sat_log_s"):
+                            self._last_tilt_sat_log_s = 0.0
+                        if (current_time - self._last_tilt_sat_log_s) >= 2.0:
+                            self.get_logger().warn(
+                                "Tilt servo saturated at limit (0° or 180°). "
+                                "If the laser moves the wrong way vertically, toggle TRACKER_INVERT_TILT (0/1)."
+                            )
+                            self._last_tilt_sat_log_s = current_time
+                else:
+                    self._tilt_sat_since_s = None
                 
                 # Calculate error relative to actual laser position
                 # Use controller's current internal estimate for logging error.
