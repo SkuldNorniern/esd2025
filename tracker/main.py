@@ -425,8 +425,9 @@ class BallTrackerNode(Node):
                 ball_center_x = (x1 + x2) / 2.0
                 ball_center_y = (y1 + y2) / 2.0
                 
-                # Get laser position from ROS topic (from calibration node), or fallback to image center
+                # Get laser position from ROS topic (from calibration node)
                 # Check if laser is within the ball's bounding box area (avoids feedback loop)
+                # If laser position is "none" or not available, reset servos to center instead of using (320, 320)
                 if (self.laser_pos is not None and 
                     current_time - self.last_laser_update < self.laser_timeout):
                     laser_x, laser_y = self.laser_pos
@@ -441,9 +442,13 @@ class BallTrackerNode(Node):
                         laser_x = self.image_width / 2.0
                         laser_y = self.image_height / 2.0
                 else:
-                    # Fallback to image center if no laser position received
-                    laser_x = self.image_width / 2.0
-                    laser_y = self.image_height / 2.0
+                    # No laser position available ("none") - reset servos to center
+                    if self.servo is not None:
+                        self.servo.set_pan(90.0)
+                        self.servo.set_tilt(90.0)
+                    # Reset controller to center position
+                    self.controller.reset_to_center()
+                    return  # Skip tracking when no laser position
                 
                 # Publish laser position (where servos are pointing = ball center when tracking)
                 # This is for calibration - the actual laser position should come from a separate calibration node
