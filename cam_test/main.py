@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Camera test node - Python version
-Captures frames from /dev/video2 using V4L2 and publishes to ROS2 /image topic
+Captures frames from /dev/video1 using V4L2 and publishes to ROS2 /image topic
 
 Requirements:
 - ROS2 installed and sourced (source /opt/ros/<distro>/setup.bash)
@@ -14,6 +14,50 @@ import time
 import signal
 import os
 import warnings
+
+# Install stderr filter BEFORE importing OpenCV to catch all warnings
+class StderrFilter:
+    """Filter stderr to suppress OpenCV JPEG corruption warnings"""
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+        self.buffer = ''
+    
+    def write(self, message):
+        # Handle both string and bytes
+        if isinstance(message, bytes):
+            message = message.decode('utf-8', errors='ignore')
+        
+        # Accumulate partial messages (OpenCV may write in chunks)
+        self.buffer += message
+        
+        # Check if we have a complete line or message
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+            # Filter out OpenCV JPEG corruption warnings
+            if 'Corrupt JPEG data' in line or 'premature end of data segment' in line:
+                continue
+            # Pass through all other messages
+            self.original_stderr.write(line + '\n')
+        
+        # If buffer is getting too large, flush it (shouldn't happen normally)
+        if len(self.buffer) > 1000:
+            self.original_stderr.write(self.buffer)
+            self.buffer = ''
+    
+    def flush(self):
+        # Flush any remaining buffer
+        if self.buffer:
+            if 'Corrupt JPEG data' not in self.buffer and 'premature end of data segment' not in self.buffer:
+                self.original_stderr.write(self.buffer)
+            self.buffer = ''
+        self.original_stderr.flush()
+    
+    def __getattr__(self, name):
+        return getattr(self.original_stderr, name)
+
+# Install stderr filter early, before OpenCV import
+_original_stderr = sys.stderr
+sys.stderr = StderrFilter(_original_stderr)
 
 try:
     import rclpy
@@ -41,30 +85,17 @@ try:
     warnings.filterwarnings('ignore', category=UserWarning)
     # Set environment variable (may work for some OpenCV builds)
     os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+    # Try to set OpenCV log level programmatically if available
+    try:
+        cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+    except AttributeError:
+        # Older OpenCV versions may not have setLogLevel
+        pass
 except ImportError:
     CV2_AVAILABLE = False
     print("Error: opencv-python not available")
     print("  Install with: pip install opencv-python")
     sys.exit(1)
-
-
-class StderrFilter:
-    """Filter stderr to suppress OpenCV JPEG corruption warnings"""
-    def __init__(self, original_stderr):
-        self.original_stderr = original_stderr
-    
-    def write(self, message):
-        # Filter out OpenCV JPEG corruption warnings
-        if 'Corrupt JPEG data' in message or 'premature end of data segment' in message:
-            return
-        # Pass through all other messages
-        self.original_stderr.write(message)
-    
-    def flush(self):
-        self.original_stderr.flush()
-    
-    def __getattr__(self, name):
-        return getattr(self.original_stderr, name)
 
 
 class CameraNode(Node):
@@ -79,10 +110,6 @@ class CameraNode(Node):
         self.width = 640
         self.height = 640
         self.fps = 30
-        
-        # Install stderr filter to suppress OpenCV JPEG corruption warnings
-        self.original_stderr = sys.stderr
-        sys.stderr = StderrFilter(self.original_stderr)
         
         # Initialize camera
         self.get_logger().info('Initializing camera node with V4L2...')
@@ -159,9 +186,6 @@ class CameraNode(Node):
     def signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         self.get_logger().info('Shutting down...')
-        # Restore original stderr
-        if hasattr(self, 'original_stderr'):
-            sys.stderr = self.original_stderr
         if self.cap.isOpened():
             self.cap.release()
         rclpy.shutdown()
@@ -301,11 +325,10 @@ def main(args=None):
         pass
     finally:
         if 'node' in locals():
-            # Restore original stderr
-            if hasattr(node, 'original_stderr'):
-                sys.stderr = node.original_stderr
             if node.cap.isOpened():
                 node.cap.release()
+        # Restore original stderr
+        sys.stderr = _original_stderr
         rclpy.shutdown()
 
 
