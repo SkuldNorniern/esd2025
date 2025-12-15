@@ -121,19 +121,22 @@ class Controller:
         self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.08)
         self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.08)
 
-        # Physical servo-to-laser mapping (verified from measurements):
-        #   Pan INCREASE = Laser moves RIGHT (X increases)
-        #   Pan DECREASE = Laser moves LEFT (X decreases)
-        #   Tilt INCREASE = Laser moves DOWN (Y increases)
-        #   Tilt DECREASE = Laser moves UP (Y decreases)
+        # Physical servo-to-laser mapping:
+        #   Pan INCREASE = Laser moves RIGHT (X increases) OR LEFT (X decreases) - depends on setup
+        #   Pan DECREASE = Laser moves LEFT (X decreases) OR RIGHT (X increases) - depends on setup
+        #   Tilt INCREASE = Laser moves DOWN (Y increases) OR UP (Y decreases) - depends on setup
+        #   Tilt DECREASE = Laser moves UP (Y decreases) OR DOWN (Y increases) - depends on setup
         #
-        # With this mapping:
-        #   - Positive X error (ball right of laser) needs positive pan delta
-        #   - Positive Y error (ball below laser) needs positive tilt delta
-        # So both inversions should be False by default.
-        # Override with TRACKER_INVERT_PAN=1 or TRACKER_INVERT_TILT=1 if your
-        # physical setup has the opposite relationship.
-        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", False)
+        # Control logic:
+        #   - Positive X error (ball right of laser) needs to move laser RIGHT
+        #   - Negative X error (ball left of laser) needs to move laser LEFT
+        #   - Positive Y error (ball below laser) needs to move laser DOWN
+        #   - Negative Y error (ball above laser) needs to move laser UP
+        #
+        # Default: Pan is INVERTED (pan increase moves laser LEFT, decrease moves RIGHT)
+        #          Tilt is NOT inverted (tilt increase moves laser DOWN, decrease moves UP)
+        # Override with TRACKER_INVERT_PAN=0 or TRACKER_INVERT_TILT=1 if your setup differs.
+        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", True)  # Changed default to True
         self.invert_tilt = self._env_bool("TRACKER_INVERT_TILT", False)
 
         self.pan_center = self._env_float("TRACKER_PAN_CENTER_DEG", 90.0)
@@ -623,10 +626,10 @@ class Controller:
         self.tilt_angle = new_tilt
 
         # Open-loop laser estimate update (dead-reckoning) when no measurement is present.
-        # Sign convention (with default invert_pan=False, invert_tilt=False):
-        # - Increasing pan moves laser RIGHT => x increases
+        # Sign convention (with default invert_pan=True, invert_tilt=False):
+        # - Increasing pan moves laser LEFT => x decreases (inverted)
         # - Increasing tilt moves laser DOWN => y increases
-        # If invert flags are True, the relationship is flipped.
+        # If invert flags are changed, the relationship is flipped.
         if not laser_measured:
             if self._laser_est_px is None:
                 self._laser_est_px = (self.cx_px, self.cy_px)
@@ -902,7 +905,15 @@ class BallTrackerNode(Node):
         print()
         print(f"Servo Configuration:")
         print(f"  Center: pan={self.controller.pan_center}°, tilt={self.controller.tilt_center}°")
-        print(f"  Invert: pan={self.controller.invert_pan}, tilt={self.controller.invert_tilt}")
+        print(f"  Invert: pan={self.controller.invert_pan} (default: True), tilt={self.controller.invert_tilt} (default: False)")
+        if self.controller.invert_pan:
+            print(f"    Pan INVERTED: Increase pan -> Laser moves LEFT, Decrease pan -> Laser moves RIGHT")
+        else:
+            print(f"    Pan NORMAL: Increase pan -> Laser moves RIGHT, Decrease pan -> Laser moves LEFT")
+        if self.controller.invert_tilt:
+            print(f"    Tilt INVERTED: Increase tilt -> Laser moves UP, Decrease tilt -> Laser moves DOWN")
+        else:
+            print(f"    Tilt NORMAL: Increase tilt -> Laser moves DOWN, Decrease tilt -> Laser moves UP")
         print(f"  Limits: pan=[{self.controller.pan_min}°, {self.controller.pan_max}°], tilt=[{self.controller.tilt_min}°, {self.controller.tilt_max}°]")
         print(f"  Max speed: {self.controller.max_speed_deg_s}°/s")
         print(f"  Max step: {self.controller.max_step_deg}° per tick")
