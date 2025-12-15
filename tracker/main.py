@@ -462,19 +462,19 @@ class BallTrackerNode(Node):
         # Timestamps for watchdog state
         self._last_laser_seen_time_s: Optional[float] = None
         self._laser_edge_since_s: Optional[float] = None
-        self._laser_estimated_since_s: Optional[float] = None
+        self._laser_estimated_steps: int = 0
         self._laser_recovery_active = False
         self._last_laser_recovery_log_s = 0.0
 
         # If we've previously seen a valid laser measurement, and we are forced into estimation
-        # for "too long", treat that as laser loss and run the recovery behavior.
-        # This catches cases where the dot is out-of-frame but the open-loop estimate remains
-        # in-bounds (e.g. due to clamping / servo saturation).
+        # for "too many ticks", treat that as laser loss and run the recovery behavior.
+        # This is intentionally step-based (not time-based) to match the control loop cadence:
+        # "allow a few dead-reckoning steps, then declare lost".
         try:
-            self.laser_estimated_max_s = float(os.environ.get("TRACKER_LASER_ESTIMATED_MAX_S", "1.5"))
+            self.laser_estimated_max_steps = int(os.environ.get("TRACKER_LASER_ESTIMATED_MAX_STEPS", "5"))
         except ValueError:
-            self.laser_estimated_max_s = 1.5
-        self.laser_estimated_max_s = max(0.1, self.laser_estimated_max_s)
+            self.laser_estimated_max_steps = 5
+        self.laser_estimated_max_steps = max(1, self.laser_estimated_max_steps)
         
         # Timeout for reset (2 seconds)
         self.timeout = 2.0
@@ -541,7 +541,7 @@ class BallTrackerNode(Node):
         print(f"  laser_timeout_s: {self.laser_timeout}")
         print(f"  laser_lost_timeout_s: {self.laser_lost_timeout_s}")
         print(f"  laser_edge_margin_px: {self.laser_edge_margin_px}")
-        print(f"  laser_estimated_max_s: {self.laser_estimated_max_s}")
+        print(f"  laser_estimated_max_steps: {self.laser_estimated_max_steps}")
         print(f"  max_jump_px_s: {self.max_jump_px_s}")
         print(f"  HFOV/VFOV deg: {self.controller.hfov_deg}/{self.controller.vfov_deg}")
         print(f"  fx/fy px: {self.controller.fx_px}/{self.controller.fy_px}")
@@ -640,11 +640,10 @@ class BallTrackerNode(Node):
                 if laser_valid:
                     self._last_laser_seen_time_s = current_time
                     self._laser_edge_since_s = None
-                    self._laser_estimated_since_s = None
+                    self._laser_estimated_steps = 0
                     self._laser_recovery_active = False
                 else:
-                    if self._laser_estimated_since_s is None:
-                        self._laser_estimated_since_s = current_time
+                    self._laser_estimated_steps += 1
                 
                 # Laser lost watchdog:
                 # If we have no valid laser measurement for too long, or if our open-loop estimate is
@@ -667,19 +666,16 @@ class BallTrackerNode(Node):
                     self._laser_edge_since_s = None
 
                 edge_for_s = (current_time - self._laser_edge_since_s) if self._laser_edge_since_s is not None else 0.0
-                estimated_for_s = (
-                    (current_time - self._laser_estimated_since_s)
-                    if (self._laser_estimated_since_s is not None)
-                    else 0.0
-                )
+                estimated_steps = int(self._laser_estimated_steps)
 
                 need_recover = (
                     (ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s)) or
                     (edge_for_s >= self.laser_lost_timeout_s) or
-                    (ever_seen_laser and (estimated_for_s >= self.laser_estimated_max_s))
+                    (ever_seen_laser and (estimated_steps >= self.laser_estimated_max_steps))
                 )
                 if need_recover:
                     self._laser_recovery_active = True
+                    self._laser_estimated_steps = 0
                     self.controller.reset_to_center()
                     self.controller.reset_laser_estimate_to_center()
                     if self.servo is not None:
@@ -690,13 +686,14 @@ class BallTrackerNode(Node):
                     if (current_time - self._last_laser_recovery_log_s) >= 1.0:
                         if ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s):
                             why = "lost"
-                        elif ever_seen_laser and (estimated_for_s >= self.laser_estimated_max_s):
-                            why = "estimated"
+                        elif ever_seen_laser and (estimated_steps >= self.laser_estimated_max_steps):
+                            why = "estimated_steps"
                         else:
                             why = "edge"
                         self.get_logger().warn(
-                            f"Laser out of frame for ~{min(lost_for_s, 999.0):.1f}s (reason={why}); "
-                            f"recentering to reacquire (timeout={self.laser_lost_timeout_s:.1f}s)"
+                            f"Laser likely out of frame (reason={why}); recentering to reacquire "
+                            f"(lost_timeout_s={self.laser_lost_timeout_s:.1f}, "
+                            f"estimated_steps={estimated_steps}/{self.laser_estimated_max_steps})"
                         )
                         self._last_laser_recovery_log_s = current_time
                     return

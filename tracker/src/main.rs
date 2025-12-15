@@ -440,6 +440,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main() -> Result<(), TrackerError> {
+    println!(
+        "esd2025 tracker (Rust) build: {} {} (uses software_pwm via rppal::gpio, not rppal::pwm)",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "If you see 'test mode - ROS2 disabled' or 'Failed to create pan PWM', you are running an old binary. Rebuild with: `cargo build --release -p tracker`."
+    );
     println!("Initializing tracker node...");
     println!("GPIO18: Pan servo (Left-Right)");
     println!("GPIO19: Tilt servo (Up-Down)");
