@@ -309,6 +309,20 @@ class Controller:
         self.pan_angle = float(self.pan_center)
         self.tilt_angle = float(self.tilt_center)
 
+    def reset_laser_estimate_to_center(self) -> None:
+        """
+        Reset the internal laser position estimate to the image center.
+
+        Why this exists:
+        - When `/laser_pos` is unavailable (e.g. the laser dot is out of frame),
+          the controller uses an open-loop estimate that can drift and/or end up
+          pinned at the image boundary due to clamping.
+        - In those cases, it is safer to explicitly re-seed the estimate so that
+          reacquisition logic (in the node) can bring the system back to a known state.
+        """
+        self._laser_ema = None
+        self._laser_est_px = (self.cx_px, self.cy_px)
+
 
 def parse_coordinates(s: str) -> Optional[Tuple[float, float, float, float]]:
     """Parse coordinates string: 'x1,y1,x2,y2' or 'none'"""
@@ -414,6 +428,30 @@ class BallTrackerNode(Node):
         self.last_laser_update = time.time()
         # If no `/laser_pos` update for this long, fall back to open-loop estimation.
         self.laser_timeout = 1.0
+
+        # Laser "lost" behavior:
+        # - If we have not received a *valid in-frame* `/laser_pos` for this long,
+        #   we stop dead-reckoning and re-center to try to get the dot back in view.
+        # - Additionally, if we are in open-loop mode and the estimated laser position
+        #   sits near the image edge for too long, treat that as "likely out of frame"
+        #   and do the same recovery action.
+        try:
+            self.laser_lost_timeout_s = float(os.environ.get("TRACKER_LASER_LOST_TIMEOUT_S", "0.8"))
+        except ValueError:
+            self.laser_lost_timeout_s = 0.8
+        self.laser_lost_timeout_s = max(0.1, self.laser_lost_timeout_s)
+
+        try:
+            self.laser_edge_margin_px = float(os.environ.get("TRACKER_LASER_EDGE_MARGIN_PX", "8.0"))
+        except ValueError:
+            self.laser_edge_margin_px = 8.0
+        self.laser_edge_margin_px = max(0.0, self.laser_edge_margin_px)
+
+        # Timestamps for watchdog state
+        self._last_laser_seen_time_s: Optional[float] = None
+        self._laser_edge_since_s: Optional[float] = None
+        self._laser_recovery_active = False
+        self._last_laser_recovery_log_s = 0.0
         
         # Timeout for reset (2 seconds)
         self.timeout = 2.0
@@ -478,6 +516,8 @@ class BallTrackerNode(Node):
         print(f"  control_hz: {1.0 / self.control_period_s:.1f}")
         print(f"  image: {self.image_width}x{self.image_height}")
         print(f"  laser_timeout_s: {self.laser_timeout}")
+        print(f"  laser_lost_timeout_s: {self.laser_lost_timeout_s}")
+        print(f"  laser_edge_margin_px: {self.laser_edge_margin_px}")
         print(f"  max_jump_px_s: {self.max_jump_px_s}")
         print(f"  HFOV/VFOV deg: {self.controller.hfov_deg}/{self.controller.vfov_deg}")
         print(f"  fx/fy px: {self.controller.fx_px}/{self.controller.fy_px}")
@@ -503,6 +543,15 @@ class BallTrackerNode(Node):
         parsed = parse_laser_position(msg.data)
         self.laser_pos = parsed
         self.last_laser_update = time.time()
+
+    def _laser_in_frame(self, x: float, y: float) -> bool:
+        return (0.0 <= x < float(self.image_width)) and (0.0 <= y < float(self.image_height))
+
+    def _laser_near_edge(self, x: float, y: float) -> bool:
+        m = float(self.laser_edge_margin_px)
+        w = float(self.image_width)
+        h = float(self.image_height)
+        return (x <= m) or (x >= (w - 1.0 - m)) or (y <= m) or (y >= (h - 1.0 - m))
     
     def control_loop(self) -> None:
         """Main control loop - runs at `TRACKER_CONTROL_HZ`."""
@@ -546,14 +595,71 @@ class BallTrackerNode(Node):
                 # Get laser position from ROS topic (from calibration node)
                 # If `/laser_pos` is not available, we fall back to open-loop:
                 # keep the latest laser estimate and dead-reckon based on the servo commands.
+                laser_valid = False
+                laser_x: Optional[float]
+                laser_y: Optional[float]
                 if self.laser_pos is not None and (current_time - self.last_laser_update) < self.laser_timeout:
-                    laser_x, laser_y = self.laser_pos
-                    laser_source = "measured"
+                    lx_meas, ly_meas = self.laser_pos
+                    if self._laser_in_frame(lx_meas, ly_meas):
+                        laser_valid = True
+                        laser_x, laser_y = lx_meas, ly_meas
+                        laser_source = "measured"
+                    else:
+                        # Treat out-of-range measurements as invalid (e.g., detector bug / partial frame math).
+                        laser_x, laser_y = None, None
+                        laser_source = "estimated"
                 else:
                     # No laser measurement: let the controller use its internal estimate based on servo motion.
                     laser_x, laser_y = None, None
                     laser_source = "estimated"
+
+                if laser_valid:
+                    self._last_laser_seen_time_s = current_time
+                    self._laser_edge_since_s = None
+                    self._laser_recovery_active = False
                 
+                # Laser lost watchdog:
+                # If we have no valid laser measurement for too long, or if our open-loop estimate is
+                # stuck near an edge for too long (likely means the real dot is out-of-frame),
+                # then re-center to help reacquire.
+                last_seen = self._last_laser_seen_time_s
+                ever_seen_laser = last_seen is not None
+                # If `/laser_pos` was never available, don't force "lost" recovery forever.
+                # In that setup, rely on the "estimate pinned near edge" detector instead.
+                lost_for_s = (current_time - last_seen) if last_seen is not None else 0.0
+
+                est_x, est_y = None, None
+                if self.controller._laser_est_px is not None:
+                    est_x, est_y = self.controller._laser_est_px
+
+                if not laser_valid and est_x is not None and est_y is not None and self._laser_near_edge(est_x, est_y):
+                    if self._laser_edge_since_s is None:
+                        self._laser_edge_since_s = current_time
+                else:
+                    self._laser_edge_since_s = None
+
+                edge_for_s = (current_time - self._laser_edge_since_s) if self._laser_edge_since_s is not None else 0.0
+
+                need_recover = ((ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s)) or
+                                (edge_for_s >= self.laser_lost_timeout_s))
+                if need_recover:
+                    self._laser_recovery_active = True
+                    self.controller.reset_to_center()
+                    self.controller.reset_laser_estimate_to_center()
+                    if self.servo is not None:
+                        self.servo.set_pan(self.controller.pan_center)
+                        self.servo.set_tilt(self.controller.tilt_center)
+
+                    # Throttle recovery logs (avoid spamming at control rate).
+                    if (current_time - self._last_laser_recovery_log_s) >= 1.0:
+                        why = "lost" if (ever_seen_laser and (lost_for_s >= self.laser_lost_timeout_s)) else "edge"
+                        self.get_logger().warn(
+                            f"Laser out of frame for ~{min(lost_for_s, 999.0):.1f}s (reason={why}); "
+                            f"recentering to reacquire (timeout={self.laser_lost_timeout_s:.1f}s)"
+                        )
+                        self._last_laser_recovery_log_s = current_time
+                    return
+
                 pan_angle, tilt_angle = self.controller.update(
                     ball_center_x=ball_center_x,
                     ball_center_y=ball_center_y,
