@@ -35,7 +35,7 @@ impl std::error::Error for CameraError {}
 
 fn find_v4l_device() -> Result<String, CameraError> {
     // Use /dev/video2 specifically as requested
-    let device_path = "/dev/video2";
+    let device_path = "/dev/video1";
     
     if std::path::Path::new(device_path).exists() {
         // Try to open it to verify it's a capture device

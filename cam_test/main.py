@@ -120,6 +120,10 @@ class CameraNode(Node):
         fourcc_code = int(self.cap.get(cv2.CAP_PROP_FOURCC))
         fourcc_str = ''.join([chr((fourcc_code >> 8 * i) & 0xFF) for i in range(4)])
         
+        # Update dimensions to match actual camera format
+        self.width = actual_width
+        self.height = actual_height
+        
         self.get_logger().info(f'Found camera device: {self.device_path}')
         self.get_logger().info(f'Camera format: {actual_width}x{actual_height} {fourcc_str}')
         
@@ -173,18 +177,34 @@ class CameraNode(Node):
             return False
         if len(frame.shape) < 2:
             return False
-        # Check dimensions match expected size (allow small tolerance)
+        
         height, width = frame.shape[:2]
-        if abs(height - self.height) > 2 or abs(width - self.width) > 2:
+        
+        # Check dimensions are reasonable (allow some tolerance for camera variations)
+        # Allow up to 10% difference in dimensions
+        height_tolerance = max(10, int(self.height * 0.1))
+        width_tolerance = max(10, int(self.width * 0.1))
+        if abs(height - self.height) > height_tolerance or abs(width - self.width) > width_tolerance:
             return False
-        # Check for all-zero or all-same-value frames (likely corrupted)
-        if np.all(frame == 0) or (len(np.unique(frame)) == 1 and frame.size > 100):
+        
+        # Check for all-zero frames (likely corrupted or camera not ready)
+        # Only reject if the entire frame is zero (not just dark)
+        if np.all(frame == 0):
             return False
+        
+        # Check for frames that are too uniform (likely corrupted)
+        # Only reject if frame is large and has very few unique values (suspicious)
+        if frame.size > 10000:
+            unique_count = len(np.unique(frame))
+            # If a large frame has only 1-2 unique values, it's likely corrupted
+            if unique_count <= 2:
+                return False
+        
         return True
     
     def capture_and_publish(self):
         """Capture frame and publish to ROS topic"""
-        max_retries = 3
+        max_retries = 5
         frame = None
         
         # Try to capture a valid frame with retries
