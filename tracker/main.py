@@ -251,6 +251,22 @@ class Controller:
         err_px_x = ball_center_x - laser_x
         err_px_y = ball_center_y - laser_y
 
+        # If the measured laser dot overlaps the detected ball region, stop moving.
+        #
+        # Rationale:
+        # - The ball detector is a bounding box; if the dot is inside that box, we consider it a hit.
+        # - Without this, tiny measurement noise will keep the servos "hunting" even though the dot
+        #   is already on the ball.
+        #
+        # This only applies when the laser is MEASURED (i.e. `/laser_pos` is valid). We don't trust
+        # the open-loop estimate to declare a hit.
+        if laser_measured:
+            half_w = max(1.0, float(ball_width) / 2.0)
+            half_h = max(1.0, float(ball_height) / 2.0)
+            if abs(err_px_x) <= half_w and abs(err_px_y) <= half_h:
+                err_px_x = 0.0
+                err_px_y = 0.0
+
         # Convert pixel error to angular error (degrees).
         err_pan_deg = self._px_to_deg_x(err_px_x)
         err_tilt_deg = self._px_to_deg_y(err_px_y)
