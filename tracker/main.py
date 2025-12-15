@@ -165,6 +165,17 @@ class Controller:
         # Optional EMA smoothing of input points (0..1)
         self.ema_alpha = self._env_float("TRACKER_EMA_ALPHA", 0.4)
 
+        # Prediction parameters
+        # Prediction horizon: how far ahead to predict (seconds)
+        # This accounts for servo response time and control loop delay
+        self.prediction_horizon_s = self._env_float("TRACKER_PREDICTION_HORIZON_S", 0.15)
+        # Velocity EMA smoothing (0..1) - higher = smoother but slower response
+        self.velocity_ema_alpha = self._env_float("TRACKER_VELOCITY_EMA_ALPHA", 0.6)
+        # Minimum velocity threshold (px/s) - below this, don't predict (reduces jitter)
+        self.min_velocity_px_s = self._env_float("TRACKER_MIN_VELOCITY_PX_S", 10.0)
+        # Maximum velocity for prediction (px/s) - cap to prevent wild predictions
+        self.max_velocity_px_s = self._env_float("TRACKER_MAX_VELOCITY_PX_S", 2000.0)
+
         self.last_update = time.time()
         self.last_err_pan_deg = 0.0
         self.last_err_tilt_deg = 0.0
@@ -174,6 +185,10 @@ class Controller:
         # If `/laser_pos` is not available, we keep the last estimate and update it
         # based on the commanded servo angles (open-loop).
         self._laser_est_px: Optional[Tuple[float, float]] = None
+        
+        # Ball velocity tracking for prediction
+        self._ball_velocity_px_s: Optional[Tuple[float, float]] = None
+        self._last_ball_pos: Optional[Tuple[float, float, float]] = None  # (x, y, time)
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -236,6 +251,53 @@ class Controller:
         # Smooth inputs (helps noisy detections / laser dot jitter).
         self._ball_ema = self._ema(self._ball_ema, ball_center_x, ball_center_y)
         ball_center_x, ball_center_y = self._ball_ema
+        
+        # Estimate ball velocity for prediction
+        if self._last_ball_pos is not None:
+            dt_vel = max(0.001, now_s - self._last_ball_pos[2])
+            if dt_vel < 0.5:  # Only use recent measurements (within 0.5s)
+                dx = ball_center_x - self._last_ball_pos[0]
+                dy = ball_center_y - self._last_ball_pos[1]
+                vx_raw = dx / dt_vel
+                vy_raw = dy / dt_vel
+                
+                # Clamp velocity to reasonable limits
+                vx_raw = max(-self.max_velocity_px_s, min(self.max_velocity_px_s, vx_raw))
+                vy_raw = max(-self.max_velocity_px_s, min(self.max_velocity_px_s, vy_raw))
+                
+                # Smooth velocity estimate
+                if self._ball_velocity_px_s is None:
+                    self._ball_velocity_px_s = (vx_raw, vy_raw)
+                else:
+                    alpha_vel = max(0.0, min(1.0, self.velocity_ema_alpha))
+                    vx_old, vy_old = self._ball_velocity_px_s
+                    vx_new = vx_old * (1.0 - alpha_vel) + vx_raw * alpha_vel
+                    vy_new = vy_old * (1.0 - alpha_vel) + vy_raw * alpha_vel
+                    self._ball_velocity_px_s = (vx_new, vy_new)
+            else:
+                # Measurement too old, reset velocity
+                self._ball_velocity_px_s = None
+        
+        # Update position history
+        self._last_ball_pos = (ball_center_x, ball_center_y, now_s)
+        
+        # Predict future ball position
+        predicted_x = ball_center_x
+        predicted_y = ball_center_y
+        if self._ball_velocity_px_s is not None:
+            vx, vy = self._ball_velocity_px_s
+            # Only predict if velocity is significant (reduces jitter on stationary balls)
+            speed = math.sqrt(vx * vx + vy * vy)
+            if speed >= self.min_velocity_px_s:
+                predicted_x = ball_center_x + vx * self.prediction_horizon_s
+                predicted_y = ball_center_y + vy * self.prediction_horizon_s
+                # Clamp prediction to image bounds
+                predicted_x = max(0.0, min(self.image_width - 1.0, predicted_x))
+                predicted_y = max(0.0, min(self.image_height - 1.0, predicted_y))
+        
+        # Use predicted position for control (instead of current position)
+        target_x = predicted_x
+        target_y = predicted_y
 
         laser_measured = (laser_x is not None) and (laser_y is not None)
 
@@ -258,10 +320,11 @@ class Controller:
         dt_raw = max(0.001, now_s - self.last_update)
         dt = min(dt_raw, max(0.001, self.max_dt_s))
 
-        err_px_x = ball_center_x - laser_x
-        err_px_y = ball_center_y - laser_y
+        # Calculate error to predicted position (not current position)
+        err_px_x = target_x - laser_x
+        err_px_y = target_y - laser_y
 
-        # If the *measured* laser dot overlaps the detected ball region, stop moving.
+        # If the *measured* laser dot overlaps the predicted target region, stop moving.
         #
         # Important: do NOT do this when the laser is estimated (open-loop), because the estimate
         # can be wrong; freezing based on a wrong estimate looks like "tracker does nothing".
@@ -347,6 +410,9 @@ class Controller:
         """Reset to center position"""
         self.pan_angle = float(self.pan_center)
         self.tilt_angle = float(self.tilt_center)
+        # Reset velocity tracking when recentering
+        self._ball_velocity_px_s = None
+        self._last_ball_pos = None
 
     def reset_laser_estimate_to_center(self) -> None:
         """
@@ -443,11 +509,13 @@ class BallTrackerNode(Node):
             print("GPIO not available, running in simulation mode")
             self.servo = None
         
-        # Image dimensions (should match camera resolution: 640x640)
-        # Updated from 320x240 to match cam_test resolution change
-        self.image_width = 640
-        self.image_height = 640
+        # Image dimensions (should match camera resolution: 640x480)
+        # Get from environment or use camera's actual resolution
+        self.image_width = int(os.environ.get("TRACKER_IMAGE_WIDTH", "640"))
+        self.image_height = int(os.environ.get("TRACKER_IMAGE_HEIGHT", "480"))
         self.controller = Controller(self.image_width, self.image_height)
+        print(f"  Image dimensions: {self.image_width}x{self.image_height}")
+        print(f"  (Set TRACKER_IMAGE_WIDTH/HEIGHT env vars if different)")
 
         # Reject one-frame detector glitches that jump too far (px/sec).
         # This is extremely common with bounding-box detectors and causes servo snaps.
@@ -551,6 +619,10 @@ class BallTrackerNode(Node):
         print(f"  max_step_deg: {self.controller.max_step_deg}")
         print(f"  deadband_deg: {self.controller.deadband_deg}")
         print(f"  ema_alpha: {self.controller.ema_alpha}")
+        print(f"  prediction_horizon_s: {self.controller.prediction_horizon_s}")
+        print(f"  velocity_ema_alpha: {self.controller.velocity_ema_alpha}")
+        print(f"  min_velocity_px_s: {self.controller.min_velocity_px_s}")
+        print(f"  max_velocity_px_s: {self.controller.max_velocity_px_s}")
         print()
     
     def coords_callback(self, msg: String) -> None:
@@ -707,8 +779,14 @@ class BallTrackerNode(Node):
                 self._log_counter += 1
                 
                 if self._log_counter % 3 == 0:  # Log every 3rd update for better debugging
+                    # Show velocity and prediction info
+                    vel_info = ""
+                    if self.controller._ball_velocity_px_s is not None:
+                        vx, vy = self.controller._ball_velocity_px_s
+                        speed = math.sqrt(vx * vx + vy * vy)
+                        vel_info = f", vel=({vx:.1f},{vy:.1f})px/s speed={speed:.1f}px/s"
                     self.get_logger().info(
-                        f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
+                        f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}){vel_info}, '
                         f'Laser[{laser_source}]: ({lx:.1f}, {ly:.1f}), '
                         f'err: ({error_x:.1f}, {error_y:.1f}), '
                         f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
