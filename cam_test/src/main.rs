@@ -194,6 +194,9 @@ async fn async_main() -> Result<(), CameraError> {
     // Note: stream.next() is a blocking call, but for camera frames it should return quickly (~33ms)
     // If it blocks longer, there may be an issue with the camera
     let mut frame_count = 0u64;
+    // Publish every other frame to reduce network overhead (publish 1, skip 1).
+    // We still dequeue frames continuously so the camera driver buffers don't stall.
+    let publish_every_n: u64 = 2;
     // For 30 FPS, we need ~33ms between frames
     // But we'll capture as fast as possible and let the interval throttle
     let mut interval = tokio::time::interval(Duration::from_millis(33)); // ~30 FPS (33ms = 1000/30)
@@ -228,6 +231,7 @@ async fn async_main() -> Result<(), CameraError> {
         };
 
         frame_count += 1;
+        let should_publish = frame_count % publish_every_n == 1;
         
         // Log every frame initially, then periodically to verify we're capturing
         if frame_count <= 5 || frame_count % 30 == 0 {
@@ -303,6 +307,13 @@ async fn async_main() -> Result<(), CameraError> {
                     meta.sequence, meta.bytesused, buffer.len());
                 eprintln!("  Continuing to publish (will stop warnings)...");
             }
+        }
+
+        if !should_publish {
+            if frame_count % 60 == 0 {
+                println!("Skipping frame #{} to reduce network overhead", frame_count);
+            }
+            continue;
         }
         
         // Debug: Print first few bytes of first valid frame to verify format

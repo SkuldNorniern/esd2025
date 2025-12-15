@@ -78,6 +78,8 @@ class CameraNode(Node):
 
         self.frame_count = 0
         self.bad_count = 0
+        # Publish every other frame to reduce network overhead (publish 1, skip 1).
+        self.publish_every_n = 2
 
         period = 1.0 / max(1.0, self.req_fps)
         self.timer = self.create_timer(period, self.capture_and_publish)
@@ -118,6 +120,11 @@ class CameraNode(Node):
 
         stamp = self.get_clock().now().to_msg()
 
+        # Publish throttling (reduce network overhead)
+        self.frame_count += 1
+        if self.frame_count % self.publish_every_n == 0:
+            return
+
         # 1) Publish raw /image (RGB8) for compatibility with your existing pipeline
         if self.publish_raw:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -146,8 +153,6 @@ class CameraNode(Node):
         cmsg.format = "jpeg"
         cmsg.data = jpeg.tobytes()
         self.pub_jpeg.publish(cmsg)
-
-        self.frame_count += 1
         if self.frame_count % 30 == 0:
             self.get_logger().info(
                 f"Published #{self.frame_count} {w}x{h} jpeg={len(cmsg.data)}B bad={self.bad_count}"
