@@ -166,9 +166,13 @@ class CameraNode(Node):
                 self.laser_pos_callback,
                 10
             )
-            # Create display window
-            cv2.namedWindow("Camera Tracking View", cv2.WINDOW_NORMAL)
+            # Start window thread for better responsiveness
+            cv2.startWindowThread()
+            # Create display window with proper flags for responsiveness
+            cv2.namedWindow("Camera Tracking View", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
             cv2.resizeWindow("Camera Tracking View", 640, 640)
+            # Allow window to process events
+            cv2.waitKey(10)
             # Create timer for display update (30 Hz)
             self.display_timer = self.create_timer(1.0/30.0, self.update_display)
 
@@ -275,7 +279,12 @@ class CameraNode(Node):
         
         # Display the frame
         cv2.imshow("Camera Tracking View", display_frame)
-        cv2.waitKey(1)
+        # Use longer wait to allow GUI event processing
+        key = cv2.waitKey(10) & 0xFF
+        if key == 27:  # ESC key to close
+            self.get_logger().info("ESC pressed - closing tracking view")
+            self.show_tracking = False
+            cv2.destroyAllWindows()
 
     def _sig(self, *_):
         self.get_logger().info("Shutting down...")
