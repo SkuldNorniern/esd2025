@@ -87,10 +87,18 @@ impl ServoController {
             )));
         }
 
-        let pan_servo = SoftwarePwmServo::new(18)
-            .map_err(|e| TrackerError::Pwm(format!("Failed to initialize pan servo on GPIO18: {:?}. {}", e, diag)))?;
-        let tilt_servo = SoftwarePwmServo::new(19)
-            .map_err(|e| TrackerError::Pwm(format!("Failed to initialize tilt servo on GPIO19: {:?}. {}", e, diag)))?;
+        let pan_servo = SoftwarePwmServo::new(18).map_err(|e| {
+            TrackerError::Pwm(format!(
+                "Failed to initialize pan servo on GPIO18: {}. {}",
+                e, diag
+            ))
+        })?;
+        let tilt_servo = SoftwarePwmServo::new(19).map_err(|e| {
+            TrackerError::Pwm(format!(
+                "Failed to initialize tilt servo on GPIO19: {}. {}",
+                e, diag
+            ))
+        })?;
 
         Ok(Self { pan_servo, tilt_servo })
     }
@@ -466,9 +474,20 @@ async fn async_main() -> Result<(), TrackerError> {
         controller.fx, controller.fy, controller.cx, controller.cy
     );
 
-    let servo = ServoController::new()?;
-    servo.set_pan(controller.cfg.pan_center_deg)?;
-    servo.set_tilt(controller.cfg.tilt_center_deg)?;
+    let servo_disabled = std::env::var("TRACKER_DISABLE_SERVO")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(false);
+
+    let servo = if servo_disabled {
+        println!("Servo output disabled (TRACKER_DISABLE_SERVO=1). Will only log computed angles.");
+        None
+    } else {
+        let servo = ServoController::new()?;
+        servo.set_pan(controller.cfg.pan_center_deg)?;
+        servo.set_tilt(controller.cfg.tilt_center_deg)?;
+        Some(servo)
+    };
 
     println!("Subscribing to /ball_coords ...");
     let (mut rx_coords, _node_coords) = create_topic_receiver::<StringMsg>(
@@ -529,8 +548,10 @@ async fn async_main() -> Result<(), TrackerError> {
         if received_at.elapsed() > timeout {
             if last_detection_time.elapsed() > timeout {
                 controller.reset_to_center();
-                servo.set_pan(controller.cfg.pan_center_deg)?;
-                servo.set_tilt(controller.cfg.tilt_center_deg)?;
+                if let Some(servo) = &servo {
+                    servo.set_pan(controller.cfg.pan_center_deg)?;
+                    servo.set_tilt(controller.cfg.tilt_center_deg)?;
+                }
                 println!("No detection for {}s, resetting to center", timeout.as_secs());
                 last_detection_time = Instant::now();
             }
@@ -581,8 +602,10 @@ async fn async_main() -> Result<(), TrackerError> {
         last_good_center_at = Instant::now();
 
         let (pan_angle, tilt_angle) = controller.update(cx as f64, cy as f64);
-        servo.set_pan(pan_angle)?;
-        servo.set_tilt(tilt_angle)?;
+        if let Some(servo) = &servo {
+            servo.set_pan(pan_angle)?;
+            servo.set_tilt(tilt_angle)?;
+        }
         last_detection_time = Instant::now();
 
         // Log periodically with pixel error, angular error, and servo angles.

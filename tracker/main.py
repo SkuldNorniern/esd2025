@@ -316,6 +316,15 @@ class BallTrackerNode(Node):
         self.image_width = 640
         self.image_height = 640
         self.controller = Controller(self.image_width, self.image_height)
+
+        # Reject one-frame detector glitches that jump too far (px/sec).
+        # This is extremely common with bounding-box detectors and causes servo snaps.
+        try:
+            self.max_jump_px_s = float(os.environ.get("TRACKER_MAX_JUMP_PX_S", "2000.0"))
+        except ValueError:
+            self.max_jump_px_s = 2000.0
+        self._last_ball_center: Optional[Tuple[float, float]] = None
+        self._last_ball_time_s: Optional[float] = None
         
         # Ball coordinates state
         self.coords: Optional[Tuple[float, float, float, float]] = None
@@ -360,12 +369,36 @@ class BallTrackerNode(Node):
         print("  Format: 'x,y' or 'none'")
         print()
         
-        # Create timer for control loop (10Hz = 100ms)
-        self.timer = self.create_timer(0.1, self.control_loop)
+        # Create timer for control loop.
+        # Higher rates reduce lag, but if your servos buzz or overshoot, reduce TRACKER_CONTROL_HZ.
+        try:
+            control_hz = float(os.environ.get("TRACKER_CONTROL_HZ", "20.0"))
+        except ValueError:
+            control_hz = 20.0
+        control_hz = max(2.0, min(60.0, control_hz))
+        self.control_period_s = 1.0 / control_hz
+        self.timer = self.create_timer(self.control_period_s, self.control_loop)
         
         print("Tracker node initialized")
         print("Waiting for ball detection data...")
         print("(Press Ctrl+C to stop)")
+        print()
+
+        # Log effective config for easier tuning
+        print("Tracker config:")
+        print(f"  control_hz: {1.0 / self.control_period_s:.1f}")
+        print(f"  image: {self.image_width}x{self.image_height}")
+        print(f"  laser_timeout_s: {self.laser_timeout}")
+        print(f"  max_jump_px_s: {self.max_jump_px_s}")
+        print(f"  HFOV/VFOV deg: {self.controller.hfov_deg}/{self.controller.vfov_deg}")
+        print(f"  fx/fy px: {self.controller.fx_px}/{self.controller.fy_px}")
+        print(f"  kp pan/tilt: {self.controller.kp_pan}/{self.controller.kp_tilt}")
+        print(f"  kd pan/tilt: {self.controller.kd_pan}/{self.controller.kd_tilt}")
+        print(f"  invert pan/tilt: {self.controller.invert_pan}/{self.controller.invert_tilt}")
+        print(f"  center pan/tilt deg: {self.controller.pan_center}/{self.controller.tilt_center}")
+        print(f"  max_speed_deg_s: {self.controller.max_speed_deg_s}")
+        print(f"  deadband_deg: {self.controller.deadband_deg}")
+        print(f"  ema_alpha: {self.controller.ema_alpha}")
         print()
     
     def coords_callback(self, msg: String) -> None:
@@ -395,6 +428,29 @@ class BallTrackerNode(Node):
                 ball_center_y = (y1 + y2) / 2.0
                 ball_width = abs(x2 - x1)
                 ball_height = abs(y2 - y1)
+
+                # Clamp to image bounds to keep math sane if detector returns out-of-range coords.
+                ball_center_x = max(0.0, min(float(self.image_width - 1), ball_center_x))
+                ball_center_y = max(0.0, min(float(self.image_height - 1), ball_center_y))
+
+                # Glitch filter: reject single-frame jumps that exceed max_jump_px_s.
+                if self._last_ball_center is not None and self._last_ball_time_s is not None:
+                    dt = max(0.001, current_time - self._last_ball_time_s)
+                    dx = abs(ball_center_x - self._last_ball_center[0])
+                    dy = abs(ball_center_y - self._last_ball_center[1])
+                    if (dx / dt) > self.max_jump_px_s or (dy / dt) > self.max_jump_px_s:
+                        if not hasattr(self, "_jump_warn_ctr"):
+                            self._jump_warn_ctr = 0
+                        self._jump_warn_ctr += 1
+                        if self._jump_warn_ctr % 10 == 0:
+                            self.get_logger().warn(
+                                f"Rejected detector jump: dx={dx:.1f}px dy={dy:.1f}px dt={dt:.3f}s "
+                                f"(limit {self.max_jump_px_s:.0f}px/s)"
+                            )
+                        return
+
+                self._last_ball_center = (ball_center_x, ball_center_y)
+                self._last_ball_time_s = current_time
                 
                 # Get laser position from ROS topic (from calibration node)
                 # If `/laser_pos` is not available, we fall back to open-loop: assume the laser is at image center.
