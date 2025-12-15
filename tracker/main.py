@@ -12,6 +12,8 @@ Requirements:
 - pigpio daemon running: sudo pigpiod
 """
 
+import sys
+
 try:
     import rclpy
     from rclpy.node import Node
@@ -28,11 +30,11 @@ except ImportError as e:
     print("Alternatively, use the Rust version: cargo run --release -p tracker")
     sys.exit(1)
 
+import math
 import time
 import os
 from typing import Optional, Tuple
 import signal
-import sys
 
 # Try to import GPIO libraries (Raspberry Pi only)
 try:
@@ -62,9 +64,12 @@ class ServoController:
         self.pan_servo = Servo(18, pin_factory=factory, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
         self.tilt_servo = Servo(19, pin_factory=factory, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
         
-        # Set initial position to center (90 degrees)
-        self.set_pan(90.0)
-        self.set_tilt(90.0)
+        # Set initial position to configured mechanical center (degrees).
+        # These env vars match the Rust tracker config.
+        pan_center = float(os.environ.get("TRACKER_PAN_CENTER_DEG", "90.0"))
+        tilt_center = float(os.environ.get("TRACKER_TILT_CENTER_DEG", "90.0"))
+        self.set_pan(pan_center)
+        self.set_tilt(tilt_center)
     
     def set_pan(self, angle: float) -> None:
         """Set pan servo position (0-180 degrees)"""
@@ -89,187 +94,159 @@ class ServoController:
 
 
 class Controller:
-    """PID controller (P-only) for ball tracking"""
-    
+    """PD controller for ball tracking (angle-domain control)."""
+
     def __init__(self, image_width: int, image_height: int):
-        # Proportional gains - higher for accurate pointing
-        self.kp_pan = 0.12  # Increased for faster tracking
-        self.kp_tilt = 0.12  # Increased for faster tracking
-        
+        self.image_width = float(image_width)
+        self.image_height = float(image_height)
+
+        # Camera model / mapping: prefer fx/fy if provided (better than HFOV/VFOV).
+        self.hfov_deg = float(os.environ.get("TRACKER_HFOV_DEG", "70.0"))
+        self.vfov_deg = float(os.environ.get("TRACKER_VFOV_DEG", "55.0"))
+        self.fx_px = self._env_float("TRACKER_FX_PX", 0.0)
+        self.fy_px = self._env_float("TRACKER_FY_PX", 0.0)
+
+        # Image center (if intrinsics known, use them).
+        self.cx_px = self._env_float("TRACKER_CX_PX", self.image_width / 2.0)
+        self.cy_px = self._env_float("TRACKER_CY_PX", self.image_height / 2.0)
+
+        # Control gains (units: degrees of servo change per degree of angular error).
+        self.kp_pan = self._env_float("TRACKER_KP_PAN", 0.8)
+        self.kp_tilt = self._env_float("TRACKER_KP_TILT", 0.8)
+        self.kd_pan = self._env_float("TRACKER_KD_PAN", 0.0)
+        self.kd_tilt = self._env_float("TRACKER_KD_TILT", 0.0)
+
+        self.invert_pan = self._env_bool("TRACKER_INVERT_PAN", False)
+        self.invert_tilt = self._env_bool("TRACKER_INVERT_TILT", False)
+
+        self.pan_center = self._env_float("TRACKER_PAN_CENTER_DEG", 90.0)
+        self.tilt_center = self._env_float("TRACKER_TILT_CENTER_DEG", 90.0)
+
         # Current servo positions (degrees)
-        self.pan_angle = 90.0  # Start at center
-        self.tilt_angle = 90.0
-        
-        # Image dimensions (for coordinate conversion)
-        self.image_width = image_width
-        self.image_height = image_height
-        
+        self.pan_angle = float(self.pan_center)
+        self.tilt_angle = float(self.tilt_center)
+
         # Servo limits (degrees)
         self.pan_min = 0.0
         self.pan_max = 180.0
         self.tilt_min = 0.0
         self.tilt_max = 180.0
-        
-        # Rate limiting (max change per update)
-        self.max_rate = 5.0  # Max 5 degrees per update for faster tracking
-        
+
+        # Servo speed limit (deg/sec)
+        self.max_speed_deg_s = self._env_float("TRACKER_MAX_SPEED_DEG_S", 120.0)
+
+        # Small deadband in angular domain to prevent buzzing
+        self.deadband_deg = self._env_float("TRACKER_DEADBAND_DEG", 0.4)
+
+        # Optional EMA smoothing of input points (0..1)
+        self.ema_alpha = self._env_float("TRACKER_EMA_ALPHA", 0.4)
+
         self.last_update = time.time()
-        
-        # Track previous ball position to detect if ball is actually moving
-        self.last_ball_center_x: Optional[float] = None
-        self.last_ball_center_y: Optional[float] = None
-        self.position_change_threshold = 5.0  # Pixels - if ball moves less than this, consider it stationary (increased to prevent overshooting)
-    
-    def update(self, x1: float, y1: float, x2: float, y2: float, 
-               laser_x: Optional[float] = None, laser_y: Optional[float] = None) -> Tuple[float, float]:
-        """Update servo positions based on ball detection"""
-        # Calculate ball center
-        ball_center_x = (x1 + x2) / 2.0
-        ball_center_y = (y1 + y2) / 2.0
-        
-        # Calculate ball area for adaptive deadzone
-        ball_width = abs(x2 - x1)
-        ball_height = abs(y2 - y1)
-        ball_area = ball_width * ball_height
-        
-        # Use provided laser position - if None, return current position (no movement)
-        if laser_x is not None and laser_y is not None:
-            target_x = laser_x
-            target_y = laser_y
-        else:
-            # No laser position - return current position without movement
+        self.last_err_pan_deg = 0.0
+        self.last_err_tilt_deg = 0.0
+        self._ball_ema: Optional[Tuple[float, float]] = None
+        self._laser_ema: Optional[Tuple[float, float]] = None
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        v = os.environ.get(name)
+        if v is None:
+            return default
+        return v.strip() not in ("0", "false", "False", "no", "NO")
+
+    def _ema(self, prev: Optional[Tuple[float, float]], x: float, y: float) -> Tuple[float, float]:
+        if prev is None:
+            return (x, y)
+        a = max(0.0, min(1.0, self.ema_alpha))
+        return (prev[0] * (1.0 - a) + x * a, prev[1] * (1.0 - a) + y * a)
+
+    def _px_to_deg_x(self, err_px: float) -> float:
+        if self.fx_px > 0.0:
+            return math.degrees(math.atan(err_px / self.fx_px))
+        # Small-angle approximation from HFOV: degrees per pixel.
+        return err_px * (self.hfov_deg / self.image_width)
+
+    def _px_to_deg_y(self, err_px: float) -> float:
+        if self.fy_px > 0.0:
+            return math.degrees(math.atan(err_px / self.fy_px))
+        return err_px * (self.vfov_deg / self.image_height)
+
+    def update(
+        self,
+        ball_center_x: float,
+        ball_center_y: float,
+        ball_width: float,
+        ball_height: float,
+        laser_x: float,
+        laser_y: float,
+        now_s: float,
+    ) -> Tuple[float, float]:
+        """Update servo positions based on ball and laser positions in pixels."""
+
+        # Smooth inputs (helps noisy detections / laser dot jitter).
+        self._ball_ema = self._ema(self._ball_ema, ball_center_x, ball_center_y)
+        self._laser_ema = self._ema(self._laser_ema, laser_x, laser_y)
+        ball_center_x, ball_center_y = self._ball_ema
+        laser_x, laser_y = self._laser_ema
+
+        # If laser is already within the ball bbox, hold position (no hunting).
+        if abs(ball_center_x - laser_x) <= (ball_width / 2.0) and abs(ball_center_y - laser_y) <= (ball_height / 2.0):
+            self.last_update = now_s
+            self.last_err_pan_deg = 0.0
+            self.last_err_tilt_deg = 0.0
             return (self.pan_angle, self.tilt_angle)
-        
-        # Calculate error relative to laser position
-        error_x = ball_center_x - target_x
-        error_y = ball_center_y - target_y
-        error_magnitude = (error_x**2 + error_y**2)**0.5
-        
-        # Check if laser is already within the ball's area
-        # If the error is less than half the ball size, the laser is likely on the ball
-        ball_half_width = ball_width / 2.0
-        ball_half_height = ball_height / 2.0
-        if abs(error_x) < ball_half_width and abs(error_y) < ball_half_height:
-            # Laser is within the ball's bounding box - no need to move
-            return (self.pan_angle, self.tilt_angle)
-        
-        # Store image center for normalization (used later)
-        image_center_x = self.image_width / 2.0
-        image_center_y = self.image_height / 2.0
-        
-        # Check if ball position actually changed significantly
-        # But allow movement if error is large (ball is far from center)
-        if self.last_ball_center_x is not None and self.last_ball_center_y is not None:
-            ball_moved_x = abs(ball_center_x - self.last_ball_center_x)
-            ball_moved_y = abs(ball_center_y - self.last_ball_center_y)
-            
-            # If ball hasn't moved much AND error is small, don't update servos to prevent overshooting
-            # This helps when the ball is stationary and we're already close to it
-            if (ball_moved_x < self.position_change_threshold and 
-                ball_moved_y < self.position_change_threshold and
-                error_magnitude < 30.0):  # Reduced threshold to prevent overshooting
-                # Ball is stationary and we're close to center, keep current servo positions
-                return (self.pan_angle, self.tilt_angle)
-        
-        # Update last known ball position
-        self.last_ball_center_x = ball_center_x
-        self.last_ball_center_y = ball_center_y
-        
-        # Normalize error to -1.0 to 1.0 range (use image center for normalization)
-        image_center_x = self.image_width / 2.0
-        image_center_y = self.image_height / 2.0
-        normalized_error_x = error_x / image_center_x
-        normalized_error_y = error_y / image_center_y
-        
-        # Calculate direct angle correction based on error
-        # Map image error to servo angle change
-        # For accurate pointing, we want direct proportional control
-        
-        # Pan control:
-        # Image center: (320, 320) for 640x640
-        # Servo center: 90° (both pan and tilt)
-        # error_x > 0: ball is right of laser -> pan right (increase angle toward 180°)
-        # error_x < 0: ball is left of laser -> pan left (decrease angle toward 0°)
-        # User reports: ball on left goes right, so pan control is inverted
-        # Invert: when error_x < 0 (ball left), we need to increase angle to pan left
-        if normalized_error_x > 0:
-            # Ball is on the right - reduce movement by 5%
-            delta_pan = -self.kp_pan * normalized_error_x * 90.0 * 0.95  # Inverted, 5% less movement
-        elif normalized_error_x < 0:
-            # Ball is on the left - full movement, inverted
-            delta_pan = -self.kp_pan * normalized_error_x * 90.0
-        else:
-            delta_pan = 0.0
-        
-        # Tilt control:
-        # Image center: (320, 320) for 640x640
-        # Servo center: 90° (both pan and tilt)
-        # error_y > 0: ball is below laser (y > laser_y) -> tilt down (increase angle toward 180°)
-        # error_y < 0: ball is above laser (y < laser_y) -> tilt up (decrease angle toward 0°)
-        # Image coordinates: (0,0) is top-left, y increases downward
-        # gpiozero Servo mapping: -1.0 = 0° (up), 0.0 = 90° (center), 1.0 = 180° (down)
-        # Logs show tilt direction is wrong - when ball is above, tilt goes down
-        # Need to invert: when error_y < 0 (ball above), we want tilt up (decrease angle)
-        # Inverted: delta_tilt = -kp * normalized_error_y
-        #   When error_y < 0: delta_tilt = -kp * (negative) = positive -> angle increases -> tilt down (WRONG!)
-        # Wait, that's still wrong. Let me check the logs more carefully.
-        # From logs: Ball above (error_y < 0), tilt going down (angle > 90) - WRONG
-        # So we need: when error_y < 0, delta_tilt should be negative to decrease angle
-        # Direct: delta_tilt = kp * normalized_error_y -> when error_y < 0, delta_tilt < 0 -> correct!
-        # But logs show it's wrong, so try inverting
-        delta_tilt = -self.kp_tilt * normalized_error_y * 90.0  # Inverted to fix direction
-        
-        # Adaptive dead zone based on ball size and movement
-        # Larger ball = larger dead zone (ball is closer, less movement needed)
-        # Smaller ball = smaller dead zone (ball is farther, more movement needed)
-        # Also consider if ball is actually moving
-        base_dead_zone = 0.03  # 3% of image size (about 19 pixels for 640x640)
-        max_dead_zone = 0.12  # 12% of image size (about 77 pixels for 640x640)
-        
-        # Normalize ball area (assume max ball area is about 20% of image = 0.2 * 640 * 640 = 81920)
-        max_ball_area = 81920.0
-        area_factor = min(ball_area / max_ball_area, 1.0)  # Clamp to 1.0
-        dead_zone = base_dead_zone + (max_dead_zone - base_dead_zone) * area_factor
-        
-        # Check if ball is actually moving
-        ball_moving = True
-        if self.last_ball_center_x is not None and self.last_ball_center_y is not None:
-            ball_moved_x = abs(ball_center_x - self.last_ball_center_x)
-            ball_moved_y = abs(ball_center_y - self.last_ball_center_y)
-            if ball_moved_x < 2.0 and ball_moved_y < 2.0:
-                # Ball is stationary - increase dead zone significantly
-                dead_zone *= 2.0  # Double the dead zone when ball is stationary
-        
-        # Apply dead zone - but don't apply to left side to ensure it moves
-        if abs(normalized_error_x) < dead_zone and normalized_error_x >= 0:
-            # Only apply dead zone for right side or center, not left side
-            delta_pan = 0.0
-        if abs(normalized_error_y) < dead_zone:
-            delta_tilt = 0.0
-        
-        # Rate limiting
-        elapsed = time.time() - self.last_update
-        max_delta = self.max_rate * max(elapsed, 0.01)  # Cap at reasonable rate
-        
+
+        dt = max(0.001, now_s - self.last_update)
+
+        err_px_x = ball_center_x - laser_x
+        err_px_y = ball_center_y - laser_y
+
+        # Convert pixel error to angular error (degrees).
+        err_pan_deg = self._px_to_deg_x(err_px_x)
+        err_tilt_deg = self._px_to_deg_y(err_px_y)
+
+        # Deadband in angular domain
+        if abs(err_pan_deg) < self.deadband_deg:
+            err_pan_deg = 0.0
+        if abs(err_tilt_deg) < self.deadband_deg:
+            err_tilt_deg = 0.0
+
+        derr_pan = (err_pan_deg - self.last_err_pan_deg) / dt
+        derr_tilt = (err_tilt_deg - self.last_err_tilt_deg) / dt
+
+        delta_pan = self.kp_pan * err_pan_deg + self.kd_pan * derr_pan
+        delta_tilt = self.kp_tilt * err_tilt_deg + self.kd_tilt * derr_tilt
+
+        if self.invert_pan:
+            delta_pan = -delta_pan
+        if self.invert_tilt:
+            delta_tilt = -delta_tilt
+
+        # Rate limit (deg/sec)
+        max_delta = self.max_speed_deg_s * dt
         delta_pan = max(-max_delta, min(max_delta, delta_pan))
         delta_tilt = max(-max_delta, min(max_delta, delta_tilt))
-        
-        # Update angles
-        self.pan_angle += delta_pan
-        self.tilt_angle += delta_tilt
-        
-        # Clamp to limits
-        self.pan_angle = max(self.pan_min, min(self.pan_max, self.pan_angle))
-        self.tilt_angle = max(self.tilt_min, min(self.tilt_max, self.tilt_angle))
-        
-        self.last_update = time.time()
-        
+
+        self.pan_angle = max(self.pan_min, min(self.pan_max, self.pan_angle + delta_pan))
+        self.tilt_angle = max(self.tilt_min, min(self.tilt_max, self.tilt_angle + delta_tilt))
+
+        self.last_update = now_s
+        self.last_err_pan_deg = err_pan_deg
+        self.last_err_tilt_deg = err_tilt_deg
+
         return (self.pan_angle, self.tilt_angle)
     
     def reset_to_center(self) -> None:
         """Reset to center position"""
-        self.pan_angle = 90.0
-        self.tilt_angle = 90.0
+        self.pan_angle = float(self.pan_center)
+        self.tilt_angle = float(self.tilt_center)
 
 
 def parse_coordinates(s: str) -> Optional[Tuple[float, float, float, float]]:
@@ -347,7 +324,7 @@ class BallTrackerNode(Node):
         # Laser position state (from ROS topic)
         self.laser_pos: Optional[Tuple[float, float]] = None
         self.last_laser_update = time.time()
-        self.laser_timeout = 1.0  # If no laser update for 1s, use image center as fallback
+        self.laser_timeout = 1.0  # If no laser update for 1s, fall back to open-loop (assume center)
         
         # Timeout for reset (2 seconds)
         self.timeout = 2.0
@@ -379,13 +356,6 @@ class BallTrackerNode(Node):
         )
         
         print("Laser position subscriber created")
-        print("  Topic: /laser_pos")
-        print("  Format: 'x,y' or 'none'")
-        print()
-        
-        # Create publisher for laser position (for real-time calibration)
-        self.laser_pub = self.create_publisher(String, '/laser_pos', 10)
-        print("Laser position publisher created")
         print("  Topic: /laser_pos")
         print("  Format: 'x,y' or 'none'")
         print()
@@ -423,45 +393,29 @@ class BallTrackerNode(Node):
                 # Calculate ball center for laser position
                 ball_center_x = (x1 + x2) / 2.0
                 ball_center_y = (y1 + y2) / 2.0
+                ball_width = abs(x2 - x1)
+                ball_height = abs(y2 - y1)
                 
                 # Get laser position from ROS topic (from calibration node)
-                # Check if laser is within the ball's bounding box area (avoids feedback loop)
-                # If laser position is "none" or not available, reset servos to center instead of using (320, 320)
-                if (self.laser_pos is not None and 
-                    current_time - self.last_laser_update < self.laser_timeout):
+                # If `/laser_pos` is not available, we fall back to open-loop: assume the laser is at image center.
+                # This will still "track to center" (camera-axis tracking), but accurate laser pointing needs real `/laser_pos`.
+                if self.laser_pos is not None and (current_time - self.last_laser_update) < self.laser_timeout:
                     laser_x, laser_y = self.laser_pos
-                    # Check if laser position is within the ball's bounding box
-                    ball_min_x = min(x1, x2)
-                    ball_max_x = max(x1, x2)
-                    ball_min_y = min(y1, y2)
-                    ball_max_y = max(y1, y2)
-                    if (ball_min_x <= laser_x <= ball_max_x and 
-                        ball_min_y <= laser_y <= ball_max_y):
-                        # Laser is within ball area - likely feedback loop, reset servos to center
-                        if self.servo is not None:
-                            self.servo.set_pan(90.0)
-                            self.servo.set_tilt(90.0)
-                        # Reset controller to center position
-                        self.controller.reset_to_center()
-                        return  # Skip tracking when laser is in ball area (feedback loop)
+                    laser_source = "measured"
                 else:
-                    # No laser position available ("none") - reset servos to center
-                    if self.servo is not None:
-                        self.servo.set_pan(90.0)
-                        self.servo.set_tilt(90.0)
-                    # Reset controller to center position
-                    self.controller.reset_to_center()
-                    return  # Skip tracking when no laser position
+                    laser_x = self.image_width / 2.0
+                    laser_y = self.image_height / 2.0
+                    laser_source = "assumed_center"
                 
-                # Publish laser position (where servos are pointing = ball center when tracking)
-                # This is for calibration - the actual laser position should come from a separate calibration node
-                # that detects where the laser dot actually appears in the image
-                laser_msg = String()
-                laser_msg.data = f"{ball_center_x:.2f},{ball_center_y:.2f}"
-                self.laser_pub.publish(laser_msg)
-                
-                # Update controller with laser position for accurate error calculation
-                pan_angle, tilt_angle = self.controller.update(x1, y1, x2, y2, laser_x, laser_y)
+                pan_angle, tilt_angle = self.controller.update(
+                    ball_center_x=ball_center_x,
+                    ball_center_y=ball_center_y,
+                    ball_width=ball_width,
+                    ball_height=ball_height,
+                    laser_x=laser_x,
+                    laser_y=laser_y,
+                    now_s=current_time,
+                )
                 
                 if self.servo is not None:
                     self.servo.set_pan(pan_angle)
@@ -471,20 +425,6 @@ class BallTrackerNode(Node):
                 error_x = ball_center_x - laser_x
                 error_y = ball_center_y - laser_y
                 
-                # Calculate what the delta should be for debugging
-                normalized_err_x = error_x / (self.image_width / 2.0)
-                normalized_err_y = error_y / (self.image_height / 2.0)
-                expected_delta_pan = -self.controller.kp_pan * normalized_err_x * 90.0  # Inverted to match actual control
-                if normalized_err_x > 0:
-                    expected_delta_pan *= 0.95  # Right side is 5% less
-                expected_delta_tilt = -self.controller.kp_tilt * normalized_err_y * 90.0  # Inverted to match actual control
-                
-                # Determine expected direction for debugging
-                expected_pan_dir = "right" if error_x > 0 else "left" if error_x < 0 else "center"
-                expected_tilt_dir = "down" if error_y > 0 else "up" if error_y < 0 else "center"
-                actual_pan_dir = "right" if pan_angle > 90 else "left" if pan_angle < 90 else "center"
-                actual_tilt_dir = "down" if tilt_angle > 90 else "up" if tilt_angle < 90 else "center"
-                
                 # Log less frequently to reduce spam
                 if not hasattr(self, '_log_counter'):
                     self._log_counter = 0
@@ -493,10 +433,9 @@ class BallTrackerNode(Node):
                 if self._log_counter % 3 == 0:  # Log every 3rd update for better debugging
                     self.get_logger().info(
                         f'Ball: ({ball_center_x:.1f}, {ball_center_y:.1f}), '
-                        f'Laser: ({laser_x:.1f}, {laser_y:.1f}), '
+                        f'Laser[{laser_source}]: ({laser_x:.1f}, {laser_y:.1f}), '
                         f'err: ({error_x:.1f}, {error_y:.1f}), '
-                        f'exp: pan→{expected_pan_dir} (Δ{expected_delta_pan:.2f}°), tilt→{expected_tilt_dir} (Δ{expected_delta_tilt:.2f}°), '
-                        f'act: pan={pan_angle:.1f}° ({actual_pan_dir}), tilt={tilt_angle:.1f}° ({actual_tilt_dir})'
+                        f'pan={pan_angle:.1f}°, tilt={tilt_angle:.1f}°'
                     )
                 
                 self.last_detection_time = current_time
@@ -505,31 +444,24 @@ class BallTrackerNode(Node):
                 if current_time - self.last_detection_time > self.timeout:
                     self.controller.reset_to_center()
                     if self.servo is not None:
-                        self.servo.set_pan(90.0)
-                        self.servo.set_tilt(90.0)
+                        self.servo.set_pan(self.controller.pan_center)
+                        self.servo.set_tilt(self.controller.tilt_center)
                     self.get_logger().info(f"No detection for {self.timeout}s, resetting to center")
                     self.last_detection_time = current_time
                 
-                # Publish "none" for laser position when no ball detected
-                laser_msg = String()
-                laser_msg.data = "none"
-                self.laser_pub.publish(laser_msg)
         else:
             # No coordinates available, check if we should reset
             if current_time - self.last_detection_time > self.timeout:
                 self.controller.reset_to_center()
                 if self.servo is not None:
-                    self.servo.set_pan(90.0)
-                    self.servo.set_tilt(90.0)
+                    self.servo.set_pan(self.controller.pan_center)
+                    self.servo.set_tilt(self.controller.tilt_center)
                 # Only log once per timeout period
                 if int(current_time) % int(self.timeout + 1) == 0:
                     self.get_logger().info(f"No detection for {self.timeout}s, resetting to center")
                 self.last_detection_time = current_time
             
-            # Publish "none" for laser position when no ball detected
-            laser_msg = String()
-            laser_msg.data = "none"
-            self.laser_pub.publish(laser_msg)
+            pass
 
 
 def main(args=None):
